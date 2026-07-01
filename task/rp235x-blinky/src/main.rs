@@ -2,16 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Minimal blinky task for the Raspberry Pi Pico 2.
+//! Blinky + UART loopback self-test for the Raspberry Pi Pico 2.
 //!
-//! Toggles the onboard LED (GPIO25) via the SIO atomic-XOR register on a timer.
-//! GPIO25 is configured as an SIO output by the app's privileged pre-kernel
-//! startup (see `app/demo-pi-pico-2/src/main.rs`); this task only needs SIO
-//! access (`uses = ["sio"]`) to toggle it.
+//! Each cycle the task sends a marker byte out UART0 TX (GP0) and tries to read it
+//! back on RX (GP1). With a jumper wire GP0 -> GP1 this proves the UART's TX and RX
+//! paths, with no host serial adapter, using the onboard LED (GPIO25) as the display:
 //!
-//! A blinking LED proves the full stack: the boot ROM accepted our IMAGE_DEF,
-//! the kernel started, it scheduled this (unprivileged) task, and the task's
-//! `sleep_for` timer notifications are being delivered.
+//! * **double blink** each ~1 s  => loopback OK (byte sent and received back)
+//! * **one long blink** each ~1 s => no echo (RX did not see the byte)
+//!
+//! Only touches SIO (LED) and UART0, so the task runs unprivileged with
+//! `uses = ["sio", "uart0"]`.
 
 #![no_std]
 #![no_main]
@@ -20,17 +21,48 @@ use userlib::hl;
 
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
+/// Marker byte for the loopback (alternating bits).
+const MARKER: u8 = 0x55;
 
 #[export_name = "main"]
 pub fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
     let mask = 1u32 << LED_PIN;
+    let led_on = || p.SIO.gpio_out_set().write(|w| unsafe { w.bits(mask) });
+    let led_off = || p.SIO.gpio_out_clr().write(|w| unsafe { w.bits(mask) });
 
     loop {
-        // Atomic toggle of GPIO25's output level. With the crystal-accurate clock
-        // (12 MHz, cycles_per_ms = 12000), a 500 ms half-period gives a precise
-        // 1 Hz blink -- verifiable against a stopwatch.
-        p.SIO.gpio_out_xor().write(|w| unsafe { w.bits(mask) });
-        hl::sleep_for(500);
+        // Discard anything already sitting in the RX FIFO (e.g. the boot banner).
+        while rp235x_uart::rx_ready(&p) {
+            let _ = rp235x_uart::read_byte(&p);
+        }
+
+        // Send the marker and wait (bounded) for it to loop back on RX.
+        rp235x_uart::write_all(&p, &[MARKER]);
+        let mut ok = false;
+        for _ in 0..1_000_000u32 {
+            if rp235x_uart::rx_ready(&p) {
+                ok = rp235x_uart::read_byte(&p) == MARKER;
+                break;
+            }
+        }
+
+        if ok {
+            // Loopback verified: quick double blink.
+            led_on();
+            hl::sleep_for(100);
+            led_off();
+            hl::sleep_for(120);
+            led_on();
+            hl::sleep_for(100);
+            led_off();
+        } else {
+            // No echo: one long blink.
+            led_on();
+            hl::sleep_for(500);
+            led_off();
+        }
+
+        hl::sleep_for(700);
     }
 }

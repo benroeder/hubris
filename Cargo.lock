@@ -974,6 +974,7 @@ dependencies = [
  "kern",
  "rp235x-pac",
  "rp235x-startup",
+ "rp235x-uart",
 ]
 
 [[package]]
@@ -5191,6 +5192,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp235x-uart"
+version = "0.1.0"
+dependencies = [
+ "rp235x-pac",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6532,6 +6540,7 @@ name = "task-rp235x-blinky"
 version = "0.1.0"
 dependencies = [
  "rp235x-pac",
+ "rp235x-uart",
  "userlib",
 ]
 

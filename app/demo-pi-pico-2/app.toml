@@ -21,9 +21,9 @@ notifications = ["fault", "timer"]
 [tasks.blinky]
 name = "task-rp235x-blinky"
 priority = 3
-max-sizes = {flash = 4096, ram = 1024}
+max-sizes = {flash = 8192, ram = 1024}
 stacksize = 512
-uses = ["sio"]
+uses = ["sio", "uart0"]
 start = true
 
 [tasks.idle]

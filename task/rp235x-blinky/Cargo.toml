@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 userlib = { path = "../../sys/userlib" }
 rp235x-pac = { workspace = true }
+rp235x-uart = { path = "../../lib/rp235x-uart" }
 
 [[bin]]
 name = "task-rp235x-blinky"
