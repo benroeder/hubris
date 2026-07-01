@@ -10,6 +10,9 @@ rp235x-usb = { path = "../../lib/rp235x-usb" }
 usb-device = { workspace = true }
 usbd-serial = { workspace = true }
 
+[build-dependencies]
+build-util = { path = "../../build/util" }
+
 [[bin]]
 name = "task-rp235x-usb"
 test = false

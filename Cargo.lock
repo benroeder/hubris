@@ -6587,9 +6587,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-rp235x-logdemo"
+version = "0.1.0"
+dependencies = [
+ "userlib",
+]
+
+[[package]]
 name = "task-rp235x-usb"
 version = "0.1.0"
 dependencies = [
+ "build-util",
  "rp235x-pac",
  "rp235x-usb",
  "usb-device",
