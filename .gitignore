@@ -17,3 +17,13 @@ hubris.testout.*
 .nvim.lua
 .zed/settings.json
 .dir-locals.el
+
+# RP2350 research: commit the source datasheets/SVD + derived docs; ignore only
+# machine-regenerable outputs (pdftotext dump, python cache).
+docs/rp2350-research/*.txt
+docs/rp2350-research/__pycache__/
+
+# CodeGraph local index (regenerate with: codegraph init)
+.codegraph/
+# Large raw codex review transcripts (process artifacts; plan captures the outcome)
+plans/rp2350-port-review-*.md
