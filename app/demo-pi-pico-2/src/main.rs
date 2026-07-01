@@ -58,16 +58,10 @@ fn main() -> ! {
     p.SIO.gpio_oe_set().write(|w| unsafe { w.bits(1 << LED_PIN) });
     p.SIO.gpio_out_set().write(|w| unsafe { w.bits(1 << LED_PIN) });
 
-    // TODO(phase 1): replace with real XOSC + PLL bring-up in `lib/rp235x-startup`
-    // (must run privileged: CLOCKS/PLL are ACCESSCTRL Privileged-only). For now,
-    // estimate the tick divisor from the current clk_sys source.
-    let cycles_per_ms = if p.CLOCKS.clk_sys_ctrl().read().src().is_clk_ref() {
-        // Reset state: running from the ~6 MHz ROSC directly out of flash.
-        6_000
-    } else {
-        // A resident debugger has likely switched clk_sys to the 48 MHz USB PLL.
-        48_000
-    };
+    // Bring up XOSC + PLL_SYS to a known 150 MHz and get the accurate tick
+    // divisor. Runs here (privileged, pre-kernel) because CLOCKS/PLL are
+    // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
+    let cycles_per_ms = rp235x_startup::init_clocks(&p);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }

@@ -27,8 +27,10 @@ pub fn main() -> ! {
     let mask = 1u32 << LED_PIN;
 
     loop {
-        // Atomic toggle of GPIO25's output level.
+        // Atomic toggle of GPIO25's output level. With the crystal-accurate clock
+        // (12 MHz, cycles_per_ms = 12000), a 500 ms half-period gives a precise
+        // 1 Hz blink -- verifiable against a stopwatch.
         p.SIO.gpio_out_xor().write(|w| unsafe { w.bits(mask) });
-        hl::sleep_for(250);
+        hl::sleep_for(500);
     }
 }

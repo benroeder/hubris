@@ -973,6 +973,7 @@ dependencies = [
  "cortex-m-rt",
  "kern",
  "rp235x-pac",
+ "rp235x-startup",
 ]
 
 [[package]]
@@ -5180,6 +5181,13 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "vcell",
+]
+
+[[package]]
+name = "rp235x-startup"
+version = "0.1.0"
+dependencies = [
+ "rp235x-pac",
 ]
 
 [[package]]
