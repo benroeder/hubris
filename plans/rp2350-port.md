@@ -24,6 +24,59 @@ alongside the existing Hubris `ImageHeader`, plus flashing.
 > confirmed against the datasheet in `docs/rp2350-research/findings.md`. Reviews:
 > `plans/rp2350-port-review-output*.md`.
 
+## Progress — verified on real hardware (Raspberry Pi Pico 2)
+
+Branch `rp2350-port`. Every commit below was flashed and confirmed on a physical
+Pico 2 (no debug probe — verified via `picotool`, the boot-accept behaviour, and the
+onboard LED / a GP0↔GP1 UART loopback as visual signals):
+
+| Commit | What | Hardware proof |
+|---|---|---|
+| `docs …` | Plan + datasheet-verified research (`docs/rp2350-research/`) | `verify.py` cross-checks addresses vs SVD |
+| G1 boot | `chips/rp235x`, `app/demo-pi-pico-2`, `.image_def` in `kernel-link.x`, `rp235x-pac` | **boot ROM accepts our IMAGE_DEF**; `picotool info` valid; block at 0x10000160 |
+| kernel | jefe+idle + `task-rp235x-blinky`; GPIO25 via SIO | **kernel schedules an unprivileged task** (LED blinks) |
+| clock | `lib/rp235x-startup`: XOSC 12 MHz | crystal-accurate **1 Hz** blink |
+| UART | `lib/rp235x-uart`: PL011, GP0/GP1 | **TX+RX** via loopback (double-blink) |
+| 150 MHz | PLL_SYS + **QMI flash retune** (CLKDIV=6) | double-blink at 150 MHz baud — the XIP-flash hazard handled |
+
+**Retired risks (were the plan's biggest unknowns, now proven on silicon):** IMAGE_DEF
+byte-correctness; "ARMv8-M kernel for free" (no kernel changes); ACCESSCTRL privilege
+split (privileged startup touches CLOCKS/PLL/QMI, unprivileged task reaches SIO/UART
+via `uses`); MPU task isolation; the §5.4.4 XIP-during-clock-ramp flash hazard.
+
+**Gate status:** G0 ✅ · G1 ✅ (host + hardware) · G2 ✅ · G3 ✅ · G4 partial (GPIO+UART
+proven; SPI/I2C pending) · G5–G6 not started.
+
+**Still a bring-up, not yet idiomatic:** GPIO/UART are helper-libs called from a task
++ privileged `main`, not `drv/rp235x-*` Idol server tasks. No peripheral *interrupt*
+has been exercised yet (all polled / SysTick). See "Next: USB console" below.
+
+## Next: USB console (talk to the board over its native USB port)
+
+Goal: a **USB CDC-ACM** device so the Pico 2 appears as `/dev/cu.usbmodem…` — an
+interactive console over the one USB cable, no adapter/probe. **Hubris has zero USB
+code** (confirmed: the only `usb` hits are LPC55 repurposing USB SRAM for DICE), so
+this is fully greenfield and the largest driver in the port. **Route B:** use the
+`usb-device` + `usbd-serial` crates + a minimal RP2350 `UsbBus` backend (don't
+re-implement enumeration/CDC). Debuggable without a probe: macOS logs enumeration.
+
+Do **before** the USB stack, in order:
+1. **`clk_usb` = 48 MHz** — add PLL_USB (12 MHz × 40 / (5×2)) to `lib/rp235x-startup`.
+   Hard prerequisite; low-risk (no flash); LED-canary verifiable.
+2. **Prove peripheral IRQ → task notification** — never tested on this chip; USB is
+   IRQ-driven. Cheapest test: enable UART0 RX IRQ, wire
+   `interrupts = {"uart0.irq" = "…"}` to a task, blink on RX (reuses the loopback).
+   De-risks USB's biggest infrastructure dependency in ~20 lines.
+3. **Push the branch** — 6 verified commits are laptop-only; get them off before the
+   risky USB work.
+4. **`UsbBus` backend decision** — reuse an rp235x backend vs. adapt `rp235x-hal` vs.
+   write a minimal one; decides polled-vs-IRQ task architecture.
+
+Then: (5) **enumeration** — device appears in `system_profiler`; (6) **CDC data** —
+`/dev/cu.usbmodem…` appears; (7) **console task** — echo/handle input.
+*Optional first:* refactor UART into a proper `drv/rp235x-uart` Idol server so USB
+follows an established driver template.
+
 What makes RP2350 different from an STM32/LPC55 port (the real work beyond generic M33):
 1. **Mandatory `IMAGE_DEF` metadata block** in the first 4 KiB — the boot ROM
    *refuses to start* an image without it. No STM32 analogue.
