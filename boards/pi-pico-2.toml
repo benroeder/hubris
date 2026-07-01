@@ -1,0 +1,4 @@
+# Raspberry Pi Pico 2 (RP2350A + 4 MB external QSPI flash).
+# probe-rs target string verified present in probe-rs 0.31 (`probe-rs chip list`).
+[probe-rs]
+chip-name = "RP235x"

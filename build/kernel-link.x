@@ -74,6 +74,20 @@ SECTIONS
     . = . + _HUBRIS_IMAGE_HEADER_SIZE;
   } > FLASH
 
+  /* Optional RP235x IMAGE_DEF block loop (20 bytes). The RP2350 boot ROM requires a
+     valid block loop within the first 4 KiB of the image. We place it AFTER the
+     Hubris .header so the ImageHeader stays at its established offset. If no object
+     defines a .image_def section (i.e. non-RP2350 targets), this section has size 0
+     and costs nothing. See app/demo-pi-pico-2/src/main.rs and
+     docs/rp2350-research/findings.md for the block contents. */
+  .image_def :
+  {
+    __image_def_start = .;
+    . = ALIGN(4);
+    KEEP(*(.image_def));
+    __image_def_end = .;
+  } > FLASH
+
   /* Explicitly place text at vector table + size of header, deliberately ignoring
      section alignment. This is important because the bootloader assumes that the header
      immediately follows the vector table; if something changes to cause that to not
@@ -81,7 +95,7 @@ SECTIONS
      a difficult to understand linker failure, which will hopefully be somewhat improved
      by this comment.
   */
-  PROVIDE(_stext = ADDR(.vector_table) + SIZEOF(.vector_table) + SIZEOF(.header));
+  PROVIDE(_stext = ADDR(.vector_table) + SIZEOF(.vector_table) + SIZEOF(.header) + SIZEOF(.image_def));
 
   /* ### .text */
   .text _stext :
@@ -278,6 +292,26 @@ the -fPIC flag. See the documentation of the `cc::Build.pic` method for details.
 ASSERT(ADDR(.vector_table) % (1 << LOG2CEIL(SIZEOF(.vector_table))) == 0, "
 Vector table alignment too small for number of exception entires. Increase
 the alignment to the next power of two");
+
+/* --- RP235x IMAGE_DEF safety checks (no-ops when .image_def is empty) --- */
+
+/* The boot ROM only scans the first 4 KiB of the image for a block loop. */
+ASSERT(SIZEOF(.image_def) == 0
+       || (__image_def_end - ADDR(.vector_table)) <= 0x1000,
+"RP235x: IMAGE_DEF must be within the first 4 KiB of the image");
+
+/* Guard against the header growing enough to push IMAGE_DEF past the 4 KiB mark. */
+ASSERT(SIZEOF(.image_def) == 0
+       || (SIZEOF(.vector_table) + SIZEOF(.header) + SIZEOF(.image_def)) <= 0x1000,
+"RP235x: vector table + header + IMAGE_DEF must fit in the first 4 KiB");
+
+/* The minimum Arm IMAGE_DEF is exactly 20 bytes; flag unexpected growth. */
+ASSERT(SIZEOF(.image_def) == 0 || SIZEOF(.image_def) == 20,
+"RP235x: unexpected IMAGE_DEF size (expected 20 bytes); update kernel-link.x if intended");
+
+/* IMAGE_DEF must precede .text. */
+ASSERT(SIZEOF(.image_def) == 0 || ADDR(.image_def) < ADDR(.text),
+"RP235x: IMAGE_DEF must precede .text");
 
 
 /* Do not exceed this mark in the error messages above                                    | */

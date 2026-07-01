@@ -964,6 +964,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffe7ed1d93f4553003e20b629abe9085e1e81b1429520f897f8f8860bc6dfc21"
 
 [[package]]
+name = "demo-pi-pico-2"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+]
+
+[[package]]
 name = "demo-stm32f4-discovery"
 version = "0.1.0"
 dependencies = [
@@ -5157,6 +5169,17 @@ dependencies = [
  "lpc55-pac",
  "lpc55-rot-startup",
  "unwrap-lite",
+]
+
+[[package]]
+name = "rp235x-pac"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f1227561239cdfbcea69f6f1c66c78cc8197d5b4103db394eacf20aedf74fa"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "vcell",
 ]
 
 [[package]]

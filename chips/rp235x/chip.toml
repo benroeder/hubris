@@ -1,0 +1,22 @@
+# RP235x (RP2350) peripheral definitions.
+# Addresses/IRQs verified against the datasheet Table 8/95 AND the official SVD
+# (see docs/rp2350-research/{addresses.md,verify.py}). Minimal set for jefe+idle
+# bring-up; grow per driver in later phases.
+
+[resets]
+address = 0x4002_0000  # RESETS_BASE
+size = 32
+
+[sio]
+address = 0xd000_0000  # SIO (core-local), inter-core FIFO / spinlocks
+size = 512
+
+[io_bank0]
+address = 0x4002_8000  # GPIO function-select
+size = 0x1000
+interrupts = { irq = 21 }  # IO_IRQ_BANK0
+
+[uart0]
+address = 0x4007_0000  # PL011
+size = 0x1000
+interrupts = { irq = 33 }  # UART0_IRQ
