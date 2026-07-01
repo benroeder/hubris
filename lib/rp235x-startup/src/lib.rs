@@ -82,5 +82,25 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
         .clk_peri_ctrl()
         .write(|w| w.enable().set_bit().auxsrc().clk_sys());
 
+    // --- 7. PLL_USB -> clk_usb = 48 MHz (required by the USB device controller) ---
+    // VCO = 12 MHz × 100 = 1200 MHz (in the 750-1600 MHz range); / (5 × 5) = 48 MHz.
+    p.RESETS.reset().modify(|_, w| w.pll_usb().clear_bit());
+    while p.RESETS.reset_done().read().pll_usb().bit_is_clear() {}
+    p.PLL_USB.cs().modify(|_, w| unsafe { w.refdiv().bits(1) });
+    p.PLL_USB
+        .fbdiv_int()
+        .write(|w| unsafe { w.fbdiv_int().bits(100) });
+    p.PLL_USB
+        .pwr()
+        .modify(|_, w| w.pd().clear_bit().vcopd().clear_bit());
+    while p.PLL_USB.cs().read().lock().bit_is_clear() {}
+    p.PLL_USB
+        .prim()
+        .write(|w| unsafe { w.postdiv1().bits(5).postdiv2().bits(5) });
+    p.PLL_USB.pwr().modify(|_, w| w.postdivpd().clear_bit());
+    p.CLOCKS
+        .clk_usb_ctrl()
+        .write(|w| w.enable().set_bit().auxsrc().clksrc_pll_usb());
+
     SYS_CLK_HZ / 1000
 }

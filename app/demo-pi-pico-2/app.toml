@@ -25,6 +25,8 @@ max-sizes = {flash = 8192, ram = 1024}
 stacksize = 512
 uses = ["sio", "uart0"]
 start = true
+notifications = ["uart-irq"]
+interrupts = {"uart0.irq" = "uart-irq"}
 
 [tasks.idle]
 name = "task-idle"

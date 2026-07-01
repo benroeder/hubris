@@ -86,6 +86,23 @@ pub fn write_all(p: &Peripherals, bytes: &[u8]) {
     }
 }
 
+/// Unmask the RX interrupts (RX FIFO level + receive timeout) so a received byte
+/// asserts UART0_IRQ. Privileged; the kernel/NVIC side is enabled per task via
+/// `sys_irq_control`.
+pub fn enable_rx_interrupt(p: &Peripherals) {
+    p.UART0
+        .uartimsc()
+        .modify(|_, w| w.rxim().set_bit().rtim().set_bit());
+}
+
+/// Acknowledge the RX interrupts at the peripheral (call after handling).
+/// UARTICR is write-1-to-clear: RXIC = bit 4, RTIC = bit 6.
+pub fn clear_rx_interrupt(p: &Peripherals) {
+    p.UART0
+        .uarticr()
+        .write(|w| unsafe { w.bits((1 << 4) | (1 << 6)) });
+}
+
 /// True if the RX FIFO has at least one byte waiting.
 pub fn rx_ready(p: &Peripherals) -> bool {
     !p.UART0.uartfr().read().rxfe().bit_is_set()

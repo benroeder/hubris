@@ -8,6 +8,9 @@ userlib = { path = "../../sys/userlib" }
 rp235x-pac = { workspace = true }
 rp235x-uart = { path = "../../lib/rp235x-uart" }
 
+[build-dependencies]
+build-util = { path = "../../build/util" }
+
 [[bin]]
 name = "task-rp235x-blinky"
 test = false

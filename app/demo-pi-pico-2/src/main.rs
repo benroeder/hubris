@@ -63,9 +63,17 @@ fn main() -> ! {
     // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
     let cycles_per_ms = rp235x_startup::init_clocks(&p);
 
-    // Bring up UART0 (115200 8N1 on GP0/GP1) so tasks can print. Baud is derived from
-    // the now-known clk_peri frequency. Privileged (touches RESETS/PADS/IO_BANK0).
+    // Clocks (incl. PLL_USB) survived -- turn the LED off so the blinky task, which
+    // toggles it only on each UART RX interrupt, starts from a known dark state.
+    // (Solid LED here => hung in init_clocks; dark-and-never-blinks => IRQ not
+    // delivering; blinking => clocks + interrupt path both work.)
+    p.SIO.gpio_out_clr().write(|w| unsafe { w.bits(1 << LED_PIN) });
+
+    // Bring up UART0 (115200 8N1 on GP0/GP1). Baud is derived from the now-known
+    // clk_peri frequency. Enable the RX interrupt so received bytes assert UART0_IRQ.
+    // Privileged (touches RESETS/PADS/IO_BANK0).
     rp235x_uart::configure(&p, cycles_per_ms * 1000);
+    rp235x_uart::enable_rx_interrupt(&p);
     rp235x_uart::write_all(&p, b"\r\nHubris booting on RP2350 / Pico 2\r\n");
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }

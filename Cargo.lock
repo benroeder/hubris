@@ -6539,6 +6539,7 @@ dependencies = [
 name = "task-rp235x-blinky"
 version = "0.1.0"
 dependencies = [
+ "build-util",
  "rp235x-pac",
  "rp235x-uart",
  "userlib",
