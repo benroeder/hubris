@@ -7,7 +7,7 @@ stacksize = 944
 
 [kernel]
 name = "demo-pi-pico-2"
-requires = {flash = 20000, ram = 1136}
+requires = {flash = 20000, ram = 4096}
 stacksize = 640
 
 [tasks.jefe]
@@ -17,6 +17,14 @@ max-sizes = {flash = 4096, ram = 512}
 start = true
 stacksize = 352
 notifications = ["fault", "timer"]
+
+[tasks.blinky]
+name = "task-rp235x-blinky"
+priority = 3
+max-sizes = {flash = 4096, ram = 1024}
+stacksize = 512
+uses = ["sio"]
+start = true
 
 [tasks.idle]
 name = "task-idle"

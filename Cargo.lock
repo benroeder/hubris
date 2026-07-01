@@ -6520,6 +6520,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-rp235x-blinky"
+version = "0.1.0"
+dependencies = [
+ "rp235x-pac",
+ "userlib",
+]
+
+[[package]]
 name = "task-sensor"
 version = "0.1.0"
 dependencies = [

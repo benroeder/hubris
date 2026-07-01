@@ -1,0 +1,17 @@
+[package]
+name = "task-rp235x-blinky"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../sys/userlib" }
+rp235x-pac = { workspace = true }
+
+[[bin]]
+name = "task-rp235x-blinky"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true
