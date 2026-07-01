@@ -25,13 +25,24 @@ const TX_PIN: usize = 0;
 const RX_PIN: usize = 1;
 const UART_FUNCSEL: u8 = 2;
 
-// 115200 baud from a 12 MHz clk_peri: 12e6 / (16 * 115200) = 6.5104.
-// integer = 6, fractional = round(0.5104 * 64) = 33.
-const BAUD_INT: u16 = 6;
-const BAUD_FRAC: u8 = 33;
+const BAUD: u32 = 115_200;
 
-/// Reset, pin-mux, and enable UART0 at 115200 8N1. Privileged; call once at startup.
-pub fn configure(p: &Peripherals) {
+/// Reset, pin-mux, and enable UART0 at 115200 8N1, given the `clk_peri` frequency.
+///
+/// Baud divisors are computed from `clk_peri_hz`, so this stays correct as the clock
+/// changes (12 MHz → 150 MHz). Privileged; call once at startup.
+pub fn configure(p: &Peripherals, clk_peri_hz: u32) {
+    // PL011 integer baud calc (as in pico-sdk uart_set_baudrate):
+    // div = 8 * f / baud; IBRD = div >> 7; FBRD = ((div & 0x7f) + 1) / 2.
+    let div = 8 * clk_peri_hz / BAUD;
+    let (baud_int, baud_frac): (u16, u8) = if div >> 7 == 0 {
+        (1, 0)
+    } else if div >> 7 >= 65535 {
+        (65535, 0)
+    } else {
+        ((div >> 7) as u16, (div & 0x7f).div_ceil(2) as u8)
+    };
+
     p.RESETS.reset().modify(|_, w| w.uart0().clear_bit());
     while p.RESETS.reset_done().read().uart0().bit_is_clear() {}
 
@@ -54,10 +65,10 @@ pub fn configure(p: &Peripherals) {
     // UART0 comes out of reset disabled. Program baud, then 8N1 + FIFO, then enable.
     p.UART0
         .uartibrd()
-        .write(|w| unsafe { w.baud_divint().bits(BAUD_INT) });
+        .write(|w| unsafe { w.baud_divint().bits(baud_int) });
     p.UART0
         .uartfbrd()
-        .write(|w| unsafe { w.baud_divfrac().bits(BAUD_FRAC) });
+        .write(|w| unsafe { w.baud_divfrac().bits(baud_frac) });
     p.UART0.uartlcr_h().write(|w| {
         unsafe { w.wlen().bits(0b11) }; // 8 data bits
         w.fen().set_bit() // enable FIFOs

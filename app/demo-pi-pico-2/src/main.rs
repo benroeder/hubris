@@ -63,9 +63,9 @@ fn main() -> ! {
     // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
     let cycles_per_ms = rp235x_startup::init_clocks(&p);
 
-    // Bring up UART0 (115200 8N1 on GP0/GP1) so tasks can print. Privileged because
-    // it touches RESETS/PADS/IO_BANK0.
-    rp235x_uart::configure(&p);
+    // Bring up UART0 (115200 8N1 on GP0/GP1) so tasks can print. Baud is derived from
+    // the now-known clk_peri frequency. Privileged (touches RESETS/PADS/IO_BANK0).
+    rp235x_uart::configure(&p, cycles_per_ms * 1000);
     rp235x_uart::write_all(&p, b"\r\nHubris booting on RP2350 / Pico 2\r\n");
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
