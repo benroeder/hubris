@@ -6,7 +6,7 @@
 //!
 //! Builds a `usb-device` stack on our `rp235x-usb::UsbBus` backend and a
 //! `usbd-serial` CDC-ACM class, then polls the device. Once enumerated it appears on
-//! the host as `/dev/cu.usbmodem…` and echoes received bytes.
+//! the host as `/dev/cu.usbmodem...` and echoes received bytes.
 //!
 //! This first cut polls in a tight loop (USB enumeration is timing-sensitive) with a
 //! slow LED heartbeat so we can see the task is alive; a later revision will drive it

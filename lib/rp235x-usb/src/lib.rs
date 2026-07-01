@@ -4,15 +4,18 @@
 
 //! `usb-device` `UsbBus` backend for the RP2350 (RP235x) USB device controller.
 //!
-//! Adapted for Hubris from `rp235x-hal`'s `usb` module (rp-rs/rp-hal,
-//! Apache-2.0/MIT), which is a proven `UsbBus` for this exact controller. Changes:
-//! the HAL clock token / reset-subsystem trait / `itertools` dependencies are
-//! removed (clk_usb must already be 48 MHz — brought up by `lib/rp235x-startup`; the
-//! controller is reset directly via RESETS), so this depends only on `rp235x-pac`,
-//! `usb-device`, `critical-section`, and `cortex-m`.
+//! Derived from the `usb` module of `rp235x-hal`
+//! (<https://github.com/rp-rs/rp-hal>, Copyright (c) The rp-rs Developers,
+//! dual-licensed Apache-2.0 OR MIT), a proven `UsbBus` for this exact controller.
+//! This attribution is retained per those licenses; see also the repo's
+//! third-party licensing notes. Changes from upstream: the HAL clock token /
+//! reset-subsystem trait / `itertools` dependencies are removed (clk_usb must
+//! already be 48 MHz -- brought up by `lib/rp235x-startup`; the controller is reset
+//! directly via RESETS), so this depends only on `rp235x-pac`, `usb-device`,
+//! `critical-section`, and `cortex-m`.
 //!
 //! `Sync` comes from `critical_section::Mutex`, whose implementation Hubris provides
-//! (a no-op — tasks are single-threaded/cooperative) via `sys/userlib`. The bus is
+//! (a no-op -- tasks are single-threaded/cooperative) via `sys/userlib`. The bus is
 //! only ever touched from the one USB task's poll loop, so there is no real
 //! contention.
 

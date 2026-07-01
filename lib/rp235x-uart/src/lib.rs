@@ -13,7 +13,7 @@
 //! can be called from an unprivileged task that has `uses = ["uart0"]`.
 //!
 //! Pico 2's USB is the RP2350's native USB, not a UART bridge, so TX appears on the
-//! physical GP0 pin — view it with a USB-serial adapter (adapter RX <- GP0, GND <-
+//! physical GP0 pin -- view it with a USB-serial adapter (adapter RX <- GP0, GND <-
 //! GND), or loop GP0 -> GP1 for an on-board RX test.
 
 #![no_std]
@@ -30,7 +30,7 @@ const BAUD: u32 = 115_200;
 /// Reset, pin-mux, and enable UART0 at 115200 8N1, given the `clk_peri` frequency.
 ///
 /// Baud divisors are computed from `clk_peri_hz`, so this stays correct as the clock
-/// changes (12 MHz → 150 MHz). Privileged; call once at startup.
+/// changes (12 MHz -> 150 MHz). Privileged; call once at startup.
 pub fn configure(p: &Peripherals, clk_peri_hz: u32) {
     // PL011 integer baud calc (as in pico-sdk uart_set_baudrate):
     // div = 8 * f / baud; IBRD = div >> 7; FBRD = ((div & 0x7f) + 1) / 2.

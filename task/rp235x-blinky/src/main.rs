@@ -11,7 +11,7 @@
 //! toggles the onboard LED (GPIO25).
 //!
 //! Because the toggle only happens on the interrupt notification, the LED proves the
-//! whole peripheral-IRQ -> task-notification path on RP2350 (never exercised before —
+//! whole peripheral-IRQ -> task-notification path on RP2350 (never exercised before --
 //! everything prior was polled / SysTick). This is the infrastructure USB depends on.
 //!
 //! LED reading (with the LED left dark by the app after clock bring-up):

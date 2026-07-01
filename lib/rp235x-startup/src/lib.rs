@@ -4,9 +4,9 @@
 
 //! RP2350 (RP235x) clock bring-up for Hubris.
 //!
-//! Runs in the app's privileged pre-kernel `main` — CLOCKS / XOSC / PLL_SYS / QMI are
+//! Runs in the app's privileged pre-kernel `main` -- CLOCKS / XOSC / PLL_SYS / QMI are
 //! ACCESSCTRL Secure-*Privileged*-only on RP2350 (see
-//! `docs/rp2350-research/findings.md` §4).
+//! `docs/rp2350-research/findings.md` sec 4).
 //!
 //! Sequence: start the 12 MHz crystal (XOSC), run `clk_ref` from it, slow the flash
 //! XIP clock (QMI) to stay in spec, bring PLL_SYS up to 150 MHz, switch `clk_sys` (CPU
@@ -14,19 +14,19 @@
 //!
 //! **QMI note:** the boot ROM configures flash XIP timing for the ~11 MHz boot clock.
 //! Ramping `clk_sys` to 150 MHz without slowing the QMI clock divider first would run
-//! flash reads far out of spec and hang the chip (datasheet §5.4.4 / §5.9.5). We set a
-//! conservative `CLKDIV` (→ 25 MHz flash SCK) *before* the ramp, while still slow.
+//! flash reads far out of spec and hang the chip (datasheet sec 5.4.4 / sec 5.9.5). We set a
+//! conservative `CLKDIV` (-> 25 MHz flash SCK) *before* the ramp, while still slow.
 
 #![no_std]
 
 use rp235x_pac::Peripherals;
 
-/// System clock after bring-up, in Hz. 12 MHz XOSC × 125 / (5 × 2) = 150 MHz.
+/// System clock after bring-up, in Hz. 12 MHz XOSC x 125 / (5 x 2) = 150 MHz.
 pub const SYS_CLK_HZ: u32 = 150_000_000;
 
 /// Bring up XOSC + PLL_SYS to [`SYS_CLK_HZ`] and return `cycles_per_ms`.
 ///
-/// If a "wait for stable/lock/selected" spin never completes, this hangs here — by
+/// If a "wait for stable/lock/selected" spin never completes, this hangs here -- by
 /// design the caller lights the LED *before* calling this, so a hang shows as a solid
 /// (non-blinking) LED.
 pub fn init_clocks(p: &Peripherals) -> u32 {
@@ -44,12 +44,12 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
     // --- 3. Slow the flash XIP clock BEFORE ramping clk_sys ---
     // At clk_sys = 150 MHz, CLKDIV = 6 gives a 25 MHz flash SCK, safe for the basic
     // serial read the boot ROM leaves configured. Do this while clk_sys is still
-    // 12 MHz (SCK becomes 2 MHz here — harmless) so flash is never over-clocked.
+    // 12 MHz (SCK becomes 2 MHz here -- harmless) so flash is never over-clocked.
     p.QMI
         .m0_timing()
         .modify(|_, w| unsafe { w.clkdiv().bits(6).rxdelay().bits(1) });
 
-    // --- 4. Configure PLL_SYS: VCO = 12 MHz / 1 × 125 = 1500 MHz ---
+    // --- 4. Configure PLL_SYS: VCO = 12 MHz / 1 x 125 = 1500 MHz ---
     p.RESETS.reset().modify(|_, w| w.pll_sys().clear_bit());
     while p.RESETS.reset_done().read().pll_sys().bit_is_clear() {}
 
@@ -62,7 +62,7 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
         .modify(|_, w| w.pd().clear_bit().vcopd().clear_bit());
     while p.PLL_SYS.cs().read().lock().bit_is_clear() {}
 
-    // Post-dividers: 1500 MHz / (5 × 2) = 150 MHz, then power the post-divider.
+    // Post-dividers: 1500 MHz / (5 x 2) = 150 MHz, then power the post-divider.
     p.PLL_SYS
         .prim()
         .write(|w| unsafe { w.postdiv1().bits(5).postdiv2().bits(2) });
@@ -83,7 +83,7 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
         .write(|w| w.enable().set_bit().auxsrc().clk_sys());
 
     // --- 7. PLL_USB -> clk_usb = 48 MHz (required by the USB device controller) ---
-    // VCO = 12 MHz × 100 = 1200 MHz (in the 750-1600 MHz range); / (5 × 5) = 48 MHz.
+    // VCO = 12 MHz x 100 = 1200 MHz (in the 750-1600 MHz range); / (5 x 5) = 48 MHz.
     p.RESETS.reset().modify(|_, w| w.pll_usb().clear_bit());
     while p.RESETS.reset_done().read().pll_usb().bit_is_clear() {}
     p.PLL_USB.cs().modify(|_, w| unsafe { w.refdiv().bits(1) });
