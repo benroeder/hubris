@@ -1,0 +1,13 @@
+[package]
+name = "rp235x-usb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rp235x-pac = { workspace = true }
+usb-device = { workspace = true }
+critical-section = { workspace = true }
+cortex-m = { workspace = true }
+
+[lints]
+workspace = true

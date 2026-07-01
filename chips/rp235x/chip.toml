@@ -20,3 +20,12 @@ interrupts = { irq = 21 }  # IO_IRQ_BANK0
 address = 0x4007_0000  # PL011
 size = 0x1000
 interrupts = { irq = 33 }  # UART0_IRQ
+
+[usbctrl]
+address = 0x5011_0000  # USB device-controller registers (USB)
+size = 0x1000
+interrupts = { irq = 14 }  # USBCTRL_IRQ
+
+[usb_dpram]
+address = 0x5010_0000  # USB dual-port RAM (endpoint control + buffers)
+size = 0x1000

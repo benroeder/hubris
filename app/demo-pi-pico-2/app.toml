@@ -18,15 +18,13 @@ start = true
 stacksize = 352
 notifications = ["fault", "timer"]
 
-[tasks.blinky]
-name = "task-rp235x-blinky"
+[tasks.usb]
+name = "task-rp235x-usb"
 priority = 3
-max-sizes = {flash = 8192, ram = 1024}
-stacksize = 512
-uses = ["sio", "uart0"]
+max-sizes = {flash = 32768, ram = 8192}
+stacksize = 4096
+uses = ["sio", "usbctrl", "usb_dpram", "resets"]
 start = true
-notifications = ["uart-irq"]
-interrupts = {"uart0.irq" = "uart-irq"}
 
 [tasks.idle]
 name = "task-idle"

@@ -1,0 +1,20 @@
+[package]
+name = "task-rp235x-usb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../sys/userlib" }
+rp235x-pac = { workspace = true }
+rp235x-usb = { path = "../../lib/rp235x-usb" }
+usb-device = { workspace = true }
+usbd-serial = { workspace = true }
+
+[[bin]]
+name = "task-rp235x-usb"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true
