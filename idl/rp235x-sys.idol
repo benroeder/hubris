@@ -1,0 +1,22 @@
+// RP2350 (RP235x) system-control (RESETS) driver API.
+//
+// Owns the RESETS block so peripheral drivers do not each poke it. `mask` is a
+// bitfield of RESETS bits (see the block constants in drv-rp235x-sys-api).
+
+Interface(
+    name: "Rp235xSys",
+    ops: {
+        "leave_reset": (
+            description: "Deassert reset for the masked blocks and wait until done.",
+            args: { "mask": "u32" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
+        "enter_reset": (
+            description: "Assert reset for the masked blocks.",
+            args: { "mask": "u32" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
+    },
+)

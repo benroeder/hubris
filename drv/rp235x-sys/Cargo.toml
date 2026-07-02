@@ -1,5 +1,5 @@
 [package]
-name = "drv-rp235x-gpio"
+name = "drv-rp235x-sys"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,7 +10,6 @@ zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 rp235x-pac = { workspace = true }
 
-drv-rp235x-gpio-api = { path = "../rp235x-gpio-api" }
 drv-rp235x-sys-api = { path = "../rp235x-sys-api" }
 userlib = { path = "../../sys/userlib" }
 
@@ -18,7 +17,7 @@ userlib = { path = "../../sys/userlib" }
 idol = { workspace = true }
 
 [[bin]]
-name = "drv-rp235x-gpio"
+name = "drv-rp235x-sys"
 test = false
 doctest = false
 bench = false

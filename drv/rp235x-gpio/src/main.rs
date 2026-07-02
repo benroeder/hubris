@@ -15,8 +15,11 @@
 #![no_main]
 
 use drv_rp235x_gpio_api::GpioError;
+use drv_rp235x_sys_api::{self as sys_api, Rp235xSys};
 use idol_runtime::RequestError;
-use userlib::RecvMessage;
+use userlib::{task_slot, RecvMessage};
+
+task_slot!(SYS, sys);
 
 /// Highest Bank 0 pin reachable through the SIO low registers.
 const MAX_PIN: u8 = 31;
@@ -136,15 +139,11 @@ impl idol_runtime::NotificationHandler for ServerImpl {
 
 #[export_name = "main"]
 fn main() -> ! {
+    // Bring the GPIO blocks out of reset via the sys server (single RESETS owner).
+    let sys = Rp235xSys::from(SYS.get_task_id());
+    sys.leave_reset(sys_api::IO_BANK0 | sys_api::PADS_BANK0);
+
     let p = unsafe { rp235x_pac::Peripherals::steal() };
-
-    // Ensure the IO blocks are out of reset (idempotent; the app also does this).
-    p.RESETS
-        .reset()
-        .modify(|_, w| w.io_bank0().clear_bit().pads_bank0().clear_bit());
-    while p.RESETS.reset_done().read().io_bank0().bit_is_clear() {}
-    while p.RESETS.reset_done().read().pads_bank0().bit_is_clear() {}
-
     let mut server = ServerImpl {
         sio: p.SIO,
         io_bank0: p.IO_BANK0,
