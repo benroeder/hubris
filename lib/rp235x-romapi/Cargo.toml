@@ -1,0 +1,14 @@
+[package]
+name = "rp235x-romapi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

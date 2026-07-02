@@ -12,3 +12,32 @@ size = 0x8_2000        # 520 kB total on-chip SRAM (striped SRAM0-7 + SRAM8/9)
 read = true
 write = true
 execute = false
+
+# Extern regions (granted to specific tasks via `extern-regions`; never
+# allocated from):
+
+# The 32 kB boot ROM (datasheet 2.2.1) -- lets the flash driver call the
+# bootrom flash API (sec 5.4.8). Executable because ROM functions run at the
+# caller's privilege in the caller's MPU context.
+#
+# Starts at 0x20, NOT 0: the kernel gives every task a no-access null region
+# over 0x0..0x20 (sys/kern/build.rs), and PMSAv8 prohibits overlapping MPU
+# regions (observed as a fault/retry loop that starves the system, not a
+# clean error). The ROM's Arm header words at 0x10..0x18 are therefore
+# unreachable from tasks; lib/rp235x-romapi uses the RISC-V well-known copies
+# at 0x7df6+ (same table) and walks the ROM table itself.
+[[rom]]
+address = 0x0000_0020
+size = 0x7fe0
+read = true
+execute = true
+
+# The whole flash, read-only, through the *uncached XIP mirror*
+# (XIP_NOCACHE_NOALLOC_BASE) -- lets the flash driver read any flash address.
+# The mirror is used instead of XIP_BASE because the driver's own code region
+# lives inside 0x10xxxxxx, and ARMv8-M PMSAv8 prohibits overlapping MPU
+# regions (overlap is UNPREDICTABLE; observed as the task faulting at start).
+[[xip]]
+address = 0x1400_0000
+size = 0x40_0000
+read = true

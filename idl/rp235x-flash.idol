@@ -1,0 +1,26 @@
+// RP2350 (RP235x) QSPI flash driver API.
+//
+// Stage 1: reads (safe with XIP live) + boot-ROM introspection. Erase/program
+// follow once the kernel is RAM-resident and startup opens ACCESSCTRL for QMI
+// (see the driver docs for the XIP hazard).
+
+Interface(
+    name: "Rp235xFlash",
+    ops: {
+        "read": (
+            description: "Copy flash contents from `offset` (bytes from the start of flash) into dest. Returns the count read.",
+            args: { "offset": "u32" },
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Result(ok: "usize", err: CLike("FlashError")),
+            idempotent: true,
+        ),
+        "rom_lookup": (
+            description: "Look up a boot-ROM entry by its two-character code (LE-packed u16, e.g. 'FO' = 0x4f46). Returns the entry address, 0 if absent.",
+            args: { "code": "u16" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+    },
+)

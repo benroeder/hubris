@@ -16,6 +16,7 @@
 #![no_std]
 #![no_main]
 
+use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
 use drv_rp235x_spi_api::Rp235xSpi;
@@ -28,6 +29,7 @@ task_slot!(GPIO, gpio_driver);
 task_slot!(UART, uart_driver);
 task_slot!(SPI, spi_driver);
 task_slot!(I2C, i2c_driver);
+task_slot!(FLASH, flash_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -37,14 +39,17 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   ticks                 ms since boot\r\n\
-  led on|off|toggle     onboard LED (GPIO25)\r\n\
+  led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
+                            idle heartbeat; blink restores it)\r\n\
   gpio out|in|hi|lo|toggle|read <pin>\r\n\
   uart send <text>      send out UART0 TX (GP0)\r\n\
   uart recv             drain UART0 RX buffer\r\n\
   spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
   i2c scan              probe all 7-bit addresses\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
-  i2c write <addr> <hex..>\r\n";
+  i2c write <addr> <hex..>\r\n\
+  flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
+  rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -52,7 +57,11 @@ struct Shell {
     uart: Rp235xUart,
     spi: Rp235xSpi,
     i2c: Rp235xI2c,
+    flash: Rp235xFlash,
     out: Out,
+    /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
+    /// the LED (turns this off), `led blink` gives it back.
+    heartbeat: bool,
 }
 
 /// Small write-combining buffer so replies go to the USB task in a few IPCs
@@ -75,19 +84,7 @@ impl Out {
     }
 
     fn put_u32(&mut self, n: u32) {
-        let mut tmp = [0u8; 10];
-        let mut i = tmp.len();
-        let mut m = n;
-        if m == 0 {
-            i -= 1;
-            tmp[i] = b'0';
-        }
-        while m > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (m % 10) as u8;
-            m /= 10;
-        }
-        self.put(&tmp[i..]);
+        self.put_u64(n as u64);
     }
 
     fn put_u64(&mut self, n: u64) {
@@ -109,6 +106,12 @@ impl Out {
     fn put_hex_byte(&mut self, b: u8) {
         const D: &[u8; 16] = b"0123456789abcdef";
         self.put(&[D[(b >> 4) as usize], D[(b & 0xf) as usize]]);
+    }
+
+    fn put_hex32(&mut self, n: u32) {
+        for b in n.to_be_bytes() {
+            self.put_hex_byte(b);
+        }
     }
 
     fn flush(&mut self) {
@@ -136,6 +139,8 @@ impl Shell {
             "uart" => self.cmd_uart(line, words.next()),
             "spi" => self.cmd_spi(line, words.next()),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
+            "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
+            "rom" => self.cmd_rom(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
                 self.out.put(cmd.as_bytes());
@@ -178,12 +183,27 @@ impl Shell {
 
     fn cmd_led(&mut self, verb: Option<&str>) {
         let _ = self.gpio.configure_output(LED_PIN);
+        // Manual LED control suspends the idle heartbeat (which would
+        // otherwise toggle the LED right back within ~500 ms).
         let r = match verb {
-            Some("on") => self.gpio.set_high(LED_PIN),
-            Some("off") => self.gpio.set_low(LED_PIN),
-            Some("toggle") | None => self.gpio.toggle(LED_PIN),
+            Some("on") => {
+                self.heartbeat = false;
+                self.gpio.set_high(LED_PIN)
+            }
+            Some("off") => {
+                self.heartbeat = false;
+                self.gpio.set_low(LED_PIN)
+            }
+            Some("toggle") | None => {
+                self.heartbeat = false;
+                self.gpio.toggle(LED_PIN)
+            }
+            Some("blink") => {
+                self.heartbeat = true;
+                Ok(())
+            }
             _ => {
-                self.out.put(b"usage: led on|off|toggle\r\n");
+                self.out.put(b"usage: led on|off|toggle|blink\r\n");
                 return;
             }
         };
@@ -337,6 +357,77 @@ impl Shell {
         }
     }
 
+    fn cmd_flash(
+        &mut self,
+        verb: Option<&str>,
+        off: Option<&str>,
+        count: Option<&str>,
+    ) {
+        if verb != Some("read") {
+            self.out.put(b"usage: flash read <hex-off> [n<=64]\r\n");
+            return;
+        }
+        let Some(off) = off.and_then(|o| u32::from_str_radix(o, 16).ok())
+        else {
+            self.out.put(b"bad offset (hex, e.g. flash read 160)\r\n");
+            return;
+        };
+        let count = match count {
+            None => 64,
+            Some(c) => match c.parse::<usize>() {
+                Ok(n) => n.min(64),
+                Err(_) => {
+                    self.out.put(b"bad count (decimal, max 64)\r\n");
+                    return;
+                }
+            },
+        };
+        let mut buf = [0u8; 64];
+        match self.flash.read(off, &mut buf[..count]) {
+            Ok(n) => {
+                // Hexdump, 16 bytes per line with an ASCII gutter.
+                for (li, chunk) in buf[..n].chunks(16).enumerate() {
+                    self.out.put_hex32(off + (li as u32) * 16);
+                    self.out.put(b": ");
+                    for &b in chunk {
+                        self.out.put_hex_byte(b);
+                        self.out.put(b" ");
+                    }
+                    self.out.put(b" |");
+                    for &b in chunk {
+                        let printable = [b];
+                        self.out.put(if (0x20..0x7f).contains(&b) {
+                            &printable
+                        } else {
+                            b"."
+                        });
+                    }
+                    self.out.put(b"|\r\n");
+                }
+            }
+            Err(_) => self.out.put(b"error (bad address)\r\n"),
+        }
+    }
+
+    fn cmd_rom(&mut self, code: Option<&str>) {
+        let Some(code) = code.filter(|c| c.len() == 2) else {
+            self.out.put(b"usage: rom <2-char code>, e.g. rom FO\r\n");
+            return;
+        };
+        let b = code.as_bytes();
+        let packed = u16::from_le_bytes([b[0], b[1]]);
+        let addr = self.flash.rom_lookup(packed);
+        self.out.put(b"rom['");
+        self.out.put(b);
+        self.out.put(b"'] = 0x");
+        self.out.put_hex32(addr);
+        self.out.put(if addr == 0 {
+            b" (absent)\r\n" as &[u8]
+        } else {
+            b"\r\n"
+        });
+    }
+
     fn i2c_scan(&mut self) {
         self.out.put(b"i2c:  ");
         let mut found = 0u32;
@@ -395,11 +486,13 @@ pub fn main() -> ! {
         uart: Rp235xUart::from(UART.get_task_id()),
         spi: Rp235xSpi::from(SPI.get_task_id()),
         i2c: Rp235xI2c::from(I2C.get_task_id()),
+        flash: Rp235xFlash::from(FLASH.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
             len: 0,
         },
+        heartbeat: true,
     };
 
     // Let enumeration settle, then greet.
@@ -408,13 +501,22 @@ pub fn main() -> ! {
     shell.out.put(PROMPT);
     shell.out.flush();
 
+    let _ = shell.gpio.configure_output(LED_PIN);
+
     let mut line = [0u8; 128];
     let mut len = 0usize;
+    let mut idle: u32 = 0;
     loop {
         let mut keys = [0u8; 32];
         let n = shell.usb.read(&mut keys);
         if n == 0 {
-            // Nothing typed; poll at human speed.
+            // Nothing typed; poll at human speed. Blink the LED (~1 Hz) as a
+            // liveness signal: blinking proves the shell loop, the GPIO IPC
+            // chain, and the USB read IPC are all running.
+            idle = idle.wrapping_add(1);
+            if shell.heartbeat && idle.is_multiple_of(25) {
+                let _ = shell.gpio.toggle(LED_PIN);
+            }
             hl::sleep_for(20);
             continue;
         }

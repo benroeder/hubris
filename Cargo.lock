@@ -2216,6 +2216,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-rp235x-flash"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "drv-rp235x-flash-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-romapi",
+ "serde",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-flash-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-rp235x-gpio"
 version = "0.1.0"
 dependencies = [
@@ -5354,6 +5383,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp235x-romapi"
+version = "0.1.0"
+
+[[package]]
 name = "rp235x-startup"
 version = "0.1.0"
 dependencies = [
@@ -6728,6 +6761,7 @@ dependencies = [
 name = "task-rp235x-shell"
 version = "0.1.0"
 dependencies = [
+ "drv-rp235x-flash-api",
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",
  "drv-rp235x-spi-api",

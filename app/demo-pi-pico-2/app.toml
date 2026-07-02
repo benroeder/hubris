@@ -73,13 +73,21 @@ uses = ["i2c0"]
 start = true
 task-slots = ["sys"]
 
+[tasks.flash_driver]
+name = "drv-rp235x-flash"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+start = true
+extern-regions = ["rom", "xip"]
+
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
 max-sizes = {flash = 16384, ram = 2048}
 stacksize = 1024
 start = true
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver"]
 
 [tasks.idle]
 name = "task-idle"

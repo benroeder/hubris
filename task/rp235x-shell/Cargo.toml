@@ -10,6 +10,7 @@ drv-rp235x-gpio-api = { path = "../../drv/rp235x-gpio-api" }
 drv-rp235x-uart-api = { path = "../../drv/rp235x-uart-api" }
 drv-rp235x-spi-api = { path = "../../drv/rp235x-spi-api" }
 drv-rp235x-i2c-api = { path = "../../drv/rp235x-i2c-api" }
+drv-rp235x-flash-api = { path = "../../drv/rp235x-flash-api" }
 
 [[bin]]
 name = "task-rp235x-shell"
