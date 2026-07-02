@@ -28,13 +28,21 @@ start = true
 notifications = ["usb-irq"]
 interrupts = {"usbctrl.irq" = "usb-irq"}
 
+[tasks.gpio_driver]
+name = "drv-rp235x-gpio"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["io_bank0", "pads_bank0", "sio", "resets"]
+start = true
+
 [tasks.logdemo]
 name = "task-rp235x-logdemo"
 priority = 4
 max-sizes = {flash = 4096, ram = 1024}
 stacksize = 512
 start = true
-task-slots = ["usb"]
+task-slots = ["usb", "gpio_driver"]
 
 [tasks.idle]
 name = "task-idle"

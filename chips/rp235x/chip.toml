@@ -16,6 +16,10 @@ address = 0x4002_8000  # GPIO function-select
 size = 0x1000
 interrupts = { irq = 21 }  # IO_IRQ_BANK0
 
+[pads_bank0]
+address = 0x4003_8000  # GPIO pad control (drive/pull/isolation)
+size = 0x1000
+
 [uart0]
 address = 0x4007_0000  # PL011
 size = 0x1000

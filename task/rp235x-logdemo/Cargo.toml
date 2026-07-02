@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 userlib = { path = "../../sys/userlib" }
+drv-rp235x-gpio-api = { path = "../../drv/rp235x-gpio-api" }
 
 [[bin]]
 name = "task-rp235x-logdemo"

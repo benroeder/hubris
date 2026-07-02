@@ -1,0 +1,43 @@
+// RP2350 (RP235x) GPIO driver API.
+//
+// Minimal Bank 0 GPIO control (pins 0-31) via SIO. Pins are configured as SIO
+// outputs/inputs and driven/read through the single-cycle IO block.
+
+Interface(
+    name: "Rp235xGpio",
+    ops: {
+        "configure_output": (
+            description: "Set a pin to SIO output (clears the RP2350 pad isolation latch).",
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+        "configure_input": (
+            description: "Set a pin to SIO input with the input buffer enabled.",
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+        "set_high": (
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+        "set_low": (
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+        "toggle": (
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+        "read": (
+            description: "Read a pin's current input level (0 or 1).",
+            args: { "pin": "u8" },
+            reply: Result(ok: "u8", err: CLike("GpioError")),
+            idempotent: true,
+        ),
+    },
+)

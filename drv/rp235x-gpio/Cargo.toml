@@ -1,0 +1,26 @@
+[package]
+name = "drv-rp235x-gpio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+idol-runtime = { workspace = true }
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+rp235x-pac = { workspace = true }
+
+drv-rp235x-gpio-api = { path = "../rp235x-gpio-api" }
+userlib = { path = "../../sys/userlib" }
+
+[build-dependencies]
+idol = { workspace = true }
+
+[[bin]]
+name = "drv-rp235x-gpio"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true
