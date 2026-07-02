@@ -25,6 +25,11 @@ address = 0x4007_0000  # PL011
 size = 0x1000
 interrupts = { irq = 33 }  # UART0_IRQ
 
+[spi0]
+address = 0x4008_0000  # PL022 SPI0
+size = 0x1000
+interrupts = { irq = 31 }  # SPI0_IRQ
+
 [usbctrl]
 address = 0x5011_0000  # USB device-controller registers (USB)
 size = 0x1000

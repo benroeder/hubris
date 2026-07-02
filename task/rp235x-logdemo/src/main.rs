@@ -15,12 +15,14 @@
 #![no_main]
 
 use drv_rp235x_gpio_api::Rp235xGpio;
+use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use userlib::{hl, sys_send, task_slot};
 
 task_slot!(USB, usb);
 task_slot!(GPIO, gpio_driver);
 task_slot!(UART, uart_driver);
+task_slot!(SPI, spi_driver);
 
 /// IPC operation understood by the USB console server: "write these bytes".
 const OP_WRITE: u16 = 1;
@@ -32,6 +34,7 @@ pub fn main() -> ! {
     let usb = USB.get_task_id();
     let gpio = Rp235xGpio::from(GPIO.get_task_id());
     let uart = Rp235xUart::from(UART.get_task_id());
+    let spi = Rp235xSpi::from(SPI.get_task_id());
 
     // Drive the LED through the GPIO driver.
     let _ = gpio.configure_output(LED_PIN);
@@ -51,21 +54,29 @@ pub fn main() -> ! {
         let mut rx = [0u8; 32];
         let rx_count = uart.read(&mut rx);
 
-        let mut line = [0u8; 48];
-        let msg = format_line(&mut line, n, rx_count as u32);
+        // SPI self-test: full-duplex exchange through the PL022 internal loopback,
+        // so the bytes we send should come back verbatim.
+        let tx = [0xA5u8, 0x5A, 0x3C];
+        let mut srx = [0u8; 3];
+        let _ = spi.exchange(&tx, &mut srx);
+        let spi_ok = srx == tx;
+
+        let mut line = [0u8; 64];
+        let msg = format_line(&mut line, n, rx_count as u32, spi_ok);
         let _ = sys_send(usb, OP_WRITE, msg, &mut [], &[]);
         n = n.wrapping_add(1);
         hl::sleep_for(1000);
     }
 }
 
-/// Write `"tick <n> uart_rx=<rx>\r\n"` into `buf` and return the used slice.
-fn format_line(buf: &mut [u8], n: u32, rx: u32) -> &[u8] {
+/// Write `"tick <n> uart_rx=<rx> spi=OK|BAD\r\n"` into `buf`; return the used slice.
+fn format_line(buf: &mut [u8], n: u32, rx: u32, spi_ok: bool) -> &[u8] {
     let mut i = 0;
     i = append(buf, i, b"tick ");
     i = append_u32(buf, i, n);
     i = append(buf, i, b" uart_rx=");
     i = append_u32(buf, i, rx);
+    i = append(buf, i, if spi_ok { b" spi=OK" } else { b" spi=BAD" });
     i = append(buf, i, b"\r\n");
     &buf[..i]
 }

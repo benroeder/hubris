@@ -1,0 +1,19 @@
+// RP2350 (RP235x) SPI0 (PL022) driver API.
+//
+// Minimal full-duplex controller. `exchange` clocks out `tx` while capturing `rx`
+// (equal-length); returns the number of bytes exchanged.
+
+Interface(
+    name: "Rp235xSpi",
+    ops: {
+        "exchange": (
+            description: "Full-duplex transfer: clock out tx, capture rx. Returns bytes exchanged (min of the two lengths).",
+            leases: {
+                "tx": (type: "[u8]", read: true, max_len: Some(256)),
+                "rx": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+    },
+)

@@ -7,6 +7,7 @@ edition = "2021"
 userlib = { path = "../../sys/userlib" }
 drv-rp235x-gpio-api = { path = "../../drv/rp235x-gpio-api" }
 drv-rp235x-uart-api = { path = "../../drv/rp235x-uart-api" }
+drv-rp235x-spi-api = { path = "../../drv/rp235x-spi-api" }
 
 [[bin]]
 name = "task-rp235x-logdemo"

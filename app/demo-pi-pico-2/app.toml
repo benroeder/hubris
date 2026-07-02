@@ -13,9 +13,9 @@ stacksize = 640
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 4096, ram = 512}
+max-sizes = {flash = 4096, ram = 1024}
 start = true
-stacksize = 352
+stacksize = 512
 notifications = ["fault", "timer"]
 
 [tasks.usb]
@@ -55,13 +55,22 @@ start = true
 notifications = ["uart-irq"]
 interrupts = {"uart0.irq" = "uart-irq"}
 
+[tasks.spi_driver]
+name = "drv-rp235x-spi"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["spi0"]
+start = true
+task-slots = ["sys"]
+
 [tasks.logdemo]
 name = "task-rp235x-logdemo"
 priority = 4
 max-sizes = {flash = 4096, ram = 1024}
 stacksize = 512
 start = true
-task-slots = ["usb", "gpio_driver", "uart_driver"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver"]
 
 [tasks.idle]
 name = "task-idle"
