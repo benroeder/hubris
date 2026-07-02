@@ -45,6 +45,7 @@ onboard LED / a GP0↔GP1 UART loopback as visual signals):
 | UART Idol | `drv/rp235x-uart{,-api}`: IRQ-driven RX ring, lease I/O | loopback `uart_rx=15` (exact marker length) each tick |
 | SPI Idol | `drv/rp235x-spi{,-api}`: PL022 mode 0, 1.5 MHz | `spi=OK` — 3-byte full-duplex round-trip via internal loopback |
 | I2C Idol | `drv/rp235x-i2c{,-api}`: DW 7-bit master, 100 kHz | empty-bus scan: 112 probes/tick NAK + recover cleanly (`i2c=0`); ACKed-transfer test pending a 2nd Pico as I2CTarget |
+| USB shell | `idl/rp235x-usbcons.idol` + `task/rp235x-shell`: interactive shell over CDC (help/status/led/gpio/uart/spi/i2c/ticks); logdemo retired | full command transcript verified by driving the CDC port: `spi xfer a5 5a 3c` → `a5 5a 3c`, status self-tests, led toggle |
 
 **Retired risks (were the plan's biggest unknowns, now proven on silicon):** IMAGE_DEF
 byte-correctness; "ARMv8-M kernel for free" (no kernel changes); ACCESSCTRL privilege
