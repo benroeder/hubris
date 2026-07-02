@@ -6725,13 +6725,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "task-rp235x-logdemo"
+name = "task-rp235x-shell"
 version = "0.1.0"
 dependencies = [
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",
  "drv-rp235x-spi-api",
  "drv-rp235x-uart-api",
+ "task-rp235x-usb-api",
  "userlib",
 ]
 
@@ -6740,11 +6741,28 @@ name = "task-rp235x-usb"
 version = "0.1.0"
 dependencies = [
  "build-util",
+ "idol",
+ "idol-runtime",
+ "num-traits",
  "rp235x-pac",
  "rp235x-usb",
  "usb-device",
  "usbd-serial",
  "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "task-rp235x-usb-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
 ]
 
 [[package]]

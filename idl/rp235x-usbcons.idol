@@ -1,0 +1,27 @@
+// RP2350 (RP235x) USB CDC console API.
+//
+// The USB task owns the CDC-ACM serial port; clients print with `write` and
+// consume host keystrokes with `read`. Both are best-effort: `write` drops
+// bytes if the host is not draining, `read` returns 0 when nothing is buffered.
+
+Interface(
+    name: "UsbCons",
+    ops: {
+        "write": (
+            description: "Write bytes to the USB serial port (best effort). Returns the count accepted.",
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+        "read": (
+            description: "Drain buffered host->device bytes into dest. Returns the count (0 if none).",
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+    },
+)

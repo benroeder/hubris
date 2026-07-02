@@ -73,11 +73,11 @@ uses = ["i2c0"]
 start = true
 task-slots = ["sys"]
 
-[tasks.logdemo]
-name = "task-rp235x-logdemo"
+[tasks.shell]
+name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 8192, ram = 1024}
-stacksize = 768
+max-sizes = {flash = 16384, ram = 2048}
+stacksize = 1024
 start = true
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver"]
 

@@ -4,24 +4,24 @@
 
 //! USB CDC-ACM console server for the Raspberry Pi Pico 2.
 //!
-//! Presents the board as a USB serial port (/dev/cu.usbmodem...) and acts as a debug
-//! console for the rest of the system:
+//! Presents the board as a USB serial port (/dev/cu.usbmodem...) and serves as
+//! the system console transport over an Idol interface (`idl/rp235x-usbcons.idol`):
 //!
-//! * On the USB interrupt (IRQ 14, delivered as the `usb-irq` notification) it polls
-//!   the device -- servicing enumeration, and echoing anything typed into the port.
-//! * On an IPC message from another task it writes the message bytes to the serial
-//!   port. So any task with a task-slot to this one can "print" over USB (best effort;
-//!   bytes are dropped if the host is not draining).
+//! * `write`: clients print bytes to the port (best effort; dropped if the host
+//!   is not draining).
+//! * `read`: clients drain host->device bytes (keystrokes), buffered here in a
+//!   ring on the USB interrupt so nothing is lost between calls.
 //!
-//! Interrupt-driven, so it does not busy-spin. Needs `clk_usb` = 48 MHz (from the
-//! app's `lib/rp235x-startup`). Runs unprivileged with
-//! `uses = ["usbctrl", "usb_dpram", "resets"]` and the `usb-irq` notification.
+//! Interrupt-driven (IRQ 14 as the `usb-irq` notification), so it does not
+//! busy-spin. Needs `clk_usb` = 48 MHz (from the app's `lib/rp235x-startup`).
+//! Runs unprivileged with `uses = ["usbctrl", "usb_dpram", "resets"]`.
 
 #![no_std]
 #![no_main]
 
-// Pulls in userlib's task runtime (`_start`) and panic handler.
-use userlib::{sys_irq_control, sys_recv_open, sys_reply, TaskId};
+use core::convert::Infallible;
+use idol_runtime::{Leased, LenLimit, RequestError, R, W};
+use userlib::{sys_irq_control, RecvMessage};
 
 use rp235x_usb::UsbBus;
 use usb_device::class_prelude::UsbBusAllocator;
@@ -29,15 +29,128 @@ use usb_device::device::StringDescriptors;
 use usb_device::prelude::*;
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
+/// Host->device bytes buffered between `read` calls. Console keystrokes are
+/// slow; 256 is plenty (drop-oldest on overflow).
+const RX_RING_LEN: usize = 256;
+
+struct ServerImpl {
+    dev: UsbDevice<'static, UsbBus>,
+    serial: SerialPort<'static, UsbBus>,
+    ring: [u8; RX_RING_LEN],
+    head: usize,
+    tail: usize,
+}
+
+impl ServerImpl {
+    fn push(&mut self, b: u8) {
+        let next = (self.head + 1) % RX_RING_LEN;
+        if next == self.tail {
+            self.tail = (self.tail + 1) % RX_RING_LEN;
+        }
+        self.ring[self.head] = b;
+        self.head = next;
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.tail == self.head {
+            None
+        } else {
+            let b = self.ring[self.tail];
+            self.tail = (self.tail + 1) % RX_RING_LEN;
+            Some(b)
+        }
+    }
+
+    /// Service the device: run enumeration/control traffic and drain any
+    /// received bytes into the ring.
+    fn poll(&mut self) {
+        if self.dev.poll(&mut [&mut self.serial]) {
+            let mut rx = [0u8; 64];
+            while let Ok(n) = self.serial.read(&mut rx) {
+                if n == 0 {
+                    break;
+                }
+                for &b in &rx[..n] {
+                    self.push(b);
+                }
+            }
+        }
+    }
+}
+
+impl idl::InOrderUsbConsImpl for ServerImpl {
+    fn write(
+        &mut self,
+        _: &RecvMessage,
+        data: LenLimit<Leased<R, [u8]>, 256>,
+    ) -> Result<usize, RequestError<Infallible>> {
+        let len = data.len();
+        let mut chunk = [0u8; 64];
+        let mut off = 0;
+        while off < len {
+            let n = (len - off).min(chunk.len());
+            data.read_range(off..off + n, &mut chunk[..n])
+                .map_err(|_| RequestError::went_away())?;
+            // Best effort: push into the CDC endpoint and service the device so
+            // the packet actually goes out; drop what the host will not take.
+            let _ = self.serial.write(&chunk[..n]);
+            let _ = self.dev.poll(&mut [&mut self.serial]);
+            off += n;
+        }
+        Ok(len)
+    }
+
+    fn read(
+        &mut self,
+        _: &RecvMessage,
+        dest: LenLimit<Leased<W, [u8]>, 256>,
+    ) -> Result<usize, RequestError<Infallible>> {
+        let cap = dest.len();
+        let mut count = 0;
+        while count < cap {
+            match self.pop() {
+                Some(b) => {
+                    dest.write_range(count..count + 1, &[b])
+                        .map_err(|_| RequestError::went_away())?;
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(count)
+    }
+}
+
+impl idol_runtime::NotificationHandler for ServerImpl {
+    fn current_notification_mask(&self) -> u32 {
+        notifications::USB_IRQ_MASK
+    }
+
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::USB_IRQ_MASK) {
+            self.poll();
+            sys_irq_control(notifications::USB_IRQ_MASK, true);
+        }
+    }
+}
+
+/// The `usb-device` objects borrow the bus allocator for their whole life, so
+/// it must live in a static; initialized exactly once at task start (and again
+/// only if jefe restarts the task, which re-runs main from scratch).
+static mut USB_ALLOC: Option<UsbBusAllocator<UsbBus>> = None;
+
 #[export_name = "main"]
 pub fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
 
     // Force VBUS detect since the Pico 2 has no dedicated VBUS sense to the controller.
     let bus = UsbBus::new(p.USB, p.USB_DPRAM, true, &p.RESETS);
-    let alloc = UsbBusAllocator::new(bus);
-    let mut serial = SerialPort::new(&alloc);
-    let mut usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x16c0, 0x27dd))
+    // SAFETY: single-threaded task; main runs once per task (re)start.
+    let alloc: &'static UsbBusAllocator<UsbBus> = unsafe {
+        (*core::ptr::addr_of_mut!(USB_ALLOC)).insert(UsbBusAllocator::new(bus))
+    };
+    let serial = SerialPort::new(alloc);
+    let dev = UsbDeviceBuilder::new(alloc, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
             .manufacturer("Oxide Hubris")
             .product("RP2350 Pico 2 CDC")
@@ -48,30 +161,23 @@ pub fn main() -> ! {
         .unwrap()
         .build();
 
-    let irq = notifications::USB_IRQ_MASK;
-    sys_irq_control(irq, true);
+    sys_irq_control(notifications::USB_IRQ_MASK, true);
 
-    let mut msg = [0u8; 128];
+    let mut server = ServerImpl {
+        dev,
+        serial,
+        ring: [0u8; RX_RING_LEN],
+        head: 0,
+        tail: 0,
+    };
+    let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {
-        let rm = sys_recv_open(&mut msg, irq);
-        if rm.sender == TaskId::KERNEL {
-            // USB interrupt: service the device, echo anything received.
-            if usb_dev.poll(&mut [&mut serial]) {
-                let mut rx = [0u8; 64];
-                if let Ok(n) = serial.read(&mut rx) {
-                    let _ = serial.write(&rx[..n]);
-                }
-            }
-            sys_irq_control(irq, true);
-        } else {
-            // A task wants to log: write its bytes to the serial port (best effort),
-            // then poll once to push them out, and reply so the client unblocks.
-            let n = rm.message_len.min(msg.len());
-            let _ = serial.write(&msg[..n]);
-            let _ = usb_dev.poll(&mut [&mut serial]);
-            sys_reply(rm.sender, 0, &[]);
-        }
+        idol_runtime::dispatch(&mut incoming, &mut server);
     }
+}
+
+mod idl {
+    include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }
 
 // Pulls in the `notifications` module generated from this task's app.toml (provides
