@@ -16,9 +16,11 @@
 #![no_std]
 #![no_main]
 
+use drv_rp235x_adc_api::{Rp235xAdc, TEMP_CHANNEL};
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
+use drv_rp235x_pwm_api::Rp235xPwm;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -30,6 +32,8 @@ task_slot!(UART, uart_driver);
 task_slot!(SPI, spi_driver);
 task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
+task_slot!(ADC, adc_driver);
+task_slot!(PWM, pwm_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -50,6 +54,9 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c write <addr> <hex..>\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
   rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n\
+  temp                  die temperature (internal sensor via ADC)\r\n\
+  adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
+  led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   reboot                reboot the system (bootsel variant not yet supported)\r\n";
 
 struct Shell {
@@ -59,6 +66,8 @@ struct Shell {
     spi: Rp235xSpi,
     i2c: Rp235xI2c,
     flash: Rp235xFlash,
+    adc: Rp235xAdc,
+    pwm: Rp235xPwm,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -135,13 +144,15 @@ impl Shell {
                 self.out.put_u64(sys_get_timer().now);
                 self.out.put(b" ms\r\n");
             }
-            "led" => self.cmd_led(words.next()),
+            "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
             "spi" => self.cmd_spi(line, words.next()),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
+            "temp" => self.cmd_temp(),
+            "adc" => self.cmd_adc(words.next(), words.next()),
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
@@ -183,7 +194,25 @@ impl Shell {
         self.i2c_scan();
     }
 
-    fn cmd_led(&mut self, verb: Option<&str>) {
+    fn cmd_led(&mut self, verb: Option<&str>, arg: Option<&str>) {
+        if verb == Some("dim") {
+            // Hand the pin to PWM (GPIO25 = slice 4, channel B, funcsel 4).
+            let pct =
+                arg.and_then(|a| a.parse::<u8>().ok()).filter(|p| *p <= 100);
+            let Some(pct) = pct else {
+                self.out.put(b"usage: led dim <0-100>\r\n");
+                return;
+            };
+            self.heartbeat = false;
+            let ok = self.gpio.set_function(LED_PIN, 4).is_ok()
+                && self.pwm.set_duty(4, 1, pct).is_ok();
+            self.out
+                .put(if ok { b"ok\r\n" as &[u8] } else { b"error\r\n" });
+            return;
+        }
+        // All other verbs drive the pin as a plain SIO output (this also
+        // reclaims it from PWM after `led dim`).
+        let _ = self.pwm.disable(4);
         let _ = self.gpio.configure_output(LED_PIN);
         // Manual LED control suspends the idle heartbeat (which would
         // otherwise toggle the LED right back within ~500 ms).
@@ -209,12 +238,17 @@ impl Shell {
                 return;
             }
         };
-        self.out.put(if r.is_ok() { b"ok\r\n" as &[u8] } else { b"error\r\n" });
+        self.out.put(if r.is_ok() {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"error\r\n"
+        });
     }
 
     fn cmd_gpio(&mut self, verb: Option<&str>, pin: Option<&str>) {
         let (Some(verb), Some(pin)) = (verb, pin) else {
-            self.out.put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
+            self.out
+                .put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
             return;
         };
         let Ok(pin) = pin.parse::<u8>() else {
@@ -231,17 +265,26 @@ impl Shell {
                 Ok(v) => {
                     self.out.put(b"pin ");
                     self.out.put_u32(pin as u32);
-                    self.out.put(if v != 0 { b" = 1\r\n" as &[u8] } else { b" = 0\r\n" });
+                    self.out.put(if v != 0 {
+                        b" = 1\r\n" as &[u8]
+                    } else {
+                        b" = 0\r\n"
+                    });
                     return;
                 }
                 Err(e) => Err(e),
             },
             _ => {
-                self.out.put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
+                self.out
+                    .put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
                 return;
             }
         };
-        self.out.put(if r.is_ok() { b"ok\r\n" as &[u8] } else { b"error (bad pin?)\r\n" });
+        self.out.put(if r.is_ok() {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"error (bad pin?)\r\n"
+        });
     }
 
     fn cmd_uart(&mut self, line: &str, verb: Option<&str>) {
@@ -337,15 +380,15 @@ impl Shell {
                 let Some(addr) =
                     arg1.and_then(|a| u8::from_str_radix(a, 16).ok())
                 else {
-                    self.out.put(b"usage: i2c write <hex-addr> <hex bytes>\r\n");
+                    self.out
+                        .put(b"usage: i2c write <hex-addr> <hex bytes>\r\n");
                     return;
                 };
                 let mut data = [0u8; 32];
                 // arg2 onward: re-derive from arg2's position is awkward with the
                 // iterator already consumed, so require the bytes in arg2 form:
                 // accept a single run of hex pairs, e.g. `i2c write 42 00ff10`.
-                let Some(n) =
-                    arg2.and_then(|s| parse_hex_bytes(s, &mut data))
+                let Some(n) = arg2.and_then(|s| parse_hex_bytes(s, &mut data))
                 else {
                     self.out.put(b"bad hex (e.g. i2c write 42 00ff10)\r\n");
                     return;
@@ -430,6 +473,48 @@ impl Shell {
         });
     }
 
+    fn cmd_temp(&mut self) {
+        match self.adc.read(TEMP_CHANNEL) {
+            Ok(raw) => {
+                // T(C) = 27 - (V - 0.706 V)/1.721 mV, V = raw * 3.3 / 4096
+                // (datasheet sec 12.4.6), in milli-units to stay integer.
+                let uv = (raw as i64 * 3_300_000) / 4096;
+                let milli_c = 27_000 - ((uv - 706_000) * 1000) / 1721;
+                self.out.put(b"die temp ");
+                if milli_c < 0 {
+                    self.out.put(b"-");
+                }
+                let m = milli_c.unsigned_abs();
+                self.out.put_u64(m / 1000);
+                self.out.put(b".");
+                self.out.put_u64((m % 1000) / 100);
+                self.out.put(b" C (raw ");
+                self.out.put_u32(raw as u32);
+                self.out.put(b")\r\n");
+            }
+            Err(_) => self.out.put(b"adc error\r\n"),
+        }
+    }
+
+    fn cmd_adc(&mut self, verb: Option<&str>, ch: Option<&str>) {
+        let (Some("read"), Some(ch)) =
+            (verb, ch.and_then(|c| c.parse::<u8>().ok()))
+        else {
+            self.out.put(b"usage: adc read <0-4>\r\n");
+            return;
+        };
+        match self.adc.read(ch) {
+            Ok(raw) => {
+                self.out.put(b"adc[");
+                self.out.put_u32(ch as u32);
+                self.out.put(b"] = ");
+                self.out.put_u32(raw as u32);
+                self.out.put(b"\r\n");
+            }
+            Err(_) => self.out.put(b"error (bad channel?)\r\n"),
+        }
+    }
+
     fn cmd_reboot(&mut self, mode: Option<&str>) {
         let bootsel = match mode {
             Some("bootsel") => 1,
@@ -510,6 +595,8 @@ pub fn main() -> ! {
         spi: Rp235xSpi::from(SPI.get_task_id()),
         i2c: Rp235xI2c::from(I2C.get_task_id()),
         flash: Rp235xFlash::from(FLASH.get_task_id()),
+        adc: Rp235xAdc::from(ADC.get_task_id()),
+        pwm: Rp235xPwm::from(PWM.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
@@ -520,7 +607,9 @@ pub fn main() -> ! {
 
     // Let enumeration settle, then greet.
     hl::sleep_for(1500);
-    shell.out.put(b"\r\nHubris on RP2350 / Pico 2 -- type `help`\r\n");
+    shell
+        .out
+        .put(b"\r\nHubris on RP2350 / Pico 2 -- type `help`\r\n");
     shell.out.put(PROMPT);
     shell.out.flush();
 

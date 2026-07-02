@@ -1,0 +1,16 @@
+// RP2350 (RP235x) ADC driver API.
+//
+// One-shot conversions. Channels 0-3 are GPIO26-29; channel 4 is the internal
+// temperature sensor (QFN-60 / RP2350A).
+
+Interface(
+    name: "Rp235xAdc",
+    ops: {
+        "read": (
+            description: "One-shot 12-bit conversion of the given channel (0-3 = GPIO26-29, 4 = temperature sensor).",
+            args: { "channel": "u8" },
+            reply: Result(ok: "u16", err: CLike("AdcError")),
+            idempotent: true,
+        ),
+    },
+)

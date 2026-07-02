@@ -102,6 +102,11 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
         .clk_usb_ctrl()
         .write(|w| w.enable().set_bit().auxsrc().clksrc_pll_usb());
 
+    // --- 8. clk_adc = 48 MHz from PLL_USB (feeds the ADC) ---
+    p.CLOCKS
+        .clk_adc_ctrl()
+        .write(|w| w.enable().set_bit().auxsrc().clksrc_pll_usb());
+
     SYS_CLK_HZ / 1000
 }
 

@@ -1,0 +1,23 @@
+// RP2350 (RP235x) PWM driver API.
+//
+// Minimal duty-cycle control: 1 kHz period, percent duty on one channel of
+// one of the twelve slices. The GPIO must separately be function-selected to
+// PWM (funcsel 4) via the GPIO driver.
+
+Interface(
+    name: "Rp235xPwm",
+    ops: {
+        "set_duty": (
+            description: "Drive slice/channel (chan_b: 0 = A, nonzero = B) at `percent` duty, 1 kHz. Enables the slice.",
+            args: { "slice": "u8", "chan_b": "u8", "percent": "u8" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
+        "disable": (
+            description: "Stop a slice (both channels).",
+            args: { "slice": "u8" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
+    },
+)

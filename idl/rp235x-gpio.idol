@@ -33,6 +33,12 @@ Interface(
             reply: Result(ok: "()", err: CLike("GpioError")),
             idempotent: true,
         ),
+        "set_function": (
+            description: "Route a pin to an alternate function (IO_BANK0 FUNCSEL value, e.g. 4 = PWM, 5 = SIO).",
+            args: { "pin": "u8", "funcsel": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
         "read": (
             description: "Read a pin's current input level (0 or 1).",
             args: { "pin": "u8" },

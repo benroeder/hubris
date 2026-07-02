@@ -1,0 +1,24 @@
+[package]
+name = "drv-rp235x-adc-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+
+counters = { path = "../../lib/counters" }
+derive-idol-err = { path = "../../lib/derive-idol-err" }
+userlib = { path = "../../sys/userlib" }
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[build-dependencies]
+idol = { workspace = true }
+
+[lints]
+workspace = true

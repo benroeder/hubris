@@ -17,7 +17,7 @@
 use drv_rp235x_gpio_api::GpioError;
 use drv_rp235x_sys_api::{self as sys_api, Rp235xSys};
 use idol_runtime::RequestError;
-use userlib::{task_slot, RecvMessage};
+use userlib::{RecvMessage, task_slot};
 
 task_slot!(SYS, sys);
 
@@ -127,6 +127,30 @@ impl idl::InOrderRp235xGpioImpl for ServerImpl {
     ) -> Result<u8, RequestError<GpioError>> {
         Self::check(pin)?;
         Ok(((self.sio.gpio_in().read().bits() >> pin) & 1) as u8)
+    }
+
+    fn set_function(
+        &mut self,
+        _: &RecvMessage,
+        pin: u8,
+        funcsel: u8,
+    ) -> Result<(), RequestError<GpioError>> {
+        Self::check(pin)?;
+        if funcsel > 0x1f {
+            // Not literally a pin problem, but the only error this API has.
+            return Err(GpioError::InvalidPin.into());
+        }
+        // Un-isolate the pad and enable both directions (output drive for
+        // output functions, input buffer for input functions -- harmless for
+        // the unused direction), then route the pin.
+        self.pads_bank0
+            .gpio(pin as usize)
+            .modify(|_, w| w.od().clear_bit().ie().set_bit().iso().clear_bit());
+        self.io_bank0
+            .gpio(pin as usize)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(funcsel) });
+        Ok(())
     }
 }
 

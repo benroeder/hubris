@@ -35,6 +35,14 @@ address = 0x4009_0000  # DW_apb_i2c I2C0
 size = 0x1000
 interrupts = { irq = 36 }  # I2C0_IRQ
 
+[adc]
+address = 0x400a_0000  # ADC + temperature sensor
+size = 0x1000
+
+[pwm]
+address = 0x400a_8000  # PWM (12 slices)
+size = 0x1000
+
 [psm]
 address = 0x4001_8000  # power-on state machine (WDSEL: what a watchdog reset resets)
 size = 0x1000
