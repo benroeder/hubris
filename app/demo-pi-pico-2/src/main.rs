@@ -37,7 +37,12 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
     0x8100_0406,
     0x1000_0000, // entry 0: storage start (physical flash address)
     0x2000_0000, // entry 0: runtime start (SRAM)
-    0x1004_0000, // entry 0: storage end (256 KiB window)
+    // Entry 0 end: the RUNTIME end address. The datasheet table calls this
+    // field "storage_end_address", but the bootrom source (varm_blocks.c)
+    // computes size = <this word> - runtime_start for absolute entries, so it
+    // must be in runtime space; storage-end here fails the span check and the
+    // ROM rejects the whole block (INVALID_BLOCK_LOOP diagnostic).
+    0x2004_0000,
     0x0000_07ff, // BLOCK_ITEM_LAST, size = 7 words of items
     0x0000_0000, // link = self (single-block loop)
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
