@@ -1,0 +1,33 @@
+// RP2350 (RP235x) I2C0 (DesignWare DW_apb_i2c) driver API.
+//
+// Minimal 7-bit master. Pins: SDA=GP4, SCL=GP5 (funcsel 3), internal pull-ups.
+
+Interface(
+    name: "Rp235xI2c",
+    ops: {
+        "probe": (
+            description: "Return true if a device ACKs this 7-bit address.",
+            args: { "addr": "u8" },
+            reply: Result(ok: "bool", err: CLike("I2cError")),
+            idempotent: true,
+        ),
+        "write": (
+            description: "Write bytes to a 7-bit address (STOP after). Returns count.",
+            args: { "addr": "u8" },
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(256)),
+            },
+            reply: Result(ok: "usize", err: CLike("I2cError")),
+            idempotent: true,
+        ),
+        "read": (
+            description: "Read bytes from a 7-bit address (STOP after). Returns count.",
+            args: { "addr": "u8" },
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Result(ok: "usize", err: CLike("I2cError")),
+            idempotent: true,
+        ),
+    },
+)

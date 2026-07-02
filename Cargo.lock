@@ -2244,6 +2244,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-rp235x-i2c"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "drv-rp235x-i2c-api",
+ "drv-rp235x-sys-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-i2c-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-rp235x-spi"
 version = "0.1.0"
 dependencies = [
@@ -6700,6 +6729,7 @@ name = "task-rp235x-logdemo"
 version = "0.1.0"
 dependencies = [
  "drv-rp235x-gpio-api",
+ "drv-rp235x-i2c-api",
  "drv-rp235x-spi-api",
  "drv-rp235x-uart-api",
  "userlib",

@@ -15,6 +15,7 @@
 #![no_main]
 
 use drv_rp235x_gpio_api::Rp235xGpio;
+use drv_rp235x_i2c_api::Rp235xI2c;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use userlib::{hl, sys_send, task_slot};
@@ -23,6 +24,7 @@ task_slot!(USB, usb);
 task_slot!(GPIO, gpio_driver);
 task_slot!(UART, uart_driver);
 task_slot!(SPI, spi_driver);
+task_slot!(I2C, i2c_driver);
 
 /// IPC operation understood by the USB console server: "write these bytes".
 const OP_WRITE: u16 = 1;
@@ -35,6 +37,7 @@ pub fn main() -> ! {
     let gpio = Rp235xGpio::from(GPIO.get_task_id());
     let uart = Rp235xUart::from(UART.get_task_id());
     let spi = Rp235xSpi::from(SPI.get_task_id());
+    let i2c = Rp235xI2c::from(I2C.get_task_id());
 
     // Drive the LED through the GPIO driver.
     let _ = gpio.configure_output(LED_PIN);
@@ -61,24 +64,61 @@ pub fn main() -> ! {
         let _ = spi.exchange(&tx, &mut srx);
         let spi_ok = srx == tx;
 
-        let mut line = [0u8; 64];
-        let msg = format_line(&mut line, n, rx_count as u32, spi_ok);
+        // I2C bus scan: probe every 7-bit address; count ACKs and remember the
+        // first responder. With nothing on GP4/GP5 this reports 0 devices --
+        // still proving the controller runs transactions (each probe NAKs).
+        let mut i2c_found: u32 = 0;
+        let mut i2c_first: u32 = 0;
+        for addr in 0x08u8..0x78 {
+            if let Ok(true) = i2c.probe(addr) {
+                if i2c_found == 0 {
+                    i2c_first = addr as u32;
+                }
+                i2c_found += 1;
+            }
+        }
+
+        let mut line = [0u8; 96];
+        let msg =
+            format_line(&mut line, n, rx_count as u32, spi_ok, i2c_found, i2c_first);
         let _ = sys_send(usb, OP_WRITE, msg, &mut [], &[]);
         n = n.wrapping_add(1);
         hl::sleep_for(1000);
     }
 }
 
-/// Write `"tick <n> uart_rx=<rx> spi=OK|BAD\r\n"` into `buf`; return the used slice.
-fn format_line(buf: &mut [u8], n: u32, rx: u32, spi_ok: bool) -> &[u8] {
+/// Write `"tick <n> uart_rx=<rx> spi=OK|BAD i2c=<count>[@<first>]\r\n"` into
+/// `buf`; return the used slice.
+fn format_line(
+    buf: &mut [u8],
+    n: u32,
+    rx: u32,
+    spi_ok: bool,
+    i2c_found: u32,
+    i2c_first: u32,
+) -> &[u8] {
     let mut i = 0;
     i = append(buf, i, b"tick ");
     i = append_u32(buf, i, n);
     i = append(buf, i, b" uart_rx=");
     i = append_u32(buf, i, rx);
     i = append(buf, i, if spi_ok { b" spi=OK" } else { b" spi=BAD" });
+    i = append(buf, i, b" i2c=");
+    i = append_u32(buf, i, i2c_found);
+    if i2c_found > 0 {
+        i = append(buf, i, b"@0x");
+        i = append_hex(buf, i, i2c_first);
+    }
     i = append(buf, i, b"\r\n");
     &buf[..i]
+}
+
+fn append_hex(buf: &mut [u8], mut i: usize, n: u32) -> usize {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    buf[i] = DIGITS[((n >> 4) & 0xf) as usize];
+    buf[i + 1] = DIGITS[(n & 0xf) as usize];
+    i += 2;
+    i
 }
 
 fn append(buf: &mut [u8], mut i: usize, s: &[u8]) -> usize {

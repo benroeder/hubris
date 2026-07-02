@@ -58,6 +58,23 @@ fn main() -> ! {
     p.SIO.gpio_oe_set().write(|w| unsafe { w.bits(1 << LED_PIN) });
     p.SIO.gpio_out_set().write(|w| unsafe { w.bits(1 << LED_PIN) });
 
+    // I2C0 pins: GP4 = SDA, GP5 = SCL (funcsel 3), open-drain bus with the
+    // internal pull-ups enabled and inputs on. Privileged (touches PADS/IO_BANK0);
+    // the I2C driver task itself only gets the i2c0 register window.
+    for pin in [4usize, 5] {
+        p.PADS_BANK0.gpio(pin).modify(|_, w| {
+            w.od().clear_bit();
+            w.iso().clear_bit();
+            w.ie().set_bit();
+            w.pue().set_bit();
+            w.pde().clear_bit()
+        });
+        p.IO_BANK0
+            .gpio(pin)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(3) });
+    }
+
     // Bring up XOSC + PLL_SYS to a known 150 MHz and get the accurate tick
     // divisor. Runs here (privileged, pre-kernel) because CLOCKS/PLL are
     // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
