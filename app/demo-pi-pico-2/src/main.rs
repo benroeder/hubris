@@ -24,10 +24,21 @@ const LED_PIN: u32 = 25;
 /// `docs/rp2350-research/findings.md`.
 #[link_section = ".image_def"]
 #[used]
-pub static RP235X_IMAGE_DEF_ARM_MIN: [u32; 5] = [
+pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
     0xffff_ded3, // PICOBIN_BLOCK_MARKER_START
     0x1021_0142, // IMAGE_TYPE item: EXE | SECURITY(S) | CPU(Arm) | CHIP(RP2350)
-    0x0000_01ff, // BLOCK_ITEM_LAST, size = 1 word
+    // VECTOR_TABLE item (type 0x03, 2 words): the runtime vector table is at
+    // the image's RAM base, where the LOAD_MAP below puts it.
+    0x0000_0203,
+    0x2000_0000,
+    // LOAD_MAP item (type 0x06, size 4 words, absolute + 1 entry = 0x81):
+    // the ROM copies the whole 256 KiB code window from flash storage into
+    // SRAM before boot, so nothing ever executes from flash at runtime.
+    0x8100_0406,
+    0x1000_0000, // entry 0: storage start (physical flash address)
+    0x2000_0000, // entry 0: runtime start (SRAM)
+    0x1004_0000, // entry 0: storage end (256 KiB window)
+    0x0000_07ff, // BLOCK_ITEM_LAST, size = 7 words of items
     0x0000_0000, // link = self (single-block loop)
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
 ];

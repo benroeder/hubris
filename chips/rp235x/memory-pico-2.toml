@@ -1,14 +1,21 @@
+# RAM image: the whole Hubris image (kernel + tasks) is linked at and runs
+# from SRAM. The boot ROM copies it out of QSPI flash at boot, directed by the
+# LOAD_MAP item in the app's IMAGE_DEF block (datasheet sec 5.1.10 "packaged
+# binaries"). Nothing executes from flash at runtime, which removes the XIP
+# hazard entirely: flash can be erased/programmed while the system runs.
+#
+# The "flash" pool below is therefore an SRAM range (code, read+execute); it
+# must stay inside the 256 KiB window the LOAD_MAP copies (storage
+# 0x10000000..0x10040000 -> runtime 0x20000000..0x20040000).
 [[flash]]
-address = 0x1000_0000  # 2.2. Address map "XIP 0x10000000"
-# NOTE: RP235x flash is external, so the value here is a property of the Pico 2, not
-# the RP2350 itself. Update to suit your actual hardware.
-size = 0x40_0000       # Pico 2 datasheet: "RP2350 microcontroller with 4 MB of flash"
+address = 0x2000_0000
+size = 0x4_0000        # 256 KiB code window (of 520 KiB total SRAM)
 read = true
 execute = true
 
 [[ram]]
-address = 0x2000_0000  # 4.2. SRAM, mapped at 0x20000000
-size = 0x8_2000        # 520 kB total on-chip SRAM (striped SRAM0-7 + SRAM8/9)
+address = 0x2004_0000  # data pool: the rest of SRAM (striped SRAM0-7 + SRAM8/9)
+size = 0x4_2000
 read = true
 write = true
 execute = false
