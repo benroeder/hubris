@@ -133,5 +133,17 @@ fn main() -> ! {
     rp235x_uart::configure(&p, cycles_per_ms * 1000);
     rp235x_uart::write_all(&p, b"\r\nHubris booting on RP2350 / Pico 2\r\n");
 
+    // Stash the unique 64-bit device id (OTP CHIPID0..3) in the tail of USB
+    // DPRAM for the USB task, which builds its serial-number string from it
+    // (per-board serials keep multiple boards distinct on one host). Read
+    // here because OTP is privileged-only; DPRAM chosen because the USB task
+    // already maps it and the endpoint allocator never reaches the tail.
+    let id: u64 = (p.OTP_DATA.chipid3().read().bits() as u64) << 48
+        | (p.OTP_DATA.chipid2().read().bits() as u64) << 32
+        | (p.OTP_DATA.chipid1().read().bits() as u64) << 16
+        | p.OTP_DATA.chipid0().read().bits() as u64;
+    const CHIPID_STASH: *mut u64 = 0x5010_0ff0 as _;
+    unsafe { core::ptr::write_volatile(CHIPID_STASH, id) };
+
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }

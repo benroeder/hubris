@@ -43,6 +43,10 @@ size = 0x1000
 address = 0x400a_8000  # PWM (12 slices)
 size = 0x1000
 
+[otp_data]
+address = 0x4013_0000  # OTP data (ECC alias): CHIPID0..3 = unique 64-bit device id
+size = 0x1000
+
 [psm]
 address = 0x4001_8000  # power-on state machine (WDSEL: what a watchdog reset resets)
 size = 0x1000

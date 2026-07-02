@@ -139,9 +139,35 @@ impl idol_runtime::NotificationHandler for ServerImpl {
 /// only if jefe restarts the task, which re-runs main from scratch).
 static mut USB_ALLOC: Option<UsbBusAllocator<UsbBus>> = None;
 
+/// USB serial-number string, filled from the chip's unique 64-bit device id
+/// (OTP CHIPID0..3) so multiple boards enumerate distinctly on one host.
+/// Static because the string descriptors borrow it for the device's life.
+static mut SERIAL: [u8; 17] = [0; 17];
+
+/// Format the device id (matching `picotool info` byte order) into
+/// [`SERIAL`] and return it as a str. The id is stashed in the DPRAM tail by
+/// the app's privileged pre-kernel main (OTP itself is privileged-only); the
+/// endpoint allocator never reaches this offset.
+fn unique_serial() -> &'static str {
+    const CHIPID_STASH: *const u64 = 0x5010_0ff0 as _;
+    let id: u64 = unsafe { core::ptr::read_volatile(CHIPID_STASH) };
+    const D: &[u8; 16] = b"0123456789ABCDEF";
+    // SAFETY: single-threaded task; written once here at startup, before the
+    // descriptor ever renders it.
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(SERIAL);
+        buf[0] = b'H'; // mark the device as Hubris at a glance
+        for i in 0..16 {
+            buf[i + 1] = D[((id >> (60 - 4 * i)) & 0xf) as usize];
+        }
+        core::str::from_utf8_unchecked(&*core::ptr::addr_of!(SERIAL))
+    }
+}
+
 #[export_name = "main"]
 pub fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
+    let serial_str = unique_serial();
 
     // Force VBUS detect since the Pico 2 has no dedicated VBUS sense to the controller.
     let bus = UsbBus::new(p.USB, p.USB_DPRAM, true, &p.RESETS);
@@ -154,7 +180,7 @@ pub fn main() -> ! {
         .strings(&[StringDescriptors::default()
             .manufacturer("Oxide Hubris")
             .product("RP2350 Pico 2 CDC")
-            .serial_number("HUBRIS-0001")])
+            .serial_number(serial_str)])
         .unwrap()
         .device_class(USB_CLASS_CDC)
         .max_packet_size_0(64)
