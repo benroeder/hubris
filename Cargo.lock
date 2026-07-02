@@ -2270,6 +2270,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-rp235x-uart"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "drv-rp235x-uart-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "rp235x-uart",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-uart-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-sbrmi"
 version = "0.1.0"
 dependencies = [
@@ -6645,6 +6673,7 @@ name = "task-rp235x-logdemo"
 version = "0.1.0"
 dependencies = [
  "drv-rp235x-gpio-api",
+ "drv-rp235x-uart-api",
  "userlib",
 ]
 

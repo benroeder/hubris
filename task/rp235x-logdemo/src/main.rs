@@ -2,24 +2,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Demo client exercising two Hubris IPC servers:
+//! Demo client exercising three RP2350 Idol/IPC servers from one unprivileged task:
 //!
-//! * the **GPIO Idol driver** (`drv-rp235x-gpio`) -- it toggles the onboard LED
-//!   (GPIO25) each tick via a typed `gpio.toggle(...)` call, not by poking registers;
-//! * the **USB console** (`task-rp235x-usb`) -- it logs an incrementing counter over
-//!   USB once a second via a raw IPC message.
-//!
-//! So the LED blink now proves the GPIO Idol driver works end to end, and the USB
-//! log proves the console, both from an ordinary unprivileged client task.
+//! * the **GPIO driver** (`drv-rp235x-gpio`) -- toggles the onboard LED (GPIO25) each
+//!   tick via a typed `gpio.toggle(...)` call, not by poking registers;
+//! * the **UART driver** (`drv-rp235x-uart`) -- writes a marker out TX and reads back
+//!   whatever RX buffered (echoes with a GP0->GP1 loopback jumper);
+//! * the **USB console** (`task-rp235x-usb`) -- logs a counter and the UART RX byte
+//!   count over USB once a second.
 
 #![no_std]
 #![no_main]
 
 use drv_rp235x_gpio_api::Rp235xGpio;
+use drv_rp235x_uart_api::Rp235xUart;
 use userlib::{hl, sys_send, task_slot};
 
 task_slot!(USB, usb);
 task_slot!(GPIO, gpio_driver);
+task_slot!(UART, uart_driver);
 
 /// IPC operation understood by the USB console server: "write these bytes".
 const OP_WRITE: u16 = 1;
@@ -30,6 +31,7 @@ const LED_PIN: u8 = 25;
 pub fn main() -> ! {
     let usb = USB.get_task_id();
     let gpio = Rp235xGpio::from(GPIO.get_task_id());
+    let uart = Rp235xUart::from(UART.get_task_id());
 
     // Drive the LED through the GPIO driver.
     let _ = gpio.configure_output(LED_PIN);
@@ -42,23 +44,41 @@ pub fn main() -> ! {
     loop {
         let _ = gpio.toggle(LED_PIN);
 
-        let mut line = [0u8; 32];
-        let msg = format_line(&mut line, n);
+        // UART self-test: send a marker out TX, then read back whatever arrived.
+        // With a GP0->GP1 loopback jumper this echoes; without it rx_count is 0.
+        uart.write(b"uart-loopback\r\n");
+        hl::sleep_for(5);
+        let mut rx = [0u8; 32];
+        let rx_count = uart.read(&mut rx);
+
+        let mut line = [0u8; 48];
+        let msg = format_line(&mut line, n, rx_count as u32);
         let _ = sys_send(usb, OP_WRITE, msg, &mut [], &[]);
         n = n.wrapping_add(1);
         hl::sleep_for(1000);
     }
 }
 
-/// Write `"logdemo tick <n>\r\n"` into `buf` and return the used slice.
-fn format_line(buf: &mut [u8; 32], n: u32) -> &[u8] {
-    const PREFIX: &[u8] = b"logdemo tick ";
+/// Write `"tick <n> uart_rx=<rx>\r\n"` into `buf` and return the used slice.
+fn format_line(buf: &mut [u8], n: u32, rx: u32) -> &[u8] {
     let mut i = 0;
-    for &b in PREFIX {
+    i = append(buf, i, b"tick ");
+    i = append_u32(buf, i, n);
+    i = append(buf, i, b" uart_rx=");
+    i = append_u32(buf, i, rx);
+    i = append(buf, i, b"\r\n");
+    &buf[..i]
+}
+
+fn append(buf: &mut [u8], mut i: usize, s: &[u8]) -> usize {
+    for &b in s {
         buf[i] = b;
         i += 1;
     }
-    // Decimal-format n into a temporary, then copy in order.
+    i
+}
+
+fn append_u32(buf: &mut [u8], i: usize, n: u32) -> usize {
     let mut tmp = [0u8; 10];
     let mut j = tmp.len();
     let mut m = n;
@@ -72,12 +92,5 @@ fn format_line(buf: &mut [u8; 32], n: u32) -> &[u8] {
             m /= 10;
         }
     }
-    while j < tmp.len() {
-        buf[i] = tmp[j];
-        i += 1;
-        j += 1;
-    }
-    buf[i] = b'\r';
-    buf[i + 1] = b'\n';
-    &buf[..i + 2]
+    append(buf, i, &tmp[j..])
 }

@@ -1,0 +1,26 @@
+// RP2350 (RP235x) UART0 driver API.
+//
+// Busy-polled TX; interrupt-driven RX buffered in the server. Both ops carry the
+// bytes as a lease and return the count transferred.
+
+Interface(
+    name: "Rp235xUart",
+    ops: {
+        "write": (
+            description: "Send bytes out UART0 TX (busy-polled). Returns the count sent.",
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+        "read": (
+            description: "Copy any buffered received bytes into dest. Returns the count (0 if none waiting).",
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+    },
+)
