@@ -82,21 +82,21 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         _: &RecvMessage,
         bootsel: u8,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
-        if bootsel != 0 {
-            // Rebooting into BOOTSEL means calling the ROM's reboot function,
-            // and calling *any* ROM function from an unprivileged task
-            // currently faults (the ROM enters via RCP-canary instructions;
-            // investigation parked until a debug probe is available). Report
-            // unsupported instead of wedging the system.
-            return Ok(u32::MAX);
-        }
-        // Plain reboot, no ROM involved: select everything but the processor
-        // cold domain for watchdog reset, clear any stale vectored-boot magic
-        // in the scratch registers, and force the reset. Needs the
-        // watchdog + psm MPU grants (app.toml) and ACCESSCTRL opened for them
-        // (rp235x-startup).
+        // ROM functions cannot be called from unprivileged tasks (privilege-
+        // gated; verified by experiment), so both variants reboot via direct
+        // watchdog/PSM writes. For BOOTSEL, a magic in watchdog scratch0
+        // (which survives the reset) asks the app's *privileged* pre-kernel
+        // boot path to complete the hop by calling the ROM reboot-to-BOOTSEL.
+        // Needs the watchdog + psm MPU grants (app.toml) and ACCESSCTRL
+        // opened for them (rp235x-startup).
+        const BOOTSEL_MAGIC: u32 = 0xb007_5e1f;
         let psm = unsafe { &*rp235x_pac::PSM::ptr() };
         let wd = unsafe { &*rp235x_pac::WATCHDOG::ptr() };
+        wd.scratch0().write(|w| unsafe {
+            w.bits(if bootsel != 0 { BOOTSEL_MAGIC } else { 0 })
+        });
+        // Select everything but the processor cold domain for watchdog
+        // reset, clear any stale vectored-boot magic, and force the reset.
         psm.wdsel().write(|w| unsafe { w.bits(0xffff_fffe) });
         wd.scratch4().write(|w| unsafe { w.bits(0) });
         wd.ctrl().modify(|_, w| w.trigger().set_bit());

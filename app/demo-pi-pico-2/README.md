@@ -70,11 +70,14 @@ The onboard LED blinks ~1 Hz as a liveness heartbeat while the shell is idle.
   and the kernel's per-task null region (0x0..0x20) makes the boot ROM's Arm
   header words unreachable -- the ROM function table is found via the RISC-V
   pointer copy at 0x7df6 and walked in Rust (`lib/rp235x-romapi`).
-- **Boot-ROM calls**: *calling* ROM functions from unprivileged tasks
-  currently faults (suspected RCP-canary hardening); `reboot` therefore
-  drives the watchdog/PSM registers directly. Reads/lookups work.
-- Known gaps: erase/program (flash stage 2: needs a RAM-resident kernel),
-  reboot-to-BOOTSEL, analog pad config for ADC channels 0-3.
+- **Boot-ROM calls are privilege-gated** (verified by experiment: a
+  privileged `flash_op` works; the same call from a task faults). `reboot`
+  drives the watchdog/PSM registers directly, and `reboot bootsel` does a
+  two-hop: the task marks watchdog scratch0 and watchdog-reboots, then the
+  privileged pre-kernel boot path sees the marker and calls the ROM
+  reboot-into-BOOTSEL. Reads/lookups work from tasks (table walked in Rust).
+- Known gaps: erase/program (flash stage 2: needs a RAM-resident kernel and
+  a privileged path for ROM flash calls), analog pad config for ADC 0-3.
 
 ## Debug
 

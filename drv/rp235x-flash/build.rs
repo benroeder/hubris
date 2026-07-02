@@ -24,8 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Derive the flash window base/size from this task's `xip` extern region
     // (chips/rp235x/memory-*.toml), so the driver tracks the board config
     // instead of hardcoding the Pico 2's 4 MB.
-    let regions =
-        build_util::task_extern_regions::<Region>().map_err(|e| e.to_string())?;
+    let regions = build_util::task_extern_regions::<Region>()
+        .map_err(|e| e.to_string())?;
     let xip = regions
         .get("xip")
         .ok_or("xip extern region not found in task config")?;

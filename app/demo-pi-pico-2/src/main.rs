@@ -32,9 +32,35 @@ pub static RP235X_IMAGE_DEF_ARM_MIN: [u32; 5] = [
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
 ];
 
+/// Watchdog scratch0 marker: "this reboot wants to land in BOOTSEL". Written
+/// by the flash driver's `reboot(bootsel)`; scratch registers survive a
+/// watchdog reset. Scratch 4-7 are reserved for the ROM's vectored-boot
+/// protocol; 0 is free for the application.
+const BOOTSEL_MAGIC: u32 = 0xb007_5e1f;
+
 #[entry]
 fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
+
+    // Two-hop BOOTSEL reboot: calling boot-ROM functions from unprivileged
+    // tasks faults (privilege-gated; verified by experiment -- a privileged
+    // flash_op here works), so the runtime `reboot bootsel` instead marks
+    // watchdog scratch0 and does a plain watchdog reboot; *this* privileged
+    // boot path completes the hop by calling the ROM reboot into BOOTSEL.
+    if p.WATCHDOG.scratch0().read().bits() == BOOTSEL_MAGIC {
+        p.WATCHDOG.scratch0().write(|w| unsafe { w.bits(0) });
+        let rb = rp235x_romapi::rom_table_lookup(
+            *b"RB",
+            rp235x_romapi::RT_FLAG_FUNC_ARM_SEC,
+        );
+        if rb != 0 {
+            let f: unsafe extern "C" fn(u32, u32, u32, u32) -> i32 =
+                unsafe { core::mem::transmute(rb) };
+            // REBOOT_TYPE_BOOTSEL (0x2) | NO_RETURN_ON_SUCCESS (0x100).
+            unsafe { f(0x0102, 10, 0, 0) };
+        }
+        // Lookup/call failure: fall through to a normal boot.
+    }
 
     // Bring IO_BANK0 and PADS_BANK0 out of reset. This runs in the privileged
     // pre-kernel context (MPU not yet enabled), so no `uses` grant is required.

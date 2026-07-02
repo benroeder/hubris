@@ -57,7 +57,7 @@ const HELP: &[u8] = b"commands:\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
-  reboot                reboot the system (bootsel variant not yet supported)\r\n";
+  reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -545,9 +545,11 @@ impl Shell {
         };
         let rc = self.flash.reboot(bootsel);
         if rc == 0 {
-            self.out.put(b"rebooting...\r\n");
-        } else if rc == u32::MAX {
-            self.out.put(b"bootsel reboot not yet supported (needs a ROM call; parked until a debug probe is available)\r\n");
+            self.out.put(if bootsel != 0 {
+                b"rebooting to BOOTSEL...\r\n" as &[u8]
+            } else {
+                b"rebooting...\r\n"
+            });
         } else {
             self.out.put(b"reboot failed, rc=");
             self.out.put_hex32(rc);

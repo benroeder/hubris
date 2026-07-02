@@ -973,6 +973,7 @@ dependencies = [
  "cortex-m-rt",
  "kern",
  "rp235x-pac",
+ "rp235x-romapi",
  "rp235x-startup",
  "rp235x-uart",
 ]

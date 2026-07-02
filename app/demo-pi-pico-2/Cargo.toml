@@ -13,6 +13,7 @@ rp235x-pac = { workspace = true, features = ["rt"] }
 kern = { path = "../../sys/kern", default-features = false }
 rp235x-startup = { path = "../../lib/rp235x-startup" }
 rp235x-uart = { path = "../../lib/rp235x-uart" }
+rp235x-romapi = { path = "../../lib/rp235x-romapi" }
 
 [build-dependencies]
 build-util = { path = "../../build/util" }
