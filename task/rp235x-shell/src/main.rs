@@ -45,7 +45,7 @@ const HELP: &[u8] = b"commands:\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
-  gpio out|in|hi|lo|toggle|read <pin>\r\n\
+  gpio out|in|hi|lo|toggle|read <pin> | gpio pull <pin> up|down|none\r\n\
   uart send <text>      send out UART0 TX (GP0)\r\n\
   uart recv             drain UART0 RX buffer\r\n\
   spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
@@ -145,7 +145,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "led" => self.cmd_led(words.next(), words.next()),
-            "gpio" => self.cmd_gpio(words.next(), words.next()),
+            "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
             "spi" => self.cmd_spi(line, words.next()),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
@@ -245,10 +245,15 @@ impl Shell {
         });
     }
 
-    fn cmd_gpio(&mut self, verb: Option<&str>, pin: Option<&str>) {
+    fn cmd_gpio(
+        &mut self,
+        verb: Option<&str>,
+        pin: Option<&str>,
+        arg: Option<&str>,
+    ) {
         let (Some(verb), Some(pin)) = (verb, pin) else {
             self.out
-                .put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
+                .put(b"usage: gpio out|in|hi|lo|toggle|read|pull <pin>\r\n");
             return;
         };
         let Ok(pin) = pin.parse::<u8>() else {
@@ -256,6 +261,19 @@ impl Shell {
             return;
         };
         let r = match verb {
+            "pull" => {
+                let pull = match arg {
+                    Some("up") => drv_rp235x_gpio_api::PULL_UP,
+                    Some("down") => drv_rp235x_gpio_api::PULL_DOWN,
+                    Some("none") => drv_rp235x_gpio_api::PULL_NONE,
+                    _ => {
+                        self.out
+                            .put(b"usage: gpio pull <pin> up|down|none\r\n");
+                        return;
+                    }
+                };
+                self.gpio.set_pull(pin, pull)
+            }
             "out" => self.gpio.configure_output(pin),
             "in" => self.gpio.configure_input(pin),
             "hi" => self.gpio.set_high(pin),
@@ -275,8 +293,9 @@ impl Shell {
                 Err(e) => Err(e),
             },
             _ => {
-                self.out
-                    .put(b"usage: gpio out|in|hi|lo|toggle|read <pin>\r\n");
+                self.out.put(
+                    b"usage: gpio out|in|hi|lo|toggle|read|pull <pin>\r\n",
+                );
                 return;
             }
         };

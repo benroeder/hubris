@@ -15,4 +15,14 @@ pub enum GpioError {
     InvalidPin = 1,
 }
 
+/// `set_pull` argument: no pulls.
+pub const PULL_NONE: u8 = 0;
+/// `set_pull` argument: pull-up (preferred for inputs; see RP2350-E9).
+pub const PULL_UP: u8 = 1;
+/// `set_pull` argument: pull-down. NOTE erratum RP2350-E9: a Bank 0 pad
+/// whose input has latched high (input driven above ~2.2 V then released)
+/// is NOT recovered by the weak internal pull-down; use an external
+/// pull-down (< 8.2 kOhm) or prefer pull-ups where possible.
+pub const PULL_DOWN: u8 = 2;
+
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));

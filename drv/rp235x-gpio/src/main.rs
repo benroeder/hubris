@@ -129,6 +129,38 @@ impl idl::InOrderRp235xGpioImpl for ServerImpl {
         Ok(((self.sio.gpio_in().read().bits() >> pin) & 1) as u8)
     }
 
+    fn set_pull(
+        &mut self,
+        _: &RecvMessage,
+        pin: u8,
+        pull: u8,
+    ) -> Result<(), RequestError<GpioError>> {
+        let p = Self::check(pin)?;
+        // Erratum RP2350-E9: a Bank 0 pad whose enabled input has been driven
+        // above ~2.2 V and released latches high, and the weak internal
+        // pull-down cannot recover it -- so pull-ups are the safe default for
+        // inputs; pull-down callers are warned in the API docs.
+        let (pue, pde) = match pull {
+            drv_rp235x_gpio_api::PULL_NONE => (false, false),
+            drv_rp235x_gpio_api::PULL_UP => (true, false),
+            drv_rp235x_gpio_api::PULL_DOWN => (false, true),
+            _ => return Err(GpioError::InvalidPin.into()),
+        };
+        self.pads_bank0
+            .gpio(p)
+            .modify(|_, w| w.pue().bit(pue).pde().bit(pde));
+        // E9 latch clear: if the input is enabled and was latched high (e.g.
+        // by a previous pull-up), the new pull-down alone cannot bring it
+        // back down. Cycling the pad's input-enable releases the latch;
+        // harmless when the input was not latched (or not enabled).
+        let ie = self.pads_bank0.gpio(p).read().ie().bit_is_set();
+        if ie {
+            self.pads_bank0.gpio(p).modify(|_, w| w.ie().clear_bit());
+            self.pads_bank0.gpio(p).modify(|_, w| w.ie().set_bit());
+        }
+        Ok(())
+    }
+
     fn set_function(
         &mut self,
         _: &RecvMessage,

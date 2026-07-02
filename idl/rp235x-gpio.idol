@@ -33,6 +33,12 @@ Interface(
             reply: Result(ok: "()", err: CLike("GpioError")),
             idempotent: true,
         ),
+        "set_pull": (
+            description: "Set a pin's pad pulls: 0 = none, 1 = pull-up, 2 = pull-down. NOTE erratum RP2350-E9: latched pad inputs can defeat the internal pull-down; prefer pull-ups for inputs (see the driver docs).",
+            args: { "pin": "u8", "pull": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
         "set_function": (
             description: "Route a pin to an alternate function (IO_BANK0 FUNCSEL value, e.g. 4 = PWM, 5 = SIO).",
             args: { "pin": "u8", "funcsel": "u8" },
