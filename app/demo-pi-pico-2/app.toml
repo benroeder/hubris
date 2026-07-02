@@ -23,7 +23,7 @@ name = "task-rp235x-usb"
 priority = 3
 max-sizes = {flash = 32768, ram = 8192}
 stacksize = 4096
-uses = ["usbctrl", "usb_dpram", "resets"]
+uses = ["usbctrl", "usb_dpram", "resets", "watchdog"]
 start = true
 notifications = ["usb-irq"]
 interrupts = {"usbctrl.irq" = "usb-irq"}

@@ -122,5 +122,23 @@ fn main() -> ! {
     rp235x_uart::configure(&p, cycles_per_ms * 1000);
     rp235x_uart::write_all(&p, b"\r\nHubris booting on RP2350 / Pico 2\r\n");
 
+    // Stash the unique 64-bit device id (OTP CHIPID0..3) in watchdog
+    // scratch1/2 for the USB task, which builds its per-board USB serial
+    // string from it (identical serials collide on the host). Read here
+    // because OTP is privileged-only. Scratch registers survive resets and,
+    // unlike USB DPRAM, are live before the USB block is unreset; the ROM's
+    // vectored-boot protocol only claims scratch 4-7 (and our BOOTSEL marker
+    // uses scratch0), and this runs after the BOOTSEL-hop check.
+    let id: u64 = (p.OTP_DATA.chipid3().read().bits() as u64) << 48
+        | (p.OTP_DATA.chipid2().read().bits() as u64) << 32
+        | (p.OTP_DATA.chipid1().read().bits() as u64) << 16
+        | p.OTP_DATA.chipid0().read().bits() as u64;
+    p.WATCHDOG
+        .scratch1()
+        .write(|w| unsafe { w.bits((id >> 32) as u32) });
+    p.WATCHDOG
+        .scratch2()
+        .write(|w| unsafe { w.bits(id as u32) });
+
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }

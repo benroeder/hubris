@@ -139,9 +139,34 @@ impl idol_runtime::NotificationHandler for ServerImpl {
 /// only if jefe restarts the task, which re-runs main from scratch).
 static mut USB_ALLOC: Option<UsbBusAllocator<UsbBus>> = None;
 
+/// USB serial-number string, filled from the chip's unique 64-bit device id
+/// so multiple boards enumerate distinctly on one host. Static because the
+/// string descriptors borrow it for the device's life.
+static mut SERIAL: [u8; 17] = [0; 17];
+
+/// Format the device id (matching `picotool info` byte order, `H`-prefixed
+/// to mark Hubris) into [`SERIAL`]. The id is stashed in watchdog scratch1/2
+/// by the app's privileged pre-kernel main (OTP itself is privileged-only).
+fn unique_serial(p: &rp235x_pac::Peripherals) -> &'static str {
+    let id: u64 = (p.WATCHDOG.scratch1().read().bits() as u64) << 32
+        | p.WATCHDOG.scratch2().read().bits() as u64;
+    const D: &[u8; 16] = b"0123456789ABCDEF";
+    // SAFETY: single-threaded task; written once here at startup, before the
+    // descriptor ever renders it.
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(SERIAL);
+        buf[0] = b'H';
+        for i in 0..16 {
+            buf[i + 1] = D[((id >> (60 - 4 * i)) & 0xf) as usize];
+        }
+        core::str::from_utf8_unchecked(&*core::ptr::addr_of!(SERIAL))
+    }
+}
+
 #[export_name = "main"]
 pub fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
+    let serial_str = unique_serial(&p);
 
     // Force VBUS detect since the Pico 2 has no dedicated VBUS sense to the controller.
     let bus = UsbBus::new(p.USB, p.USB_DPRAM, true, &p.RESETS);
@@ -154,7 +179,7 @@ pub fn main() -> ! {
         .strings(&[StringDescriptors::default()
             .manufacturer("Oxide Hubris")
             .product("RP2350 Pico 2 CDC")
-            .serial_number("HUBRIS-0001")])
+            .serial_number(serial_str)])
         .unwrap()
         .device_class(USB_CLASS_CDC)
         .max_packet_size_0(64)
