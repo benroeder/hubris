@@ -38,18 +38,27 @@ onboard LED / a GP0↔GP1 UART loopback as visual signals):
 | clock | `lib/rp235x-startup`: XOSC 12 MHz | crystal-accurate **1 Hz** blink |
 | UART | `lib/rp235x-uart`: PL011, GP0/GP1 | **TX+RX** via loopback (double-blink) |
 | 150 MHz | PLL_SYS + **QMI flash retune** (CLKDIV=6) | double-blink at 150 MHz baud — the XIP-flash hazard handled |
+| USB clk + IRQ | PLL_USB 48 MHz; UART RX IRQ → task notification | LED toggles only on interrupt delivery |
+| USB CDC | `lib/rp235x-usb` (UsbBus adapted from rp-hal) + `task/rp235x-usb` (usbd-serial), IRQ-driven | enumerates as `/dev/cu.usbmodemHUBRIS_0001`; echo verified; console streams |
+| GPIO Idol | `drv/rp235x-gpio{,-api}` + `idl/rp235x-gpio.idol` | LED blinks via `gpio.toggle()` IPC from `task-rp235x-logdemo` |
+| sys Idol | `drv/rp235x-sys{,-api}`: single RESETS owner | GPIO resets via `sys.leave_reset()` IPC; console keeps streaming |
+| UART Idol | `drv/rp235x-uart{,-api}`: IRQ-driven RX ring, lease I/O | loopback `uart_rx=15` (exact marker length) each tick |
+| SPI Idol | `drv/rp235x-spi{,-api}`: PL022 mode 0, 1.5 MHz | `spi=OK` — 3-byte full-duplex round-trip via internal loopback |
+| I2C Idol | `drv/rp235x-i2c{,-api}`: DW 7-bit master, 100 kHz | empty-bus scan: 112 probes/tick NAK + recover cleanly (`i2c=0`); ACKed-transfer test pending a 2nd Pico as I2CTarget |
 
 **Retired risks (were the plan's biggest unknowns, now proven on silicon):** IMAGE_DEF
 byte-correctness; "ARMv8-M kernel for free" (no kernel changes); ACCESSCTRL privilege
 split (privileged startup touches CLOCKS/PLL/QMI, unprivileged task reaches SIO/UART
-via `uses`); MPU task isolation; the §5.4.4 XIP-during-clock-ramp flash hazard.
+via `uses`); MPU task isolation; the §5.4.4 XIP-during-clock-ramp flash hazard;
+peripheral IRQ → notification delivery; USB device controller (greenfield for Hubris).
 
-**Gate status:** G0 ✅ · G1 ✅ (host + hardware) · G2 ✅ · G3 ✅ · G4 partial (GPIO+UART
-proven; SPI/I2C pending) · G5–G6 not started.
+**Gate status:** G0 ✅ · G1 ✅ (host + hardware) · G2 ✅ · G3 ✅ · G4 ✅ (GPIO, UART,
+SPI, I2C all behind Idol servers; I2C ACK test awaits a bus peer) · G5–G6 not started.
 
-**Still a bring-up, not yet idiomatic:** GPIO/UART are helper-libs called from a task
-+ privileged `main`, not `drv/rp235x-*` Idol server tasks. No peripheral *interrupt*
-has been exercised yet (all polled / SysTick). See "Next: USB console" below.
+**Idiomatic now:** sys/gpio/uart/spi/i2c are `drv/rp235x-*` Idol servers over IPC;
+the demo client (`task-rp235x-logdemo`) self-tests all of them every tick over the
+USB console (`tick N uart_rx=15 spi=OK i2c=0`). Remaining: flash/update server
+(Tier 3), hiffy + on-target tests + debug-probe workflow (Phase 5).
 
 ## Next: USB console (talk to the board over its native USB port)
 
