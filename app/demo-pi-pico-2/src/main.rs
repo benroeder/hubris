@@ -80,6 +80,10 @@ fn main() -> ! {
     // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
     let cycles_per_ms = rp235x_startup::init_clocks(&p);
 
+    // Let unprivileged tasks (with the matching MPU grants) use the boot-ROM
+    // reboot API: open ACCESSCTRL for the WATCHDOG/TICKS blocks it drives.
+    rp235x_startup::open_accessctrl_for_reboot(&p);
+
     // Clocks (incl. PLL_USB, for USB) survived -- turn the LED off so the USB task's
     // heartbeat toggle starts from a known dark state. (Solid LED here => hung in
     // init_clocks; a heartbeat blink => the USB task is running.)

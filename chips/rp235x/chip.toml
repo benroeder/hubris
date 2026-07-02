@@ -35,6 +35,22 @@ address = 0x4009_0000  # DW_apb_i2c I2C0
 size = 0x1000
 interrupts = { irq = 36 }  # I2C0_IRQ
 
+[psm]
+address = 0x4001_8000  # power-on state machine (WDSEL: what a watchdog reset resets)
+size = 0x1000
+
+[watchdog]
+address = 0x400d_8000  # watchdog (scratch regs + trigger; used by ROM reboot)
+size = 0x1000
+
+[ticks]
+address = 0x4010_8000  # tick generators (watchdog tick; used by ROM reboot)
+size = 0x1000
+
+[powman]
+address = 0x4010_0000  # power manager (boot-vector scratch; used by ROM BOOTSEL reboot)
+size = 0x1000
+
 [usbctrl]
 address = 0x5011_0000  # USB device-controller registers (USB)
 size = 0x1000

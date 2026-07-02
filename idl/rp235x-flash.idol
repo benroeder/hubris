@@ -22,5 +22,11 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "reboot": (
+            description: "Reboot the chip via the boot-ROM reboot API ~100ms after replying. bootsel != 0 reboots into BOOTSEL (USB flashing) mode. Returns the ROM status (0 = reboot armed).",
+            args: { "bootsel": "u8" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
     },
 )

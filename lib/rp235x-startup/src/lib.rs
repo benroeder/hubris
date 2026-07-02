@@ -104,3 +104,25 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
 
     SYS_CLK_HZ / 1000
 }
+
+/// Open ACCESSCTRL so *unprivileged* code can reach the WATCHDOG and TICKS
+/// blocks. The boot-ROM `reboot` API (datasheet sec 5.4.8.24) arms the reboot
+/// through watchdog scratch/trigger registers, and ROM code runs at the
+/// caller's privilege -- without this grant an unprivileged task calling it
+/// faults. ACCESSCTRL writes require 0xacce in the top 16 bits (sec 10.6.3).
+///
+/// Security tradeoff, accepted for this board: any task granted the watchdog
+/// MMIO region in its app.toml `uses` can now reboot the system. Tasks
+/// without the MPU grant still cannot (the MPU check comes first).
+///
+/// Privileged; call from the app's pre-kernel main.
+pub fn open_accessctrl_for_reboot(p: &Peripherals) {
+    // Default is 0xb8 (SP | CORE0 | CORE1 | DMA); add SU (bit 2).
+    const GRANT_SU: u32 = 0xacce_00bc;
+    p.ACCESSCTRL
+        .watchdog()
+        .write(|w| unsafe { w.bits(GRANT_SU) });
+    // The ROM reboot code writes PSM.WDSEL (which reset domains a watchdog
+    // reset covers) -- PSM's ACCESSCTRL register is named `rsm`.
+    p.ACCESSCTRL.rsm().write(|w| unsafe { w.bits(GRANT_SU) });
+}

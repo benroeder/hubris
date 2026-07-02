@@ -76,6 +76,33 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
             rp235x_romapi::RT_FLAG_FUNC_ARM_SEC | rp235x_romapi::RT_FLAG_DATA,
         ) as u32)
     }
+
+    fn reboot(
+        &mut self,
+        _: &RecvMessage,
+        bootsel: u8,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        if bootsel != 0 {
+            // Rebooting into BOOTSEL means calling the ROM's reboot function,
+            // and calling *any* ROM function from an unprivileged task
+            // currently faults (the ROM enters via RCP-canary instructions;
+            // investigation parked until a debug probe is available). Report
+            // unsupported instead of wedging the system.
+            return Ok(u32::MAX);
+        }
+        // Plain reboot, no ROM involved: select everything but the processor
+        // cold domain for watchdog reset, clear any stale vectored-boot magic
+        // in the scratch registers, and force the reset. Needs the
+        // watchdog + psm MPU grants (app.toml) and ACCESSCTRL opened for them
+        // (rp235x-startup).
+        let psm = unsafe { &*rp235x_pac::PSM::ptr() };
+        let wd = unsafe { &*rp235x_pac::WATCHDOG::ptr() };
+        psm.wdsel().write(|w| unsafe { w.bits(0xffff_fffe) });
+        wd.scratch4().write(|w| unsafe { w.bits(0) });
+        wd.ctrl().modify(|_, w| w.trigger().set_bit());
+        // Reset is effectively immediate; this reply is best-effort.
+        Ok(0)
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {

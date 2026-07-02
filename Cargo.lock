@@ -2224,6 +2224,7 @@ dependencies = [
  "idol",
  "idol-runtime",
  "num-traits",
+ "rp235x-pac",
  "rp235x-romapi",
  "serde",
  "userlib",

@@ -87,3 +87,4 @@ pub fn rom_table_lookup(code: [u8; 2], mask: u32) -> usize {
     }
     0
 }
+

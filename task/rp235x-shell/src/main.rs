@@ -49,7 +49,8 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
-  rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n";
+  rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n\
+  reboot                reboot the system (bootsel variant not yet supported)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -141,6 +142,7 @@ impl Shell {
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
+            "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
                 self.out.put(cmd.as_bytes());
@@ -426,6 +428,27 @@ impl Shell {
         } else {
             b"\r\n"
         });
+    }
+
+    fn cmd_reboot(&mut self, mode: Option<&str>) {
+        let bootsel = match mode {
+            Some("bootsel") => 1,
+            None => 0,
+            _ => {
+                self.out.put(b"usage: reboot [bootsel]\r\n");
+                return;
+            }
+        };
+        let rc = self.flash.reboot(bootsel);
+        if rc == 0 {
+            self.out.put(b"rebooting...\r\n");
+        } else if rc == u32::MAX {
+            self.out.put(b"bootsel reboot not yet supported (needs a ROM call; parked until a debug probe is available)\r\n");
+        } else {
+            self.out.put(b"reboot failed, rc=");
+            self.out.put_hex32(rc);
+            self.out.put(b"\r\n");
+        }
     }
 
     fn i2c_scan(&mut self) {

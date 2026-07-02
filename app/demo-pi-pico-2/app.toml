@@ -78,6 +78,7 @@ name = "drv-rp235x-flash"
 priority = 2
 max-sizes = {flash = 8192, ram = 2048}
 stacksize = 1024
+uses = ["watchdog", "psm"]
 start = true
 extern-regions = ["rom", "xip"]
 

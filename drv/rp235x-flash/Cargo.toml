@@ -9,6 +9,7 @@ num-traits = { workspace = true }
 zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 
+rp235x-pac = { workspace = true }
 drv-rp235x-flash-api = { path = "../rp235x-flash-api" }
 rp235x-romapi = { path = "../../lib/rp235x-romapi" }
 userlib = { path = "../../sys/userlib" }
