@@ -102,13 +102,21 @@ uses = ["watchdog", "psm", "qmi"]
 start = true
 extern-regions = ["rom", "xip"]
 
+[tasks.mailbox_driver]
+name = "drv-rp235x-mailbox"
+priority = 3
+max-sizes = {flash = 4096, ram = 1024}
+stacksize = 512
+uses = ["sio"]
+start = true
+
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 24576, ram = 4096}
+max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "mailbox_driver"]
 
 [tasks.idle]
 name = "task-idle"

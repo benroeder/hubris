@@ -1,0 +1,18 @@
+// RP2350 (RP235x) inter-core mailbox driver API.
+//
+// Owns the SIO inter-core FIFO on core 0 and bridges it to Hubris IPC: tasks
+// call `exchange` to send a 32-bit request word to the core-1 payload and get
+// its reply. This is the AMP "tasks post between cores" path (branch
+// rp2350-amp) -- an explicit channel, not transparent cross-core IPC.
+
+Interface(
+    name: "Rp235xMailbox",
+    ops: {
+        "exchange": (
+            description: "Send `req` to core 1 over the SIO FIFO and return its reply word. Bounded wait; returns 0xffffffff on timeout.",
+            args: { "req": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+    },
+)

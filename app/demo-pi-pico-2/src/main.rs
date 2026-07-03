@@ -45,17 +45,23 @@ static mut CORE1_STACK: [u32; 256] = [0; 256];
 const CORE1_MAGIC: u32 = 0xC0FF_EE01;
 
 /// Bare payload that runs on core 1 after launch: announce via the mailbox,
-/// then bump a heartbeat forever. No stack-heavy calls (keeps the compiler
-/// from emitting RCP/canary ops core 1's coprocessor may not be salted for).
+/// then act as a compute engine over the SIO inter-core FIFO -- read each
+/// request word from core 0 and reply with `req*2 + 1` -- while bumping a
+/// heartbeat. Loop-only (no stack-heavy calls) so the compiler emits no
+/// RCP/canary ops core 1's coprocessor is not salted for.
 extern "C" fn core1_main() -> ! {
+    let sio = unsafe { &*rp235x_pac::SIO::ptr() };
     CORE1_MAILBOX[0].store(CORE1_MAGIC, Ordering::SeqCst);
     let mut beat: u32 = 0;
     loop {
+        if sio.fifo_st().read().vld().bit_is_set() {
+            let req = sio.fifo_rd().read().bits();
+            let reply = req.wrapping_mul(2).wrapping_add(1);
+            while sio.fifo_st().read().rdy().bit_is_clear() {}
+            sio.fifo_wr().write(|w| unsafe { w.bits(reply) });
+        }
         beat = beat.wrapping_add(1);
         CORE1_MAILBOX[1].store(beat, Ordering::SeqCst);
-        for _ in 0..300_000 {
-            cortex_m::asm::nop();
-        }
     }
 }
 

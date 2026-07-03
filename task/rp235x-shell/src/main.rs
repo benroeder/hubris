@@ -20,6 +20,7 @@ use drv_rp235x_adc_api::{Rp235xAdc, TEMP_CHANNEL};
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
+use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
@@ -34,6 +35,7 @@ task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
+task_slot!(MAILBOX, mailbox_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -43,6 +45,7 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   bench all [addr]      throughput of every bus in one table\r\n\
+  core1 <n>             send n to core 1 (AMP); prints its reply (n*2+1)\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -83,6 +86,7 @@ struct Shell {
     flash: Rp235xFlash,
     adc: Rp235xAdc,
     pwm: Rp235xPwm,
+    mailbox: Rp235xMailbox,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -163,6 +167,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "bench" => self.cmd_bench(words.next(), words.next()),
+            "core1" => self.cmd_core1(words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -398,6 +403,31 @@ impl Shell {
     /// `bench all [n]` -- run every bus back-to-back and print one comparison
     /// table. UART (TX) and SPI (loopback/controller) bench standalone; I2C
     /// needs a target on the bus, so `bench all 42` benches address 0x42 too.
+    /// AMP: send a number to core 1 over the inter-core mailbox and print its
+    /// reply. Core 1 (a bare compute payload) answers with `n*2 + 1`. This is a
+    /// task on core 0 posting work across cores via normal Hubris IPC to the
+    /// mailbox driver, which bridges to the SIO FIFO.
+    fn cmd_core1(&mut self, arg: Option<&str>) {
+        let Some(n) = arg.and_then(|a| a.parse::<u32>().ok()) else {
+            self.out.put(b"usage: core1 <n>\r\n");
+            return;
+        };
+        let reply = self.mailbox.exchange(n);
+        if reply == 0xffff_ffff {
+            self.out.put(b"core 1 did not answer (timeout)\r\n");
+            return;
+        }
+        self.out.put(b"core 1: ");
+        self.out.put_u32(n);
+        self.out.put(b" -> ");
+        self.out.put_u32(reply);
+        self.out.put(if reply == n.wrapping_mul(2).wrapping_add(1) {
+            b" (n*2+1, correct)\r\n" as &[u8]
+        } else {
+            b" (unexpected)\r\n"
+        });
+    }
+
     fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {
         if sub != Some("all") {
             self.out.put(b"usage: bench all [i2c-target-hex-addr]\r\n");
@@ -1332,6 +1362,7 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        mailbox: Rp235xMailbox::from(MAILBOX.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
