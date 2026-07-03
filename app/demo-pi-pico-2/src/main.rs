@@ -10,6 +10,10 @@ use rp235x_pac as _;
 
 use cortex_m_rt::entry;
 
+mod image_version {
+    include!(concat!(env!("OUT_DIR"), "/image_version.rs"));
+}
+
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
 
@@ -27,7 +31,7 @@ const LED_PIN: u32 = 25;
 /// source (varm_blocks.c); see also docs/rp2350-research/findings.md.
 #[link_section = ".image_def"]
 #[used]
-pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
+pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
     0xffff_ded3, // PICOBIN_BLOCK_MARKER_START
     0x1021_0142, // IMAGE_TYPE item: EXE | SECURITY(S) | CPU(Arm) | CHIP(RP2350)
     // VECTOR_TABLE item (type 0x03, 2 words): the runtime vector table is at
@@ -46,8 +50,15 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
     0xffff_fe90, // entry 0: storage start, relative to the load-map item
     0x2000_0000, // entry 0: runtime start (SRAM, absolute)
     0x0004_0000, // entry 0: size in bytes (256 KiB)
+    // VERSION item (type 0x48, 2 words, no rollback rows): the boot ROM uses
+    // this to choose between A/B partitions -- the higher version boots. The
+    // second word ((major << 16) | minor) is stamped by build.rs from
+    // HUBRIS_IMAGE_VERSION. Placed AFTER the load map so the load-map item's
+    // address (and thus its relative storage offset) is unchanged.
+    0x0000_0248,
+    image_version::IMAGE_VERSION_WORD,
 
-    0x0000_07ff, // BLOCK_ITEM_LAST, size = 7 words of items
+    0x0000_09ff, // BLOCK_ITEM_LAST, size = 9 words of items
     0x0000_0000, // link = self (single-block loop)
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
 ];

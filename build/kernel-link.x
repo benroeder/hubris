@@ -307,7 +307,8 @@ ASSERT(SIZEOF(.image_def) == 0
 
 /* Known IMAGE_DEF sizes: 20 bytes (minimum Arm EXE) or 44 bytes (RAM image
    with VECTOR_TABLE + LOAD_MAP items); flag unexpected growth. */
-ASSERT(SIZEOF(.image_def) == 0 || SIZEOF(.image_def) == 20 || SIZEOF(.image_def) == 44,
+ASSERT(SIZEOF(.image_def) == 0 || SIZEOF(.image_def) == 20
+       || SIZEOF(.image_def) == 44 || SIZEOF(.image_def) == 52,
 "RP235x: unexpected IMAGE_DEF size; update kernel-link.x if intended");
 
 /* IMAGE_DEF must precede .text. */
