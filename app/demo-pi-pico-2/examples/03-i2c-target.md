@@ -58,7 +58,19 @@ per-byte IPC + FIFO overhead means the measured rate sits under that.
 
 ### Measured
 
-_To be filled in from hardware._
+Verified on hardware (two boards, GP4/GP5 + GND, internal pull-ups):
+
+```
+target   i2c target 42 48554252495321   -> serving 7 bytes at 0x42
+control  i2c scan                       -> i2c:  0x42        (target ACKs)
+control  i2c read 42 7                  -> rx: 48 55 42 52 49 53 21   ("HUBRIS!")
+```
+
+Closes the long-staged ACK test (previously only NAK-on-empty-bus was verified).
+Throughput is 100 kHz standard mode (~11 kB/s theoretical, 9 bits/byte with the
+ACK); like SPI, the per-byte IPC + FIFO overhead means the on-wire rate is not
+the bottleneck. (`i2c scan` sweeps 112 addresses, each NAK timing out on an
+empty slot, so a full scan takes ~1.5 s -- that is scan cost, not bus speed.)
 
 ## Notes
 
