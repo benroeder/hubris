@@ -48,6 +48,8 @@ const HELP: &[u8] = b"commands:\r\n\
   gpio out|in|hi|lo|toggle|read <pin> | gpio pull <pin> up|down|none\r\n\
   uart send <text>      send out UART0 TX (GP0)\r\n\
   uart recv             drain UART0 RX buffer\r\n\
+  uart bench [n]        time sending n bytes (default 4096); reports B/s\r\n\
+  uart rxbench          count RX bytes over 3s (run while peer benches)\r\n\
   spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
   i2c scan              probe all 7-bit addresses\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
@@ -342,8 +344,68 @@ impl Shell {
                 }
                 self.out.put(b"\r\n");
             }
-            _ => self.out.put(b"usage: uart send <text> | uart recv\r\n"),
+            Some("bench") => {
+                // Send N bytes (default 4096) and time it. write() blocks on
+                // TX-FIFO backpressure, so elapsed reflects the wire rate.
+                let n: u32 = subcommand_rest(line, "bench")
+                    .trim()
+                    .parse()
+                    .unwrap_or(4096);
+                let buf = [0x55u8; 256];
+                let t0 = sys_get_timer().now;
+                let mut sent = 0u32;
+                while sent < n {
+                    let c = (n - sent).min(256);
+                    self.uart.write(&buf[..c as usize]);
+                    sent += c;
+                }
+                let ms = (sys_get_timer().now - t0) as u32;
+                // 115200 8N1 -> 11520 B/s theoretical (10 bits/byte).
+                self.bench_report(b"uart tx: ", n, ms, 11520);
+            }
+            Some("rxbench") => {
+                // Count bytes received over a 3 s window while the peer runs
+                // `uart bench`; reports the far-end throughput as a cross-check.
+                let mut rx = [0u8; 256];
+                let mut total = 0u32;
+                let t0 = sys_get_timer().now;
+                while sys_get_timer().now - t0 < 3000 {
+                    total += self.uart.read(&mut rx) as u32;
+                }
+                self.bench_report(b"uart rx: ", total, 3000, 11520);
+            }
+            _ => self.out.put(
+                b"usage: uart send <text> | recv | bench [n] | rxbench\r\n",
+            ),
         }
+    }
+
+    /// Shared throughput report line for the bus speed-test demos:
+    /// "<label> <bytes> bytes in <ms> ms = <B/s> B/s (<pct>% of <max>)".
+    fn bench_report(
+        &mut self,
+        label: &[u8],
+        bytes: u32,
+        ms: u32,
+        max_bps: u32,
+    ) {
+        let bps = if ms > 0 {
+            (bytes as u64 * 1000 / ms as u64) as u32
+        } else {
+            0
+        };
+        self.out.put(label);
+        self.out.put_u32(bytes);
+        self.out.put(b" bytes in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u32(bps);
+        self.out.put(b" B/s (");
+        self.out
+            .put_u32((bps * 100).checked_div(max_bps).unwrap_or(0));
+        self.out.put(b"% of ");
+        self.out.put_u32(max_bps);
+        self.out.put(b" theoretical)\r\n");
     }
 
     fn cmd_spi(&mut self, line: &str, verb: Option<&str>) {
