@@ -68,8 +68,9 @@ const HELP: &[u8] = b"commands:\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
-  update <size-hex> <crc32-hex>  receive a firmware image over this console,\r\n\
-                        write it to flash, verify, then `reboot` to apply\r\n\
+  update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
+  uart-update <size> <crc>  receive image over UART from a peer push\r\n\
+  push <size> <crc>     stream own flash image to a peer over UART\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -171,6 +172,8 @@ impl Shell {
             "adc" => self.cmd_adc(words.next(), words.next()),
             "slot" => self.cmd_slot(),
             "update" => self.cmd_update(words.next(), words.next()),
+            "uart-update" => self.cmd_uart_update(words.next(), words.next()),
+            "push" => self.cmd_push(words.next(), words.next()),
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
@@ -859,48 +862,58 @@ impl Shell {
         }
     }
 
+    /// Receive a firmware image over this USB console (the host drives it).
     fn cmd_update(&mut self, size: Option<&str>, crc: Option<&str>) {
-        const SECTOR: u32 = 4096;
-        const PAGE: u32 = 256;
-        const IMAGE_MAX: u32 = 0x4_0000; // the 256 KiB LOAD_MAP window
-
-        let (Some(size), Some(want_crc)) = (
-            size.and_then(|s| u32::from_str_radix(s, 16).ok()),
-            crc.and_then(|c| u32::from_str_radix(c, 16).ok()),
-        ) else {
+        let Some((size, want_crc)) = parse_update_args(size, crc) else {
             self.out.put(b"usage: update <size-hex> <crc32-hex>\r\n");
             return;
         };
-        if size == 0 || size > IMAGE_MAX {
-            self.out.put(b"size out of range (max 40000)\r\n");
-            return;
-        }
+        self.receive_update(Link::Usb, size, want_crc);
+    }
 
-        // Pick where to write. If a partition table is present (A/B mode), the
-        // incoming image goes into the *inactive* partition -- the one with the
-        // lower IMAGE_DEF version, since the ROM booted the higher one -- and
-        // the new (higher-versioned) image wins on the next reboot without
-        // ever overwriting the image we are running from. Without a partition
-        // table (single image) we write slot 0 in place.
+    /// Receive a firmware image over UART from a peer board's `push`
+    /// (example 04, cross-board A/B update -- no host touches this board).
+    fn cmd_uart_update(&mut self, size: Option<&str>, crc: Option<&str>) {
+        let Some((size, want_crc)) = parse_update_args(size, crc) else {
+            self.out
+                .put(b"usage: uart-update <size-hex> <crc32-hex>\r\n");
+            return;
+        };
+        self.out.put(b"waiting for image over UART...\r\n");
+        self.out.flush();
+        self.receive_update(Link::Uart, size, want_crc);
+    }
+
+    /// Transport-agnostic image receiver: read `size` bytes from `link` (paced,
+    /// one `.` ACK per 256-byte page back over the same link), write them to
+    /// the inactive A/B slot (or slot 0 if single-image), then CRC-verify by
+    /// readback. Shared by the USB (`update`) and UART (`uart-update`) paths.
+    fn receive_update(&mut self, link: Link, size: u32, want_crc: u32) {
+        const SECTOR: u32 = 4096;
+        const PAGE: u32 = 256;
+        // A/B: write the inactive (lower-version) partition; the ROM boots the
+        // higher version next reboot, leaving the running image as fallback.
+        // Single-image boards get base 0 (in-place).
         let base = self.update_target_base();
         self.out.put(b"target flash 0x");
         self.out.put_hex32(base);
-        self.out.put(b"\r\nGO\r\n");
+        self.out.put(b"\r\n");
         self.out.flush();
+        self.link_write(link, b"GO\r\n"); // tell the sender we are ready
 
         let mut page = [0u8; PAGE as usize];
         let mut off: u32 = 0;
         while off < size {
             let want = (size - off).min(PAGE) as usize;
-            // Collect one page from the console (with an idle timeout).
             let mut got = 0usize;
             let mut idle = 0u32;
             while got < want {
-                let n = self.usb.read(&mut page[got..want]);
+                let n = self.link_read(link, &mut page[got..want]);
                 if n == 0 {
                     idle += 1;
                     if idle > 500 {
                         self.out.put(b"\r\ntimeout waiting for data\r\n");
+                        self.link_write(link, b"ERR\r\n");
                         return;
                     }
                     hl::sleep_for(10);
@@ -909,33 +922,91 @@ impl Shell {
                     got += n;
                 }
             }
-            // Erase each sector as we first touch it.
             if off.is_multiple_of(SECTOR)
                 && self.flash.erase(base + off).is_err()
             {
                 self.out.put(b"\r\nerase failed\r\n");
+                self.link_write(link, b"ERR\r\n");
                 return;
             }
             if self.flash.program(base + off, &page[..want]).is_err() {
                 self.out.put(b"\r\nprogram failed\r\n");
+                self.link_write(link, b"ERR\r\n");
                 return;
             }
             off += want as u32;
-            // ACK the page so the host sends the next one.
-            self.out.put(b".");
-            self.out.flush();
+            self.link_write(link, b"."); // ACK the page over the link
         }
 
-        // Verify: CRC32 (zlib polynomial) over the flash contents just
-        // written, read back through the driver.
-        let mut crc: u32 = 0xffff_ffff;
+        let crc = self.flash_crc32(base, size);
+        if crc == want_crc {
+            self.out.put(b"\r\nOK crc verified; `reboot` to apply\r\n");
+            self.link_write(link, b"OK\r\n");
+        } else {
+            self.out.put(b"\r\nCRC MISMATCH: flash ");
+            self.out.put_hex32(crc);
+            self.out.put(b" != ");
+            self.out.put_hex32(want_crc);
+            self.out.put(b" -- do NOT reboot; retry\r\n");
+            self.link_write(link, b"ERR\r\n");
+        }
+    }
+
+    /// Push this board's own flash image to a peer over UART (example 04):
+    /// wait for the peer's `GO`, stream `size` bytes (256-byte pages, one `.`
+    /// ACK each), read the peer's final `OK`/`ERR`, and report the on-wire
+    /// time. The image is read from flash `base` 0 (active slot / single
+    /// image). The peer must already be in `uart-update <size> <crc>`.
+    fn cmd_push(&mut self, size: Option<&str>, crc: Option<&str>) {
+        const PAGE: u32 = 256;
+        let Some((size, _crc)) = parse_update_args(size, crc) else {
+            self.out.put(b"usage: push <size-hex> <crc32-hex>\r\n");
+            return;
+        };
+        self.out.put(b"waiting for peer GO over UART...\r\n");
+        self.out.flush();
+        if !self.uart_wait_token(b"GO", 800) {
+            self.out.put(b"no GO (is the peer in uart-update?)\r\n");
+            return;
+        }
+        let start = sys_get_timer().now;
         let mut off: u32 = 0;
         let mut buf = [0u8; PAGE as usize];
         while off < size {
             let want = (size - off).min(PAGE) as usize;
-            let Ok(n) = self.flash.read(base + off, &mut buf[..want]) else {
-                self.out.put(b"\r\nreadback failed\r\n");
+            if self.flash.read(off, &mut buf[..want]).is_err() {
+                self.out.put(b"flash read failed\r\n");
                 return;
+            }
+            self.uart.write(&buf[..want]);
+            if !self.uart_wait_token(b".", 800) {
+                self.out.put(b"\r\npeer ACK timeout\r\n");
+                return;
+            }
+            off += want as u32;
+        }
+        let ms = (sys_get_timer().now - start) as u32;
+        let ok = self.uart_wait_token(b"OK", 1500);
+        self.out.put(if ok {
+            b"\r\npush OK: peer verified; " as &[u8]
+        } else {
+            b"\r\npush done (peer status?); "
+        });
+        self.out.put_u32(size);
+        self.out.put(b" bytes in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms\r\n");
+    }
+
+    /// CRC32 (zlib polynomial) over `size` bytes of flash at `base` (readback).
+    fn flash_crc32(&mut self, base: u32, size: u32) -> u32 {
+        let mut crc: u32 = 0xffff_ffff;
+        let mut off: u32 = 0;
+        let mut buf = [0u8; 256];
+        while off < size {
+            let want = (size - off).min(256) as usize;
+            let Ok(n) = self.flash.read(base + off, &mut buf[..want]) else {
+                return 0;
             };
             for &b in &buf[..n] {
                 crc ^= b as u32;
@@ -946,15 +1017,59 @@ impl Shell {
             }
             off += n as u32;
         }
-        let crc = !crc;
-        if crc == want_crc {
-            self.out.put(b"\r\nOK crc verified; `reboot` to apply\r\n");
-        } else {
-            self.out.put(b"\r\nCRC MISMATCH: flash ");
-            self.out.put_hex32(crc);
-            self.out.put(b" != ");
-            self.out.put_hex32(want_crc);
-            self.out.put(b" -- do NOT reboot; retry the update\r\n");
+        !crc
+    }
+
+    /// Read UART until `token` appears or the idle timeout (in 10 ms units)
+    /// elapses. Returns whether the token was seen. Simple substring match --
+    /// fine for the short protocol tokens (GO, ., OK) with no repeated prefix.
+    fn uart_wait_token(&mut self, token: &[u8], units: u32) -> bool {
+        let mut matched = 0usize;
+        let mut idle = 0u32;
+        let mut rx = [0u8; 64];
+        loop {
+            let n = self.uart.read(&mut rx);
+            if n == 0 {
+                idle += 1;
+                if idle > units {
+                    return false;
+                }
+                hl::sleep_for(10);
+                continue;
+            }
+            idle = 0;
+            for &b in &rx[..n] {
+                if b == token[matched] {
+                    matched += 1;
+                    if matched == token.len() {
+                        return true;
+                    }
+                } else {
+                    matched = usize::from(b == token[0]);
+                }
+            }
+        }
+    }
+
+    /// Read bytes from a transport link.
+    fn link_read(&mut self, link: Link, buf: &mut [u8]) -> usize {
+        match link {
+            Link::Usb => self.usb.read(buf),
+            Link::Uart => self.uart.read(buf),
+        }
+    }
+
+    /// Send protocol bytes (GO / . / OK / ERR) back over a transport link.
+    /// For USB, flush the console buffer first so ordering is preserved.
+    fn link_write(&mut self, link: Link, data: &[u8]) {
+        match link {
+            Link::Usb => {
+                self.out.flush();
+                self.usb.write(data);
+            }
+            Link::Uart => {
+                self.uart.write(data);
+            }
         }
     }
 
@@ -1008,6 +1123,29 @@ fn subcommand_rest<'a>(line: &'a str, verb: &str) -> &'a str {
         Some(i) => line[i + verb.len()..].trim(),
         None => "",
     }
+}
+
+/// A firmware-image transport for the update path -- USB console (host) or
+/// UART (a peer board). The paced protocol (size + CRC, 256-byte pages, `.`
+/// ACKs) is the same over each; only the byte source/sink differs.
+#[derive(Copy, Clone, PartialEq)]
+enum Link {
+    Usb,
+    Uart,
+}
+
+/// Parse and range-check the `<size-hex> <crc32-hex>` update arguments.
+fn parse_update_args(
+    size: Option<&str>,
+    crc: Option<&str>,
+) -> Option<(u32, u32)> {
+    const IMAGE_MAX: u32 = 0x4_0000; // the 256 KiB LOAD_MAP window
+    let size = u32::from_str_radix(size?, 16).ok()?;
+    let crc = u32::from_str_radix(crc?, 16).ok()?;
+    if size == 0 || size > IMAGE_MAX {
+        return None;
+    }
+    Some((size, crc))
 }
 
 /// Parse whitespace-separated hex byte pairs (or one contiguous run) into
