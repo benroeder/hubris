@@ -57,6 +57,22 @@ hubris> reboot         # ONLY if B said "OK crc verified"
 B boots the pushed image. (Build the updater with a distinct greeting to see B
 visibly change.)
 
+### A/B (unbrickable) variant
+
+Provision the target with two slots so the push never overwrites the running
+image:
+
+```
+# once, from BOOTSEL: partition table + slot A (v2) + slot B (v1)
+picotool partition create ab.json pt.bin -t bin
+# combine pt.bin @0, slotA @0x2000, slotB @0x42000 into one image; picotool load it
+```
+
+B boots slot A (v2). `push` a v3 image: B writes the *inactive* slot B
+(`target flash 0x00042000`), reboots, and the ROM boots the highest version
+(v3). `slot` afterwards shows `verA=2.0 verB=3.0 target=0x2000` -- slot A is
+untouched, so an interrupted transfer just leaves B booting v2. Unbrickable.
+
 ### Measured
 
 Verified on hardware, **visibly**: board A (built with a distinct greeting)
@@ -79,10 +95,14 @@ and now carries a 2-byte checksum.
   `0x00000000` -- B overwrites its only image. If the transfer is corrupted or
   interrupted and you reboot anyway, B is bricked until BOOTSEL. The end-to-end
   CRC *catches* corruption ("do NOT reboot; retry") but does not prevent it.
-- **The fix is A/B.** Provision B with the partition table (the A/B machinery on
-  `rp2350-port`): `target flash` becomes the *inactive* slot, the ROM boots the
-  higher version, and the running image stays as an automatic fallback --
-  **unbrickable**, and the real point of this stage.
+- **A/B: DONE and proven unbrickable.** Provision B with a partition table +
+  two image slots (picotool combines `pt + slotA(v2) + slotB(v1)`); B boots the
+  higher version (slot A, v2). A push then reports `target flash 0x00042000` --
+  the *inactive* slot B -- writes there, and on reboot the ROM boots the highest
+  version (the pushed v3 in slot B). Verified on hardware: after the push B
+  boots `[PUSHED-A-B-v3]` and `slot` shows `verA=2.0 verB=3.0 target=0x2000` --
+  **slot A (v2) is untouched**, so a failed/interrupted transfer never bricks the
+  running image. This is the real, unbrickable form of the stage.
 - **Per-page integrity: DONE.** Each UART page carries a 2-byte checksum; a bad
   page is NAK'd (`!`) and the sender resends just that page (bounded retries),
   so a transient bit error no longer fails the whole 66 KB transfer. (An earlier
