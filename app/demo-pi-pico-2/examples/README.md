@@ -13,7 +13,7 @@ terminal. Drive one board, observe the other.
 |---|---------|-------|---------------|
 | 01 | [UART link](01-uart-link.md) | UART0 | cross-board messaging + throughput |
 | 02 | [SPI link](02-spi-link.md) | SPI0 | controller/peripheral exchange + throughput |
-| 03 | I2C target (planned) | I2C0 | ACKed transaction + throughput |
+| 03 | [I2C target](03-i2c-target.md) | I2C0 | ACKed transaction + throughput |
 | 04 | Firmware push (planned) | UART0 | one board updates the other's A/B slot |
 
 ## Speed comparison (filled in as examples land)
