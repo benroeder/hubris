@@ -14,7 +14,7 @@ terminal. Drive one board, observe the other.
 | 01 | [UART link](01-uart-link.md) | UART0 | cross-board messaging + throughput |
 | 02 | [SPI link](02-spi-link.md) | SPI0 | controller/peripheral exchange + throughput |
 | 03 | [I2C target](03-i2c-target.md) | I2C0 | ACKed transaction + throughput |
-| 04 | Firmware push (planned) | UART0 | one board updates the other's A/B slot |
+| 04 | [Firmware push](04-uart-update.md) | UART0 | one board updates the other over the wire |
 
 ## Speed comparison (filled in as examples land)
 
@@ -26,6 +26,14 @@ terminal. Drive one board, observe the other.
 | I2C0 fast | 400 kHz | 33573 B/s | 44444 B/s | 75% |
 | I2C0 FM+ | 1 MHz | 64000 B/s | 111111 B/s | 57% |
 | USB CDC | 12 Mbit FS | ~16 KB/s | — | — |
+
+Firmware transfer (66 KB image, end-to-end incl. flash writes):
+
+| Transport | Time | Effective |
+|-----------|------|-----------|
+| USB | ~3.6 s | ~18 KB/s |
+| UART | ~9.4 s | ~7 KB/s |
+| SPI | tbd | tbd |
 
 The drivers poll the peripheral FIFO one byte per IPC, so measured throughput
 sits well under the line-rate theoretical max; that gap is itself a result and
