@@ -59,6 +59,7 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
   i2c target <addr> <hex<=16>   become an I2C target serving those bytes\r\n\
+  i2c bench <addr> [n]  controller: time reading n bytes from a target\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
   flash erase <hex-off>          erase a 4K sector (aligned)\r\n\
   flash write <hex-off> <hex..>  program bytes (within one 256B page)\r\n\
@@ -585,7 +586,38 @@ impl Shell {
                     Err(_) => self.out.put(b"error\r\n"),
                 }
             }
-            _ => self.out.put(b"usage: i2c scan|read|write|target\r\n"),
+            Some("bench") => {
+                // Controller: read <addr> repeatedly to n bytes, timed on-
+                // device (excludes USB overhead). Needs a target on the bus.
+                let Some(addr) =
+                    arg1.and_then(|a| u8::from_str_radix(a, 16).ok())
+                else {
+                    self.out.put(b"usage: i2c bench <hex-addr> [n]\r\n");
+                    return;
+                };
+                let n: u32 = arg2.and_then(|c| c.parse().ok()).unwrap_or(4096);
+                let mut buf = [0u8; 32];
+                let t0 = sys_get_timer().now;
+                let mut done = 0u32;
+                let mut ok = true;
+                while done < n {
+                    let c = (n - done).min(32) as usize;
+                    if self.i2c.read(addr, &mut buf[..c]).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    done += c as u32;
+                }
+                let ms = (sys_get_timer().now - t0) as u32;
+                if ok {
+                    // 100 kHz, ~9 bits/byte (data + ACK) -> ~11111 B/s.
+                    self.bench_report(b"i2c: ", n, ms, 11111);
+                } else {
+                    self.out
+                        .put(b"i2c bench: read error (target present?)\r\n");
+                }
+            }
+            _ => self.out.put(b"usage: i2c scan|read|write|target|bench\r\n"),
         }
     }
 

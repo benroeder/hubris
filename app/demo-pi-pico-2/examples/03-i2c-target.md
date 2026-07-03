@@ -66,11 +66,17 @@ control  i2c scan                       -> i2c:  0x42        (target ACKs)
 control  i2c read 42 7                  -> rx: 48 55 42 52 49 53 21   ("HUBRIS!")
 ```
 
+```
+control  i2c bench 42 4096            -> i2c: 4096 bytes in 405 ms = 10113 B/s (91%)
+```
+
 Closes the long-staged ACK test (previously only NAK-on-empty-bus was verified).
-Throughput is 100 kHz standard mode (~11 kB/s theoretical, 9 bits/byte with the
-ACK); like SPI, the per-byte IPC + FIFO overhead means the on-wire rate is not
-the bottleneck. (`i2c scan` sweeps 112 addresses, each NAK timing out on an
-empty slot, so a full scan takes ~1.5 s -- that is scan cost, not bus speed.)
+At 100 kHz (9 bits/byte with the ACK, ~11111 B/s theoretical) I2C runs at 91% of
+line rate -- UNLIKE SPI (30%). The reason is the clock: at 100 kHz a byte takes
+~90 us, which dwarfs the per-byte IPC/FIFO overhead, so the bus stays busy (same
+as UART at 115200). SPI's 1.5 MHz is fast enough that the software overhead
+dominates. (`i2c scan` sweeps 112 addresses, each NAK timing out on an empty
+slot, so a full scan takes ~1.5 s -- that is scan cost, not bus speed.)
 
 ## Notes
 
