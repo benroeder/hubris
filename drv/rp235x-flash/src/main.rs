@@ -26,7 +26,7 @@
 #![no_main]
 
 use drv_rp235x_flash_api::FlashError;
-use idol_runtime::{Leased, LenLimit, RequestError, W};
+use idol_runtime::{Leased, LenLimit, R, RequestError, W};
 use userlib::RecvMessage;
 
 // XIP_BASE (the uncached XIP mirror, XIP_NOCACHE_NOALLOC_BASE -- the cached
@@ -35,7 +35,95 @@ use userlib::RecvMessage;
 // `xip` extern region so they track the board's memory config.
 include!(concat!(env!("OUT_DIR"), "/flash_config.rs"));
 
-struct ServerImpl;
+/// 4 KiB flash sector (erase granularity).
+const SECTOR: u32 = 4096;
+/// 256-byte flash page (program granularity).
+const PAGE: u32 = 256;
+/// Bounded spin for flash-busy polling. A sector erase is ~45 ms typical /
+/// 400 ms max (W25Q32JV); this is comfortably beyond that at 150 MHz.
+const BUSY_SPINS: u32 = 30_000_000;
+
+/// Minimal QMI direct-mode SPI master for talking to the flash chip
+/// (datasheet sec 12.14.5). While direct mode is active, XIP accesses
+/// bus-error -- safe here because the whole image runs from SRAM and this
+/// server serializes its own read ops with erase/program.
+struct Direct<'a> {
+    qmi: &'a rp235x_pac::QMI,
+}
+
+impl<'a> Direct<'a> {
+    /// Enter direct mode. CLKDIV=30 -> 5 MHz SCK at 150 MHz clk_sys:
+    /// conservative and far inside every W25Q rating.
+    fn new(qmi: &'a rp235x_pac::QMI) -> Self {
+        qmi.direct_csr().write(|w| unsafe {
+            w.clkdiv().bits(30);
+            w.en().set_bit()
+        });
+        while qmi.direct_csr().read().busy().bit_is_set() {}
+        Direct { qmi }
+    }
+
+    /// Run one CS-framed SPI transaction: clock out every byte of `tx`, then
+    /// clock `rx.len()` more bytes capturing the responses.
+    fn transact(&self, tx: &[u8], rx: &mut [u8]) {
+        self.qmi
+            .direct_csr()
+            .modify(|_, w| w.assert_cs0n().set_bit());
+        for &b in tx {
+            self.xfer(b);
+        }
+        for slot in rx.iter_mut() {
+            *slot = self.xfer(0);
+        }
+        self.qmi
+            .direct_csr()
+            .modify(|_, w| w.assert_cs0n().clear_bit());
+    }
+
+    /// Clock one byte out (single-lane, output enabled) and return the byte
+    /// clocked in.
+    fn xfer(&self, b: u8) -> u8 {
+        while self.qmi.direct_csr().read().txfull().bit_is_set() {}
+        self.qmi.direct_tx().write(|w| unsafe {
+            w.oe().set_bit();
+            w.data().bits(b as u16)
+        });
+        while self.qmi.direct_csr().read().rxempty().bit_is_set() {}
+        self.qmi.direct_rx().read().direct_rx().bits() as u8
+    }
+}
+
+impl Drop for Direct<'_> {
+    /// Leave direct mode; the QMI resumes memory-mapped (XIP) service with
+    /// its M0 window configuration untouched.
+    fn drop(&mut self) {
+        while self.qmi.direct_csr().read().busy().bit_is_set() {}
+        self.qmi.direct_csr().modify(|_, w| w.en().clear_bit());
+    }
+}
+
+struct ServerImpl {
+    qmi: rp235x_pac::QMI,
+}
+
+impl ServerImpl {
+    /// Issue WRITE ENABLE, run `op`, then poll the status register until the
+    /// chip finishes (or we time out).
+    fn write_op(&mut self, op: &[u8]) -> Result<(), FlashError> {
+        let d = Direct::new(&self.qmi);
+        d.transact(&[0x06], &mut []); // WRITE ENABLE
+        d.transact(op, &mut []);
+        // Poll READ STATUS-1 until the BUSY bit clears.
+        let mut sr = [0u8; 1];
+        for _ in 0..BUSY_SPINS {
+            d.transact(&[0x05], &mut sr);
+            if sr[0] & 0x01 == 0 {
+                return Ok(());
+            }
+        }
+        Err(FlashError::Timeout)
+    }
+}
 
 impl idl::InOrderRp235xFlashImpl for ServerImpl {
     fn read(
@@ -62,6 +150,48 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         dest.write_range(0..len, &buf[..len])
             .map_err(|_| RequestError::went_away())?;
         Ok(len)
+    }
+
+    fn erase(
+        &mut self,
+        _: &RecvMessage,
+        offset: u32,
+    ) -> Result<(), RequestError<FlashError>> {
+        if offset >= FLASH_SIZE {
+            return Err(FlashError::BadAddress.into());
+        }
+        if !offset.is_multiple_of(SECTOR) {
+            return Err(FlashError::BadAlignment.into());
+        }
+        // SECTOR ERASE (20h) + 24-bit address.
+        let a = offset.to_be_bytes();
+        self.write_op(&[0x20, a[1], a[2], a[3]])?;
+        Ok(())
+    }
+
+    fn program(
+        &mut self,
+        _: &RecvMessage,
+        offset: u32,
+        data: LenLimit<Leased<R, [u8]>, 256>,
+    ) -> Result<(), RequestError<FlashError>> {
+        let len = data.len() as u32;
+        if offset >= FLASH_SIZE || len > FLASH_SIZE - offset {
+            return Err(FlashError::BadAddress.into());
+        }
+        // Must lie within a single 256-byte page (the chip wraps otherwise).
+        if len == 0 || (offset % PAGE) + len > PAGE {
+            return Err(FlashError::BadAlignment.into());
+        }
+        let mut buf = [0u8; 4 + 256];
+        // PAGE PROGRAM (02h) + 24-bit address + data.
+        buf[0] = 0x02;
+        let a = offset.to_be_bytes();
+        buf[1..4].copy_from_slice(&a[1..4]);
+        data.read_range(0..len as usize, &mut buf[4..4 + len as usize])
+            .map_err(|_| RequestError::went_away())?;
+        self.write_op(&buf[..4 + len as usize])?;
+        Ok(())
     }
 
     fn rom_lookup(
@@ -114,7 +244,8 @@ impl idol_runtime::NotificationHandler for ServerImpl {
 
 #[export_name = "main"]
 fn main() -> ! {
-    let mut server = ServerImpl;
+    let p = unsafe { rp235x_pac::Peripherals::steal() };
+    let mut server = ServerImpl { qmi: p.QMI };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {
         idol_runtime::dispatch(&mut incoming, &mut server);

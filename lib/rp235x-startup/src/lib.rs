@@ -130,4 +130,8 @@ pub fn open_accessctrl_for_reboot(p: &Peripherals) {
     // The ROM reboot code writes PSM.WDSEL (which reset domains a watchdog
     // reset covers) -- PSM's ACCESSCTRL register is named `rsm`.
     p.ACCESSCTRL.rsm().write(|w| unsafe { w.bits(GRANT_SU) });
+    // QMI direct mode: lets the flash driver task erase/program the QSPI
+    // flash. Safe on this system because the whole image runs from SRAM
+    // (LOAD_MAP boot) -- nothing fetches from flash at runtime.
+    p.ACCESSCTRL.xip_qmi().write(|w| unsafe { w.bits(GRANT_SU) });
 }

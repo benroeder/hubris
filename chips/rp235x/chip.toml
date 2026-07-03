@@ -43,6 +43,10 @@ size = 0x1000
 address = 0x400a_8000  # PWM (12 slices)
 size = 0x1000
 
+[qmi]
+address = 0x400d_0000  # QSPI memory interface (direct mode for erase/program)
+size = 0x1000
+
 [psm]
 address = 0x4001_8000  # power-on state machine (WDSEL: what a watchdog reset resets)
 size = 0x1000

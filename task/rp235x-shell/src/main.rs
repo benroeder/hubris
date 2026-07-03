@@ -53,6 +53,8 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
+  flash erase <hex-off>          erase a 4K sector (aligned)\r\n\
+  flash write <hex-off> <hex..>  program bytes (within one 256B page)\r\n\
   rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
@@ -427,8 +429,50 @@ impl Shell {
         off: Option<&str>,
         count: Option<&str>,
     ) {
+        if verb == Some("erase") {
+            let Some(off) = off.and_then(|o| u32::from_str_radix(o, 16).ok())
+            else {
+                self.out.put(b"bad offset (hex, 4K-aligned)\r\n");
+                return;
+            };
+            self.out.put(match self.flash.erase(off) {
+                Ok(()) => b"erased\r\n" as &[u8],
+                Err(drv_rp235x_flash_api::FlashError::BadAlignment) => {
+                    b"not 4K-aligned\r\n"
+                }
+                Err(_) => b"error\r\n",
+            });
+            return;
+        }
+        if verb == Some("write") {
+            let Some(off) = off.and_then(|o| u32::from_str_radix(o, 16).ok())
+            else {
+                self.out.put(b"bad offset (hex)\r\n");
+                return;
+            };
+            let mut data = [0u8; 64];
+            let Some(n) = count.and_then(|s| parse_hex_bytes(s, &mut data))
+            else {
+                self.out
+                    .put(b"bad hex (e.g. flash write 3f0000 deadbeef)\r\n");
+                return;
+            };
+            if n == 0 {
+                self.out.put(b"no data\r\n");
+                return;
+            }
+            self.out.put(match self.flash.program(off, &data[..n]) {
+                Ok(()) => b"programmed\r\n" as &[u8],
+                Err(drv_rp235x_flash_api::FlashError::BadAlignment) => {
+                    b"crosses a page boundary\r\n"
+                }
+                Err(_) => b"error\r\n",
+            });
+            return;
+        }
         if verb != Some("read") {
-            self.out.put(b"usage: flash read <hex-off> [n<=64]\r\n");
+            self.out
+                .put(b"usage: flash read|erase|write <hex-off> ...\r\n");
             return;
         }
         let Some(off) = off.and_then(|o| u32::from_str_radix(o, 16).ok())

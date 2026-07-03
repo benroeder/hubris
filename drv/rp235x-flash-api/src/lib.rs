@@ -13,6 +13,10 @@ use userlib::{sys_send, FromPrimitive};
 pub enum FlashError {
     /// The requested range is outside the flash device.
     BadAddress = 1,
+    /// Offset/length does not meet the operation's alignment rules.
+    BadAlignment = 2,
+    /// The flash chip did not finish the operation in time.
+    Timeout = 3,
 }
 
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));

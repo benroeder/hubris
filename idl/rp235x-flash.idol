@@ -22,6 +22,21 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "erase": (
+            description: "Erase one 4 KiB sector at `offset` (must be sector-aligned).",
+            args: { "offset": "u32" },
+            reply: Result(ok: "()", err: CLike("FlashError")),
+            idempotent: true,
+        ),
+        "program": (
+            description: "Program up to one 256-byte page at `offset` (page-aligned; data must not cross a page boundary). Bits can only be cleared; erase first.",
+            args: { "offset": "u32" },
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(256)),
+            },
+            reply: Result(ok: "()", err: CLike("FlashError")),
+            idempotent: true,
+        ),
         "reboot": (
             description: "Reboot the chip via the boot-ROM reboot API ~100ms after replying. bootsel != 0 reboots into BOOTSEL (USB flashing) mode. Returns the ROM status (0 = reboot armed).",
             args: { "bootsel": "u8" },
