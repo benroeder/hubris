@@ -34,16 +34,19 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
     // the image's RAM base, where the LOAD_MAP below puts it.
     0x0000_0203,
     0x2000_0000,
-    // LOAD_MAP item (type 0x06, size 4 words, absolute + 1 entry = 0x81).
-    0x8100_0406,
-    0x1000_0000, // entry 0: storage start (physical flash address)
-    0x2000_0000, // entry 0: runtime start (SRAM)
-    // Entry 0 end: the RUNTIME end address. The datasheet table calls this
-    // field "storage_end_address", but the bootrom source (varm_blocks.c)
-    // computes size = <this word> - runtime_start for absolute entries, so it
-    // must be in runtime space; a storage-space end fails the span check and
-    // the ROM rejects the whole block (INVALID_BLOCK_LOOP diagnostic).
-    0x2004_0000,
+    // LOAD_MAP item (type 0x06, size 4 words, RELATIVE + 1 entry = 0x01).
+    // Relative addressing makes the copy source position-independent -- the
+    // same binary boots correctly wherever it is stored in flash (flash base,
+    // or partition A/B). storage_start is relative to this item's own header
+    // address: the block sits at 0x10000160, the item is its 5th word (0x10),
+    // so the item header is at 0x10000170 and 0x10000000 - 0x10000170 =
+    // 0xffff_fe90. The relative form's third word is a byte size, not an end
+    // address (contrast the absolute form; see bootrom varm_blocks.c).
+    0x0100_0406,
+    0xffff_fe90, // entry 0: storage start, relative to the load-map item
+    0x2000_0000, // entry 0: runtime start (SRAM, absolute)
+    0x0004_0000, // entry 0: size in bytes (256 KiB)
+
     0x0000_07ff, // BLOCK_ITEM_LAST, size = 7 words of items
     0x0000_0000, // link = self (single-block loop)
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
