@@ -51,6 +51,10 @@ const HELP: &[u8] = b"commands:\r\n\
   uart bench [n]        time sending n bytes (default 4096); reports B/s\r\n\
   uart rxbench          count RX bytes over 3s (run while peer benches)\r\n\
   spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
+  spi role controller|peripheral   set bus role for board-to-board (GP16-19)\r\n\
+  spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
+  spi recv              peripheral: show bytes clocked in by the controller\r\n\
+  spi bench [n]         controller: time clocking n bytes; reports B/s\r\n\
   i2c scan              probe all 7-bit addresses\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
@@ -409,28 +413,95 @@ impl Shell {
     }
 
     fn cmd_spi(&mut self, line: &str, verb: Option<&str>) {
-        if verb != Some("xfer") {
-            self.out.put(b"usage: spi xfer <hex bytes>\r\n");
-            return;
+        match verb {
+            Some("xfer") => {
+                let mut tx = [0u8; 32];
+                let Some(n) =
+                    parse_hex_bytes(subcommand_rest(line, "xfer"), &mut tx)
+                else {
+                    self.out.put(b"bad hex (e.g. spi xfer a5 5a 3c)\r\n");
+                    return;
+                };
+                if n == 0 {
+                    self.out.put(b"usage: spi xfer <hex bytes>\r\n");
+                    return;
+                }
+                let mut rx = [0u8; 32];
+                self.spi.exchange(&tx[..n], &mut rx[..n]);
+                self.out.put(b"rx:");
+                for &b in &rx[..n] {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(b);
+                }
+                self.out.put(b"\r\n");
+            }
+            Some("role") => {
+                let periph = match subcommand_rest(line, "role").trim() {
+                    "peripheral" => 1u8,
+                    "controller" => 0u8,
+                    _ => {
+                        self.out
+                            .put(b"usage: spi role controller|peripheral\r\n");
+                        return;
+                    }
+                };
+                self.spi.set_role(periph);
+                self.out.put(if periph != 0 {
+                    b"spi role = peripheral (slave)\r\n" as &[u8]
+                } else {
+                    b"spi role = controller\r\n"
+                });
+            }
+            Some("load") => {
+                // Peripheral: stage up to 8 response bytes for the controller.
+                let mut buf = [0u8; 8];
+                let Some(n) =
+                    parse_hex_bytes(subcommand_rest(line, "load"), &mut buf)
+                else {
+                    self.out.put(b"bad hex (max 8 bytes)\r\n");
+                    return;
+                };
+                let k = self.spi.load_tx(&buf[..n]);
+                self.out.put(b"loaded ");
+                self.out.put_u32(k as u32);
+                self.out.put(b" bytes into TX FIFO\r\n");
+            }
+            Some("recv") => {
+                let mut rx = [0u8; 32];
+                let n = self.spi.drain_rx(&mut rx);
+                self.out.put(b"rx ");
+                self.out.put_u32(n as u32);
+                self.out.put(b":");
+                for &b in &rx[..n] {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(b);
+                }
+                self.out.put(b"\r\n");
+            }
+            Some("bench") => {
+                // Controller: clock n bytes and time it. Works standalone
+                // (RX shifts in line state) or against a peripheral.
+                let n: u32 = subcommand_rest(line, "bench")
+                    .trim()
+                    .parse()
+                    .unwrap_or(4096);
+                let tx = [0x55u8; 256];
+                let mut rx = [0u8; 256];
+                let t0 = sys_get_timer().now;
+                let mut sent = 0u32;
+                while sent < n {
+                    let c = (n - sent).min(256) as usize;
+                    self.spi.exchange(&tx[..c], &mut rx[..c]);
+                    sent += c as u32;
+                }
+                let ms = (sys_get_timer().now - t0) as u32;
+                // 1.5 MHz SCK, 8 bits/byte -> 187500 B/s theoretical.
+                self.bench_report(b"spi: ", n, ms, 187500);
+            }
+            _ => self
+                .out
+                .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
         }
-        let mut tx = [0u8; 32];
-        let Some(n) = parse_hex_bytes(subcommand_rest(line, "xfer"), &mut tx)
-        else {
-            self.out.put(b"bad hex (e.g. spi xfer a5 5a 3c)\r\n");
-            return;
-        };
-        if n == 0 {
-            self.out.put(b"usage: spi xfer <hex bytes>\r\n");
-            return;
-        }
-        let mut rx = [0u8; 32];
-        self.spi.exchange(&tx[..n], &mut rx[..n]);
-        self.out.put(b"rx:");
-        for &b in &rx[..n] {
-            self.out.put(b" ");
-            self.out.put_hex_byte(b);
-        }
-        self.out.put(b"\r\n");
     }
 
     fn cmd_i2c(

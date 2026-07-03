@@ -15,5 +15,27 @@ Interface(
             reply: Simple("usize"),
             idempotent: true,
         ),
+        "set_role": (
+            description: "Set the bus role: peripheral != 0 = slave (clocked by the far controller), 0 = controller. Clears internal loopback (use for board-to-board).",
+            args: { "peripheral": "u8" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
+        "load_tx": (
+            description: "Peripheral role: preload the TX FIFO (up to 8 bytes) with the response the far controller will clock out. Returns bytes loaded.",
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(8)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
+        "drain_rx": (
+            description: "Drain the RX FIFO into dest (non-blocking). Peripheral role: shows what the far controller clocked in. Returns bytes read.",
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(256)),
+            },
+            reply: Simple("usize"),
+            idempotent: true,
+        ),
     },
 )

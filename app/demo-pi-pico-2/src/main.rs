@@ -138,6 +138,22 @@ fn main() -> ! {
             .modify(|_, w| unsafe { w.funcsel().bits(3) });
     }
 
+    // SPI0 pins for the board-to-board link (funcsel 1): GP16 = RX (data in),
+    // GP17 = CSn, GP18 = SCK, GP19 = TX (data out). Push-pull, no pulls. The
+    // SPI driver defaults to internal loopback (ignores these pads) until a
+    // `spi role` command switches it to a real controller/peripheral.
+    for pin in [16usize, 17, 18, 19] {
+        p.PADS_BANK0.gpio(pin).modify(|_, w| {
+            w.od().clear_bit();
+            w.iso().clear_bit();
+            w.ie().set_bit()
+        });
+        p.IO_BANK0
+            .gpio(pin)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(1) });
+    }
+
     // Bring up XOSC + PLL_SYS to a known 150 MHz and get the accurate tick
     // divisor. Runs here (privileged, pre-kernel) because CLOCKS/PLL are
     // ACCESSCTRL Privileged-only. If this hangs, the LED (lit above) stays solid.
