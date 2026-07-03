@@ -72,6 +72,8 @@ stacksize = 1536
 uses = ["i2c0"]
 start = true
 task-slots = ["sys"]
+notifications = ["i2c-irq"]
+interrupts = {"i2c0.irq" = "i2c-irq"}
 
 [tasks.adc_driver]
 name = "drv-rp235x-adc"

@@ -22,8 +22,8 @@
 
 use drv_rp235x_i2c_api::I2cError;
 use drv_rp235x_sys_api::{self as sys_api, Rp235xSys};
-use idol_runtime::{Leased, LenLimit, RequestError, R, W};
-use userlib::{task_slot, RecvMessage};
+use idol_runtime::{Leased, LenLimit, R, RequestError, W};
+use userlib::{RecvMessage, sys_irq_control, task_slot};
 
 task_slot!(SYS, sys);
 
@@ -38,6 +38,9 @@ const SPIN_LIMIT: u32 = 2_000_000;
 
 struct ServerImpl {
     i2c: rp235x_pac::I2C0,
+    /// Bytes served on every controller read while in target (slave) mode.
+    window: [u8; 16],
+    window_len: usize,
 }
 
 impl ServerImpl {
@@ -166,13 +169,81 @@ impl idl::InOrderRp235xI2cImpl for ServerImpl {
             .map_err(|_| RequestError::went_away())?;
         Ok(len)
     }
+
+    fn serve(
+        &mut self,
+        _: &RecvMessage,
+        addr: u8,
+        data: LenLimit<Leased<R, [u8]>, 16>,
+    ) -> Result<(), RequestError<I2cError>> {
+        // Switch the block to target (slave) mode at `addr` and stash the
+        // window it serves. Reads are handled asynchronously in the RD_REQ
+        // interrupt (the DW slave stretches SCL until we provide data, so the
+        // IPC/IRQ latency is covered).
+        let len = data.len().min(16);
+        data.read_range(0..len, &mut self.window[..len])
+            .map_err(|_| RequestError::went_away())?;
+        self.window_len = len;
+
+        self.i2c.ic_enable().write(|w| w.enable().disabled());
+        while self.i2c.ic_enable_status().read().ic_en().bit_is_set() {}
+        self.i2c.ic_con().write(|w| {
+            w.master_mode().disabled();
+            w.ic_slave_disable().slave_enabled();
+            w.ic_restart_en().enabled();
+            w.speed().standard()
+        });
+        self.i2c
+            .ic_sar()
+            .write(|w| unsafe { w.ic_sar().bits(addr as u16) });
+        // Enable ONLY read-request (bit5, controller wants data), tx-abort
+        // (bit6, the DW flushes our TX FIFO when the controller ends a read
+        // early -- so each read starts fresh from window[0]) and rx-full (bit2,
+        // controller wrote us). Written as raw bits because two traps combine:
+        // IC_INTR_MASK resets to 0x8ff (most enabled) so a partial svd2rust
+        // `write` leaves TX_EMPTY enabled (fires continuously on the empty
+        // FIFO), AND the PAC's enabled()/disabled() enum is inverted vs the
+        // hardware (bit=1 enables). Either alone livelocks this priority-2
+        // task and starves USB/shell. 0x64 = (1<<2)|(1<<5)|(1<<6).
+        self.i2c
+            .ic_intr_mask()
+            .write(|w| unsafe { w.bits(0x0000_0064) });
+        self.i2c.ic_enable().write(|w| w.enable().enabled());
+        sys_irq_control(notifications::I2C_IRQ_MASK, true);
+        Ok(())
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {
     fn current_notification_mask(&self) -> u32 {
-        0
+        notifications::I2C_IRQ_MASK
     }
-    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {}
+
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if !bits.check_notification_mask(notifications::I2C_IRQ_MASK) {
+            return;
+        }
+        let stat = self.i2c.ic_raw_intr_stat().read();
+        if stat.rd_req().is_active() {
+            // Controller is reading us: clear the request and (re)load the
+            // whole window into the TX FIFO. The DW slave shifts it out as the
+            // controller clocks; leftover bytes are flushed on the next STOP.
+            let _ = self.i2c.ic_clr_rd_req().read();
+            for &b in &self.window[..self.window_len] {
+                self.i2c.ic_data_cmd().write(|w| unsafe { w.dat().bits(b) });
+            }
+        }
+        if stat.tx_abrt().is_active() {
+            let _ = self.i2c.ic_clr_tx_abrt().read();
+        }
+        if stat.rx_full().is_active() {
+            // Controller wrote to us; drain (unused by the demo).
+            while self.i2c.ic_rxflr().read().rxflr().bits() > 0 {
+                let _ = self.i2c.ic_data_cmd().read();
+            }
+        }
+        sys_irq_control(notifications::I2C_IRQ_MASK, true);
+    }
 }
 
 #[export_name = "main"]
@@ -208,7 +279,11 @@ fn main() -> ! {
 
     i2c.ic_enable().write(|w| w.enable().enabled());
 
-    let mut server = ServerImpl { i2c };
+    let mut server = ServerImpl {
+        i2c,
+        window: [0u8; 16],
+        window_len: 0,
+    };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {
         idol_runtime::dispatch(&mut incoming, &mut server);
@@ -219,3 +294,5 @@ mod idl {
     use drv_rp235x_i2c_api::I2cError;
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }
+
+include!(concat!(env!("OUT_DIR"), "/notifications.rs"));

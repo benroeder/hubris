@@ -29,5 +29,14 @@ Interface(
             reply: Result(ok: "usize", err: CLike("I2cError")),
             idempotent: true,
         ),
+        "serve": (
+            description: "Become an I2C target at `addr`, serving `data` (up to 16 bytes) on every controller read. Switches the block to slave mode (controller ops stop working until reboot).",
+            args: { "addr": "u8" },
+            leases: {
+                "data": (type: "[u8]", read: true, max_len: Some(16)),
+            },
+            reply: Result(ok: "()", err: CLike("I2cError")),
+            idempotent: true,
+        ),
     },
 )

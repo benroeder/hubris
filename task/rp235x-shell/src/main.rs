@@ -58,6 +58,7 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c scan              probe all 7-bit addresses\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
+  i2c target <addr> <hex<=16>   become an I2C target serving those bytes\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
   flash erase <hex-off>          erase a 4K sector (aligned)\r\n\
   flash write <hex-off> <hex..>  program bytes (within one 256B page)\r\n\
@@ -556,7 +557,35 @@ impl Shell {
                     Err(_) => self.out.put(b"error (nak/timeout)\r\n"),
                 }
             }
-            _ => self.out.put(b"usage: i2c scan|read|write\r\n"),
+            Some("target") => {
+                // Become an I2C target at <addr> serving <hex> on every read.
+                let (Some(addr), Some(hex)) =
+                    (arg1.and_then(|a| u8::from_str_radix(a, 16).ok()), arg2)
+                else {
+                    self.out.put(
+                        b"usage: i2c target <hex-addr> <hex bytes<=16>\r\n",
+                    );
+                    return;
+                };
+                let mut data = [0u8; 16];
+                let Some(n) = parse_hex_bytes(hex, &mut data) else {
+                    self.out.put(
+                        b"bad hex (e.g. i2c target 42 48554252495321)\r\n",
+                    );
+                    return;
+                };
+                match self.i2c.serve(addr, &data[..n]) {
+                    Ok(()) => {
+                        self.out.put(b"serving ");
+                        self.out.put_u32(n as u32);
+                        self.out.put(b" bytes at 0x");
+                        self.out.put_hex_byte(addr);
+                        self.out.put(b" (this board is now an I2C target)\r\n");
+                    }
+                    Err(_) => self.out.put(b"error\r\n"),
+                }
+            }
+            _ => self.out.put(b"usage: i2c scan|read|write|target\r\n"),
         }
     }
 

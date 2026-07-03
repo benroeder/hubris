@@ -16,6 +16,7 @@ counters = { path = "../../lib/counters" }
 userlib = { path = "../../sys/userlib" }
 
 [build-dependencies]
+build-util = { path = "../../build/util" }
 idol = { workspace = true }
 
 [[bin]]
