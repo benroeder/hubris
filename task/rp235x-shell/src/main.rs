@@ -42,6 +42,7 @@ const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
+  bench all [addr]      throughput of every bus in one table\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -161,6 +162,7 @@ impl Shell {
                 self.out.put_u64(sys_get_timer().now);
                 self.out.put(b" ms\r\n");
             }
+            "bench" => self.cmd_bench(words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -390,6 +392,81 @@ impl Shell {
             _ => self.out.put(
                 b"usage: uart send <text> | recv | bench [n] | rxbench\r\n",
             ),
+        }
+    }
+
+    /// `bench all [n]` -- run every bus back-to-back and print one comparison
+    /// table. UART (TX) and SPI (loopback/controller) bench standalone; I2C
+    /// needs a target on the bus, so `bench all 42` benches address 0x42 too.
+    fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {
+        if sub != Some("all") {
+            self.out.put(b"usage: bench all [i2c-target-hex-addr]\r\n");
+            return;
+        }
+        const N: u32 = 4096;
+        self.out.put(b"bus throughput (4096 bytes each):\r\n");
+
+        // UART TX: write() blocks on the TX FIFO, so elapsed = wire rate.
+        let buf = [0x55u8; 256];
+        let t0 = sys_get_timer().now;
+        let mut sent = 0u32;
+        while sent < N {
+            let c = (N - sent).min(256);
+            self.uart.write(&buf[..c as usize]);
+            sent += c;
+        }
+        self.bench_report(
+            b"  uart:  ",
+            N,
+            (sys_get_timer().now - t0) as u32,
+            11520,
+        );
+
+        // SPI: exchange through loopback (or the real bus if role=controller).
+        let mut rx = [0u8; 256];
+        let t0 = sys_get_timer().now;
+        let mut sent = 0u32;
+        while sent < N {
+            let c = (N - sent).min(256) as usize;
+            self.spi.exchange(&buf[..c], &mut rx[..c]);
+            sent += c as u32;
+        }
+        self.bench_report(
+            b"  spi:   ",
+            N,
+            (sys_get_timer().now - t0) as u32,
+            187500,
+        );
+
+        // I2C: needs a target; bench it only if an address was given.
+        match addr.and_then(|a| u8::from_str_radix(a, 16).ok()) {
+            Some(a) => {
+                let mut ib = [0u8; 32];
+                let t0 = sys_get_timer().now;
+                let mut done = 0u32;
+                let mut ok = true;
+                while done < N {
+                    let c = (N - done).min(32) as usize;
+                    if self.i2c.read(a, &mut ib[..c]).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    done += c as u32;
+                }
+                if ok {
+                    self.bench_report(
+                        b"  i2c:   ",
+                        N,
+                        (sys_get_timer().now - t0) as u32,
+                        self.i2c_khz * 1000 / 9,
+                    );
+                } else {
+                    self.out.put(b"  i2c:   no target at that address\r\n");
+                }
+            }
+            None => self
+                .out
+                .put(b"  i2c:   (give a target addr: `bench all 42`)\r\n"),
         }
     }
 

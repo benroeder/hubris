@@ -16,7 +16,16 @@ terminal. Drive one board, observe the other.
 | 03 | [I2C target](03-i2c-target.md) | I2C0 | ACKed transaction + throughput |
 | 04 | [Firmware push](04-uart-update.md) | UART0 | one board updates the other over the wire |
 
-## Speed comparison (filled in as examples land)
+## Speed comparison
+
+Run `bench all <i2c-target-addr>` on one board (with a peer serving as the I2C
+target) to print all three buses in one table, e.g.:
+
+```
+  uart:  4096 bytes in 352 ms = 11636 B/s (101% of 11520 theoretical)
+  spi:   4096 bytes in  73 ms = 56109 B/s (29% of 187500 theoretical)
+  i2c:   4096 bytes in 406 ms = 10088 B/s (90% of 11111 theoretical)
+```
 
 | Bus | Clock | Measured | Theoretical | % of max |
 |-----|-------|----------|-------------|----------|
