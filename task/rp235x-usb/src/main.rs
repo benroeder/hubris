@@ -111,6 +111,18 @@ impl idl::InOrderUsbConsImpl for ServerImpl {
         Ok(len)
     }
 
+    fn disconnect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<Infallible>> {
+        // Drop the D+ pull-up: the host sees the device leave. Used before a
+        // warm reboot so the freshly-booted image re-enumerates cleanly
+        // instead of the host holding a stale connection.
+        let usb = unsafe { &*rp235x_pac::USB::ptr() };
+        usb.sie_ctrl().modify(|_, w| w.pullup_en().clear_bit());
+        Ok(())
+    }
+
     fn read(
         &mut self,
         _: &RecvMessage,

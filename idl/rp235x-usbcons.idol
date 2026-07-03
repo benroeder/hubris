@@ -15,6 +15,11 @@ Interface(
             reply: Simple("usize"),
             idempotent: true,
         ),
+        "disconnect": (
+            description: "Drop the USB D+ pull-up so the host sees a clean disconnect (call before a warm reboot so the next boot re-enumerates).",
+            reply: Simple("()"),
+            idempotent: true,
+        ),
         "read": (
             description: "Drain buffered host->device bytes into dest. Returns the count (0 if none).",
             leases: {
