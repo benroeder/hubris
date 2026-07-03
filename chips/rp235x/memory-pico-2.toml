@@ -9,13 +9,13 @@
 # 0x10000000..0x10040000 -> runtime 0x20000000..0x20040000).
 [[flash]]
 address = 0x2000_0000
-size = 0x4_0000        # 256 KiB code window (of 520 KiB total SRAM)
+size = 0x2_0000        # 128 KiB code window (lower half; core 1 gets the upper)
 read = true
 execute = true
 
 [[ram]]
-address = 0x2004_0000  # data pool: the rest of SRAM (striped SRAM0-7 + SRAM8/9)
-size = 0x4_2000
+address = 0x2002_0000  # data pool: 128 KiB (core 1 kernel gets 0x20040000+)
+size = 0x2_0000
 read = true
 write = true
 execute = false

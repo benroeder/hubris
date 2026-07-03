@@ -1,0 +1,23 @@
+[package]
+edition = "2021"
+name = "demo-pi-pico-2-core1"
+version = "0.1.0"
+
+[dependencies]
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+rp235x-pac = { workspace = true, features = ["rt"] }
+
+kern = { path = "../../sys/kern", default-features = false }
+
+[build-dependencies]
+build-util = { path = "../../build/util" }
+
+[[bin]]
+name = "demo-pi-pico-2-core1"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

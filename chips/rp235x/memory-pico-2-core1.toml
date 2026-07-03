@@ -1,0 +1,16 @@
+# Core-1 kernel memory (AMP two-kernel experiment, branch rp2350-amp). A second,
+# independent Hubris image linked into the upper half of SRAM; core 0 copies it
+# there (via a second LOAD_MAP entry) and launches core 1 at its reset vector.
+# Disjoint from core 0's regions (core 0 will be shrunk to the lower half).
+[[flash]]
+address = 0x2004_0000
+size = 0x2_0000        # 128 KiB code window for core 1
+read = true
+execute = true
+
+[[ram]]
+address = 0x2006_0000
+size = 0x2_0000        # 128 KiB data/stacks for core 1
+read = true
+write = true
+execute = false
