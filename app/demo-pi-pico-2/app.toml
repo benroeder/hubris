@@ -103,8 +103,8 @@ extern-regions = ["rom", "xip"]
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 16384, ram = 2048}
-stacksize = 1024
+max-sizes = {flash = 24576, ram = 4096}
+stacksize = 2048
 start = true
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver"]
 

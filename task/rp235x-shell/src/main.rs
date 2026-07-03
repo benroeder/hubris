@@ -59,6 +59,8 @@ const HELP: &[u8] = b"commands:\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
+  update <size-hex> <crc32-hex>  receive a firmware image over this console,\r\n\
+                        write it to flash, verify, then `reboot` to apply\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -155,6 +157,7 @@ impl Shell {
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
             "adc" => self.cmd_adc(words.next(), words.next()),
+            "update" => self.cmd_update(words.next(), words.next()),
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
@@ -575,6 +578,99 @@ impl Shell {
                 self.out.put(b"\r\n");
             }
             Err(_) => self.out.put(b"error (bad channel?)\r\n"),
+        }
+    }
+
+    /// Receive `size` raw bytes over the console and program them into the
+    /// boot region of flash, 256-byte page at a time, ACKing each page with
+    /// a `.` so the host self-paces (the USB RX ring is finite). Safe while
+    /// running because the whole image executes from SRAM; only a power cut
+    /// mid-update leaves flash inconsistent (recover via BOOTSEL).
+    fn cmd_update(&mut self, size: Option<&str>, crc: Option<&str>) {
+        const SECTOR: u32 = 4096;
+        const PAGE: u32 = 256;
+        const IMAGE_MAX: u32 = 0x4_0000; // the 256 KiB LOAD_MAP window
+
+        let (Some(size), Some(want_crc)) = (
+            size.and_then(|s| u32::from_str_radix(s, 16).ok()),
+            crc.and_then(|c| u32::from_str_radix(c, 16).ok()),
+        ) else {
+            self.out.put(b"usage: update <size-hex> <crc32-hex>\r\n");
+            return;
+        };
+        if size == 0 || size > IMAGE_MAX {
+            self.out.put(b"size out of range (max 40000)\r\n");
+            return;
+        }
+
+        self.out.put(b"GO\r\n");
+        self.out.flush();
+
+        let mut page = [0u8; PAGE as usize];
+        let mut off: u32 = 0;
+        while off < size {
+            let want = (size - off).min(PAGE) as usize;
+            // Collect one page from the console (with an idle timeout).
+            let mut got = 0usize;
+            let mut idle = 0u32;
+            while got < want {
+                let n = self.usb.read(&mut page[got..want]);
+                if n == 0 {
+                    idle += 1;
+                    if idle > 500 {
+                        self.out.put(b"\r\ntimeout waiting for data\r\n");
+                        return;
+                    }
+                    hl::sleep_for(10);
+                } else {
+                    idle = 0;
+                    got += n;
+                }
+            }
+            // Erase each sector as we first touch it.
+            if off.is_multiple_of(SECTOR) && self.flash.erase(off).is_err() {
+                self.out.put(b"\r\nerase failed\r\n");
+                return;
+            }
+            if self.flash.program(off, &page[..want]).is_err() {
+                self.out.put(b"\r\nprogram failed\r\n");
+                return;
+            }
+            off += want as u32;
+            // ACK the page so the host sends the next one.
+            self.out.put(b".");
+            self.out.flush();
+        }
+
+        // Verify: CRC32 (zlib polynomial) over the flash contents just
+        // written, read back through the driver.
+        let mut crc: u32 = 0xffff_ffff;
+        let mut off: u32 = 0;
+        let mut buf = [0u8; PAGE as usize];
+        while off < size {
+            let want = (size - off).min(PAGE) as usize;
+            let Ok(n) = self.flash.read(off, &mut buf[..want]) else {
+                self.out.put(b"\r\nreadback failed\r\n");
+                return;
+            };
+            for &b in &buf[..n] {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+                }
+            }
+            off += n as u32;
+        }
+        let crc = !crc;
+        if crc == want_crc {
+            self.out.put(b"\r\nOK crc verified; `reboot` to apply\r\n");
+        } else {
+            self.out.put(b"\r\nCRC MISMATCH: flash ");
+            self.out.put_hex32(crc);
+            self.out.put(b" != ");
+            self.out.put_hex32(want_crc);
+            self.out.put(b" -- do NOT reboot; retry the update\r\n");
         }
     }
 

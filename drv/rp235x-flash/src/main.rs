@@ -115,13 +115,31 @@ impl ServerImpl {
         d.transact(op, &mut []);
         // Poll READ STATUS-1 until the BUSY bit clears.
         let mut sr = [0u8; 1];
+        let mut done = false;
         for _ in 0..BUSY_SPINS {
             d.transact(&[0x05], &mut sr);
             if sr[0] & 0x01 == 0 {
-                return Ok(());
+                done = true;
+                break;
             }
         }
-        Err(FlashError::Timeout)
+        // Leave the chip in a pristine power-on-like state: exit any
+        // continuous-read mode (FFh) and soft-reset the volatile config
+        // (66h + 99h). Without this, chip state left by direct-mode traffic
+        // survives a watchdog reboot (and even an apparent power cycle, since
+        // the SWD wires can back-feed the board) and can make the boot ROM's
+        // flash probe fail -- observed as a bricked-until-BOOTSEL reboot
+        // right after a self-update.
+        d.transact(&[0xff], &mut []);
+        d.transact(&[0x66], &mut []);
+        d.transact(&[0x99], &mut []);
+        // t_RST is 30 us; at 5 MHz SCK one dummy frame comfortably covers it.
+        d.transact(&[0xff], &mut []);
+        if done {
+            Ok(())
+        } else {
+            Err(FlashError::Timeout)
+        }
     }
 }
 
@@ -229,7 +247,14 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         // reset, clear any stale vectored-boot magic, and force the reset.
         psm.wdsel().write(|w| unsafe { w.bits(0xffff_fffe) });
         wd.scratch4().write(|w| unsafe { w.bits(0) });
-        wd.ctrl().modify(|_, w| w.trigger().set_bit());
+        // Clear CTRL first -- notably the PAUSE_DBG0/1/PAUSE_JTAG bits, which
+        // reset to 1: with a debugger attached (or having been attached this
+        // power session), triggering the watchdog with pause bits set wedges
+        // the chip in an unrecoverable-until-BOOTSEL state. The boot ROM's
+        // own reboot code does exactly this, "to ensure we reboot even under
+        // debugger".
+        wd.ctrl().write(|w| unsafe { w.bits(0) });
+        wd.ctrl().write(|w| w.trigger().set_bit());
         // Reset is effectively immediate; this reply is best-effort.
         Ok(0)
     }

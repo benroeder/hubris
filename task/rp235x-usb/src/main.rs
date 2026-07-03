@@ -20,8 +20,8 @@
 #![no_main]
 
 use core::convert::Infallible;
-use idol_runtime::{Leased, LenLimit, RequestError, R, W};
-use userlib::{sys_irq_control, RecvMessage};
+use idol_runtime::{Leased, LenLimit, R, RequestError, W};
+use userlib::{RecvMessage, sys_irq_control};
 
 use rp235x_usb::UsbBus;
 use usb_device::class_prelude::UsbBusAllocator;
@@ -29,9 +29,10 @@ use usb_device::device::StringDescriptors;
 use usb_device::prelude::*;
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
-/// Host->device bytes buffered between `read` calls. Console keystrokes are
-/// slow; 256 is plenty (drop-oldest on overflow).
-const RX_RING_LEN: usize = 256;
+/// Host->device bytes buffered between `read` calls. Sized for the shell's
+/// firmware-update protocol: a full 256-byte page chunk must fit with slack
+/// (drop-oldest on overflow).
+const RX_RING_LEN: usize = 512;
 
 struct ServerImpl {
     dev: UsbDevice<'static, UsbBus>,
@@ -91,10 +92,20 @@ impl idl::InOrderUsbConsImpl for ServerImpl {
             let n = (len - off).min(chunk.len());
             data.read_range(off..off + n, &mut chunk[..n])
                 .map_err(|_| RequestError::went_away())?;
-            // Best effort: push into the CDC endpoint and service the device so
-            // the packet actually goes out; drop what the host will not take.
-            let _ = self.serial.write(&chunk[..n]);
-            let _ = self.dev.poll(&mut [&mut self.serial]);
+            // Push into the CDC endpoint, servicing the device between
+            // attempts so the endpoint drains. Bounded retries: if the host
+            // stops reading entirely we still drop rather than wedge.
+            let mut sent = 0usize;
+            for _ in 0..2000 {
+                match self.serial.write(&chunk[sent..n]) {
+                    Ok(k) => sent += k,
+                    Err(_) => {}
+                }
+                let _ = self.dev.poll(&mut [&mut self.serial]);
+                if sent == n {
+                    break;
+                }
+            }
             off += n;
         }
         Ok(len)
