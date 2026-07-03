@@ -60,6 +60,7 @@ const HELP: &[u8] = b"commands:\r\n\
   i2c write <addr> <hex..>\r\n\
   i2c target <addr> <hex<=16>   become an I2C target serving those bytes\r\n\
   i2c bench <addr> [n]  controller: time reading n bytes from a target\r\n\
+  i2c speed <khz>       100 (std) | 400 (fast) | 1000 (fast-mode-plus)\r\n\
   flash read <hex-off> [n<=64]   dump flash, e.g. flash read 0 64\r\n\
   flash erase <hex-off>          erase a 4K sector (aligned)\r\n\
   flash write <hex-off> <hex..>  program bytes (within one 256B page)\r\n\
@@ -84,6 +85,9 @@ struct Shell {
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
     heartbeat: bool,
+    /// Current I2C bus speed (kHz), tracked so `i2c bench` reports the right
+    /// theoretical; updated by `i2c speed`.
+    i2c_khz: u32,
 }
 
 /// Small write-combining buffer so replies go to the USB task in a few IPCs
@@ -586,6 +590,18 @@ impl Shell {
                     Err(_) => self.out.put(b"error\r\n"),
                 }
             }
+            Some("speed") => {
+                // Set bus speed in kHz: 100 (standard), 400 (fast), 1000 (FM+).
+                let Some(khz) = arg1.and_then(|a| a.parse::<u32>().ok()) else {
+                    self.out.put(b"usage: i2c speed <khz: 100|400|1000>\r\n");
+                    return;
+                };
+                self.i2c.set_speed(khz);
+                self.i2c_khz = khz;
+                self.out.put(b"i2c speed set to ");
+                self.out.put_u32(khz);
+                self.out.put(b" kHz\r\n");
+            }
             Some("bench") => {
                 // Controller: read <addr> repeatedly to n bytes, timed on-
                 // device (excludes USB overhead). Needs a target on the bus.
@@ -610,14 +626,17 @@ impl Shell {
                 }
                 let ms = (sys_get_timer().now - t0) as u32;
                 if ok {
-                    // 100 kHz, ~9 bits/byte (data + ACK) -> ~11111 B/s.
-                    self.bench_report(b"i2c: ", n, ms, 11111);
+                    // ~9 bits/byte (data + ACK): theoretical = clock / 9.
+                    let theo = self.i2c_khz * 1000 / 9;
+                    self.bench_report(b"i2c: ", n, ms, theo);
                 } else {
                     self.out
                         .put(b"i2c bench: read error (target present?)\r\n");
                 }
             }
-            _ => self.out.put(b"usage: i2c scan|read|write|target|bench\r\n"),
+            _ => self
+                .out
+                .put(b"usage: i2c scan|read|write|target|speed|bench\r\n"),
         }
     }
 
@@ -1029,6 +1048,7 @@ pub fn main() -> ! {
             len: 0,
         },
         heartbeat: true,
+        i2c_khz: 100,
     };
 
     // Let enumeration settle, then greet.

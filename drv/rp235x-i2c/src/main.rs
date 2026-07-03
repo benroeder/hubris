@@ -170,6 +170,42 @@ impl idl::InOrderRp235xI2cImpl for ServerImpl {
         Ok(len)
     }
 
+    fn set_speed(
+        &mut self,
+        _: &RecvMessage,
+        khz: u32,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        // Reconfigure SCL timing. speed=standard for <=100 kHz, else fast
+        // (which covers both fast 400k and fast-mode-plus 1M). Same count
+        // split as the initial config: low = 3/5 of the period, high = the
+        // rest. The slave (target) uses `speed` too, for its spike filter.
+        let hz = khz.max(1) * 1000;
+        let period = CLK_HZ / hz;
+        let lcnt = (period * 3 / 5) as u16;
+        let hcnt = (period - period * 3 / 5) as u16;
+        self.i2c.ic_enable().write(|w| w.enable().disabled());
+        while self.i2c.ic_enable_status().read().ic_en().bit_is_set() {}
+        if hz > 100_000 {
+            self.i2c.ic_con().modify(|_, w| w.speed().fast());
+            self.i2c
+                .ic_fs_scl_hcnt()
+                .write(|w| unsafe { w.ic_fs_scl_hcnt().bits(hcnt) });
+            self.i2c
+                .ic_fs_scl_lcnt()
+                .write(|w| unsafe { w.ic_fs_scl_lcnt().bits(lcnt) });
+        } else {
+            self.i2c.ic_con().modify(|_, w| w.speed().standard());
+            self.i2c
+                .ic_ss_scl_hcnt()
+                .write(|w| unsafe { w.ic_ss_scl_hcnt().bits(hcnt) });
+            self.i2c
+                .ic_ss_scl_lcnt()
+                .write(|w| unsafe { w.ic_ss_scl_lcnt().bits(lcnt) });
+        }
+        self.i2c.ic_enable().write(|w| w.enable().enabled());
+        Ok(())
+    }
+
     fn serve(
         &mut self,
         _: &RecvMessage,

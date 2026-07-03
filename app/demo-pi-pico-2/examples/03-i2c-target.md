@@ -66,17 +66,23 @@ control  i2c scan                       -> i2c:  0x42        (target ACKs)
 control  i2c read 42 7                  -> rx: 48 55 42 52 49 53 21   ("HUBRIS!")
 ```
 
-```
-control  i2c bench 42 4096            -> i2c: 4096 bytes in 405 ms = 10113 B/s (91%)
-```
-
 Closes the long-staged ACK test (previously only NAK-on-empty-bus was verified).
-At 100 kHz (9 bits/byte with the ACK, ~11111 B/s theoretical) I2C runs at 91% of
-line rate -- UNLIKE SPI (30%). The reason is the clock: at 100 kHz a byte takes
-~90 us, which dwarfs the per-byte IPC/FIFO overhead, so the bus stays busy (same
-as UART at 115200). SPI's 1.5 MHz is fast enough that the software overhead
-dominates. (`i2c scan` sweeps 112 addresses, each NAK timing out on an empty
-slot, so a full scan takes ~1.5 s -- that is scan cost, not bus speed.)
+
+**Speed sweep** (`i2c speed <khz>` then `i2c bench 42 4096`, both boards set):
+
+| Mode | Clock | Measured | Efficiency |
+|------|-------|----------|-----------|
+| standard       | 100 kHz | 10113 B/s | 91% |
+| fast           | 400 kHz | 33573 B/s | 75% |
+| fast-mode-plus | 1 MHz   | 64000 B/s | 57% |
+
+Same driver, same code -- just a faster clock -- and the efficiency *drops*
+(91 -> 75 -> 57%) as the per-byte IPC/FIFO overhead becomes a bigger fraction of
+each byte's shrinking on-wire time. That is the exact mechanism that caps SPI
+(30% at 1.5 MHz). In absolute terms fast-mode-plus I2C (64 KB/s) even edges past
+SPI (56.9 KB/s). (`i2c scan` sweeps 112 addresses, each NAK timing out on an
+empty slot, so a full scan takes ~1.5 s at 100 kHz -- that is scan cost, not bus
+speed.)
 
 ## Notes
 

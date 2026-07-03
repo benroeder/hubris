@@ -29,6 +29,12 @@ Interface(
             reply: Result(ok: "usize", err: CLike("I2cError")),
             idempotent: true,
         ),
+        "set_speed": (
+            description: "Set the bus speed in kHz (100 = standard, 400 = fast, 1000 = fast-mode-plus). Reconfigures the controller SCL timing; also sets the slave spike filter mode.",
+            args: { "khz": "u32" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
         "serve": (
             description: "Become an I2C target at `addr`, serving `data` (up to 16 bytes) on every controller read. Switches the block to slave mode (controller ops stop working until reboot).",
             args: { "addr": "u8" },

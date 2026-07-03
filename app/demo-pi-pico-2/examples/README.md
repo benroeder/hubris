@@ -23,6 +23,8 @@ terminal. Drive one board, observe the other.
 | UART0 | 115200 8N1 | 11636 B/s | 11520 B/s | ~100% |
 | SPI0 | 1.5 MHz | 56888 B/s | 187500 B/s | 30% |
 | I2C0 | 100 kHz | 10113 B/s | 11111 B/s | 91% |
+| I2C0 fast | 400 kHz | 33573 B/s | 44444 B/s | 75% |
+| I2C0 FM+ | 1 MHz | 64000 B/s | 111111 B/s | 57% |
 | USB CDC | 12 Mbit FS | ~16 KB/s | — | — |
 
 The drivers poll the peripheral FIFO one byte per IPC, so measured throughput
