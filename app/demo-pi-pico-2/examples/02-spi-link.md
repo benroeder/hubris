@@ -75,7 +75,19 @@ peripheral attached.
 
 ### Measured
 
-_To be filled in from hardware._
+Verified on hardware (two boards, 5-wire cross, controller <-> peripheral):
+
+```
+controller  spi xfer aa bb cc dd  ->  rx: 11 22 33 44   (peripheral's staged bytes)
+peripheral  spi recv              ->  rx 4: aa bb cc dd  (controller's bytes, exact)
+
+spi bench 4096  ->  56888 B/s (30% of 187500 theoretical @ 1.5 MHz SCK)
+```
+
+SPI runs ~5x faster than the UART link (56.9 KB/s vs 11.5 KB/s) but at only
+30% of its line rate: the SCK is fast enough that the per-byte IPC + FIFO-poll
+overhead dominates (the opposite of UART, which hit ~100% because its slow byte
+period hides that overhead). This gap is where batching / DMA would pay off.
 
 ## Notes
 
