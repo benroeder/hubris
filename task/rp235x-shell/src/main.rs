@@ -754,10 +754,6 @@ impl Shell {
                 return;
             }
         };
-        // Cleanly drop USB so the host re-enumerates the next boot instead of
-        // hanging onto a stale connection across the warm reset.
-        self.usb.disconnect();
-        hl::sleep_for(60);
         let rc = self.flash.reboot(bootsel);
         if rc == 0 {
             self.out.put(if bootsel != 0 {
