@@ -245,19 +245,23 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         wd.scratch0().write(|w| unsafe {
             w.bits(if bootsel != 0 { BOOTSEL_MAGIC } else { 0 })
         });
-        // Select everything but the processor cold domain for watchdog
-        // reset, clear any stale vectored-boot magic, and force the reset.
+        // Select everything but the processor cold domain for watchdog reset,
+        // and clear any stale vectored-boot magic.
         psm.wdsel().write(|w| unsafe { w.bits(0xffff_fffe) });
         wd.scratch4().write(|w| unsafe { w.bits(0) });
-        // Clear CTRL first -- notably the PAUSE_DBG0/1/PAUSE_JTAG bits, which
-        // reset to 1: with a debugger attached (or having been attached this
-        // power session), triggering the watchdog with pause bits set wedges
-        // the chip in an unrecoverable-until-BOOTSEL state. The boot ROM's
-        // own reboot code does exactly this, "to ensure we reboot even under
-        // debugger".
+        // Clear CTRL: disables the watchdog and clears the PAUSE_DBG0/1 /
+        // PAUSE_JTAG bits, which reset to 1 (leaving them set wedges the chip
+        // when a debugger is or was attached).
         wd.ctrl().write(|w| unsafe { w.bits(0) });
-        wd.ctrl().write(|w| w.trigger().set_bit());
-        // Reset is effectively immediate; this reply is best-effort.
+        // Reboot via the watchdog *timer* (a short countdown), NOT the
+        // immediate TRIGGER bit. The boot ROM does exactly this on purpose:
+        // an immediate trigger can glitch clk_pow as the watchdog resets the
+        // system clock generators and leave the chip wedged; the timer path
+        // gives the clocks time to settle. LOAD counts down at the watchdog
+        // tick (~1 MHz, left running by the boot ROM); ~1 ms here.
+        wd.load().write(|w| unsafe { w.bits(1000) });
+        wd.ctrl().write(|w| w.enable().set_bit());
+        // The reset lands within ~1 ms; this reply is best-effort.
         Ok(0)
     }
 }
