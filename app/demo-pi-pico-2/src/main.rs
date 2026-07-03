@@ -13,25 +13,41 @@ use cortex_m_rt::entry;
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
 
-/// RP2350 boot metadata: the minimum valid Arm IMAGE_DEF block loop.
+/// RP2350 boot metadata: IMAGE_DEF block for a RAM ("packaged") image.
 ///
-/// The RP2350 boot ROM refuses to start a flash image that lacks this. It must
-/// appear within the first 4 KiB (the linker places `.image_def` right after the
-/// vector table + Hubris `ImageHeader`; see `build/kernel-link.x`).
+/// The boot ROM refuses images without an IMAGE_DEF in the first 4 KiB (the
+/// linker places `.image_def` right after the vector table + Hubris
+/// `ImageHeader`; see `build/kernel-link.x`). This block additionally carries
+/// a LOAD_MAP: the ROM copies the whole 256 KiB code window from flash into
+/// SRAM before boot (datasheet sec 5.1.10 "packaged binaries"), so nothing
+/// ever executes from flash at runtime and the sec 5.4.4 XIP erase/program
+/// hazard does not exist on this system.
 ///
-/// The five little-endian words are datasheet-verified (RP2350 datasheet
-/// sec 5.9.5.1, "Minimum Arm IMAGE_DEF") and cross-checked in
-/// `docs/rp2350-research/findings.md`.
+/// Words verified against the datasheet, pico-sdk picobin.h, and the bootrom
+/// source (varm_blocks.c); see also docs/rp2350-research/findings.md.
 #[link_section = ".image_def"]
 #[used]
-pub static RP235X_IMAGE_DEF_ARM_MIN: [u32; 5] = [
+pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 11] = [
     0xffff_ded3, // PICOBIN_BLOCK_MARKER_START
     0x1021_0142, // IMAGE_TYPE item: EXE | SECURITY(S) | CPU(Arm) | CHIP(RP2350)
-    0x0000_01ff, // BLOCK_ITEM_LAST, size = 1 word
+    // VECTOR_TABLE item (type 0x03, 2 words): the runtime vector table is at
+    // the image's RAM base, where the LOAD_MAP below puts it.
+    0x0000_0203,
+    0x2000_0000,
+    // LOAD_MAP item (type 0x06, size 4 words, absolute + 1 entry = 0x81).
+    0x8100_0406,
+    0x1000_0000, // entry 0: storage start (physical flash address)
+    0x2000_0000, // entry 0: runtime start (SRAM)
+    // Entry 0 end: the RUNTIME end address. The datasheet table calls this
+    // field "storage_end_address", but the bootrom source (varm_blocks.c)
+    // computes size = <this word> - runtime_start for absolute entries, so it
+    // must be in runtime space; a storage-space end fails the span check and
+    // the ROM rejects the whole block (INVALID_BLOCK_LOOP diagnostic).
+    0x2004_0000,
+    0x0000_07ff, // BLOCK_ITEM_LAST, size = 7 words of items
     0x0000_0000, // link = self (single-block loop)
     0xab12_3579, // PICOBIN_BLOCK_MARKER_END
 ];
-
 /// Watchdog scratch0 marker: "this reboot wants to land in BOOTSEL". Written
 /// by the flash driver's `reboot(bootsel)`; scratch registers survive a
 /// watchdog reset. Scratch 4-7 are reserved for the ROM's vectored-boot

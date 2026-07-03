@@ -305,9 +305,10 @@ ASSERT(SIZEOF(.image_def) == 0
        || (SIZEOF(.vector_table) + SIZEOF(.header) + SIZEOF(.image_def)) <= 0x1000,
 "RP235x: vector table + header + IMAGE_DEF must fit in the first 4 KiB");
 
-/* The minimum Arm IMAGE_DEF is exactly 20 bytes; flag unexpected growth. */
-ASSERT(SIZEOF(.image_def) == 0 || SIZEOF(.image_def) == 20,
-"RP235x: unexpected IMAGE_DEF size (expected 20 bytes); update kernel-link.x if intended");
+/* Known IMAGE_DEF sizes: 20 bytes (minimum Arm EXE) or 44 bytes (RAM image
+   with VECTOR_TABLE + LOAD_MAP items); flag unexpected growth. */
+ASSERT(SIZEOF(.image_def) == 0 || SIZEOF(.image_def) == 20 || SIZEOF(.image_def) == 44,
+"RP235x: unexpected IMAGE_DEF size; update kernel-link.x if intended");
 
 /* IMAGE_DEF must precede .text. */
 ASSERT(SIZEOF(.image_def) == 0 || ADDR(.image_def) < ADDR(.text),
