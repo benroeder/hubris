@@ -8,6 +8,7 @@
 // Pull in the PAC so its interrupt vector table is linked into the image.
 use rp235x_pac as _;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m_rt::entry;
 
 mod image_version {
@@ -16,6 +17,77 @@ mod image_version {
 
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
+
+// --- AMP milestone 1: launch a bare payload on core 1 -------------------------
+//
+// Optional multicore experiment (branch rp2350-amp). Core 0 runs single-core
+// Hubris exactly as before; just before starting the kernel it wakes core 1
+// with a minimal bare-metal payload that has NO kernel -- it only writes a
+// shared mailbox in RAM so we can confirm, over the debug probe (`--core 1`),
+// that core 1 launched and is running our code. Nothing here touches the
+// kernel or any peripheral core 0 owns.
+
+/// Shared mailbox: [0] = magic ("core 1 reached my code"), [1] = heartbeat.
+/// Read these over SWD to see core 1 alive. `#[used]`/no-mangle so the symbol
+/// address is easy to find with `nm`.
+#[no_mangle]
+#[used]
+static CORE1_MAILBOX: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Core 1's stack (1 KiB) -- it has no kernel, so this is its whole stack.
+static mut CORE1_STACK: [u32; 256] = [0; 256];
+
+const CORE1_MAGIC: u32 = 0xC0FF_EE01;
+
+/// Bare payload that runs on core 1 after launch: announce via the mailbox,
+/// then bump a heartbeat forever. No stack-heavy calls (keeps the compiler
+/// from emitting RCP/canary ops core 1's coprocessor may not be salted for).
+extern "C" fn core1_main() -> ! {
+    CORE1_MAILBOX[0].store(CORE1_MAGIC, Ordering::SeqCst);
+    let mut beat: u32 = 0;
+    loop {
+        beat = beat.wrapping_add(1);
+        CORE1_MAILBOX[1].store(beat, Ordering::SeqCst);
+        for _ in 0..300_000 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+/// Wake core 1 (asleep in the bootrom) and start it at `core1_main`, using the
+/// SIO inter-core FIFO handshake from datasheet sec 5.3:
+/// send {0, 0, 1, VTOR, SP, entry}, each echoed back before advancing.
+fn launch_core1(sio: &rp235x_pac::SIO) {
+    let vtor = 0x2000_0000u32; // the RAM image's vector table (unused by the loop)
+    let sp = core::ptr::addr_of!(CORE1_STACK) as u32 + 256 * 4;
+    let entry = core1_main as *const () as u32 | 1; // thumb bit
+    let seq = [0u32, 0, 1, vtor, sp, entry];
+    let mut i = 0usize;
+    while i < seq.len() {
+        let cmd = seq[i];
+        if cmd == 0 {
+            // Drain anything core 1 left in our read FIFO, then wake it.
+            while sio.fifo_st().read().vld().bit_is_set() {
+                let _ = sio.fifo_rd().read().bits();
+            }
+            cortex_m::asm::sev();
+        }
+        while sio.fifo_st().read().rdy().bit_is_clear() {}
+        sio.fifo_wr().write(|w| unsafe { w.bits(cmd) });
+        cortex_m::asm::sev();
+        while sio.fifo_st().read().vld().bit_is_clear() {
+            cortex_m::asm::wfe();
+        }
+        let resp = sio.fifo_rd().read().bits();
+        i = if cmd == resp { i + 1 } else { 0 };
+    }
+}
+// -----------------------------------------------------------------------------
 
 /// RP2350 boot metadata: IMAGE_DEF block for a RAM ("packaged") image.
 ///
@@ -192,6 +264,11 @@ fn main() -> ! {
     p.WATCHDOG
         .scratch2()
         .write(|w| unsafe { w.bits(id as u32) });
+
+    // AMP milestone 1: wake core 1 with the bare payload before core 0 enters
+    // the kernel. Core 0 continues to single-core Hubris; core 1 spins its loop
+    // and reports via CORE1_MAILBOX (read it over `probe-rs --core 1`).
+    launch_core1(&p.SIO);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
