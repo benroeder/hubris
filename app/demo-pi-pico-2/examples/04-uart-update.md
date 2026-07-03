@@ -59,10 +59,19 @@ visibly change.)
 
 ### Measured
 
-Verified on hardware: **66624 bytes, A -> B over UART, ~9.4 s**, CRC-verified
-byte-exact. That is ~7 KB/s effective -- below the raw 11.5 KB/s UART line rate
-(example 01) because each page waits for B's ACK *and* B's flash write
-(sector erase + program) before the next page.
+Verified on hardware, **visibly**: board A (built with a distinct greeting)
+pushed its ~66 KB flash image to board B over UART; B verified byte-exact and
+rebooted into it -- its greeting changed to the pushed image's.
+
+```
+A: push OK: peer verified; 66912 bytes in 10146 ms   (~6.6 KB/s)
+B: OK crc verified; `reboot` to apply
+B (after reboot): Hubris [PUSHED-OVER-UART-v2] ...
+```
+
+~6.6 KB/s effective -- below the raw 11.5 KB/s UART line rate (example 01)
+because each page waits for B's ACK, B's flash write (sector erase + program),
+and now carries a 2-byte checksum.
 
 ## Important caveats (and the roadmap)
 
@@ -74,10 +83,12 @@ byte-exact. That is ~7 KB/s effective -- below the raw 11.5 KB/s UART line rate
   `rp2350-port`): `target flash` becomes the *inactive* slot, the ROM boots the
   higher version, and the running image stays as an automatic fallback --
   **unbrickable**, and the real point of this stage.
-- **Per-page integrity is the next robustness step.** Today a single UART bit
-  error fails the whole transfer (end-to-end CRC, full retry). A per-page
-  checksum + page-level retry would recover from transient errors without
-  restarting the 66 KB transfer -- important on a raw UART with no flow control.
+- **Per-page integrity: DONE.** Each UART page carries a 2-byte checksum; a bad
+  page is NAK'd (`!`) and the sender resends just that page (bounded retries),
+  so a transient bit error no longer fails the whole 66 KB transfer. (An earlier
+  run without this hit a UART glitch, the end-to-end CRC caught it, but an
+  in-place reboot into the corrupt image bricked the target -- motivating both
+  this and A/B.) USB CDC is reliable, so it skips the per-page check.
 
 ## Next transports
 

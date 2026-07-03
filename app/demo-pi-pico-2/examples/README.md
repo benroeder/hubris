@@ -32,7 +32,7 @@ Firmware transfer (66 KB image, end-to-end incl. flash writes):
 | Transport | Time | Effective |
 |-----------|------|-----------|
 | USB | ~3.6 s | ~18 KB/s |
-| UART | ~9.4 s | ~7 KB/s |
+| UART | ~10 s | ~6.6 KB/s (per-page CRC) |
 | SPI | tbd | tbd |
 
 The drivers poll the peripheral FIFO one byte per IPC, so measured throughput

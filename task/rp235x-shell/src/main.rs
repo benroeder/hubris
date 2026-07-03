@@ -905,22 +905,34 @@ impl Shell {
         let mut off: u32 = 0;
         while off < size {
             let want = (size - off).min(PAGE) as usize;
-            let mut got = 0usize;
-            let mut idle = 0u32;
-            while got < want {
-                let n = self.link_read(link, &mut page[got..want]);
-                if n == 0 {
-                    idle += 1;
-                    if idle > 500 {
-                        self.out.put(b"\r\ntimeout waiting for data\r\n");
-                        self.link_write(link, b"ERR\r\n");
-                        return;
-                    }
-                    hl::sleep_for(10);
-                } else {
-                    idle = 0;
-                    got += n;
+            // Read one page. On UART each page carries a 2-byte checksum; a bad
+            // page is NAK'd ("!") so the sender resends just that page (bounded
+            // retries). USB CDC is reliable, so no per-page check there.
+            let mut tries = 0u32;
+            loop {
+                if self.recv_bytes(link, &mut page[..want]).is_err() {
+                    self.out.put(b"\r\ntimeout waiting for data\r\n");
+                    self.link_write(link, b"ERR\r\n");
+                    return;
                 }
+                if link != Link::Uart {
+                    break;
+                }
+                let mut ck = [0u8; 2];
+                if self.recv_bytes(link, &mut ck).is_err() {
+                    self.link_write(link, b"ERR\r\n");
+                    return;
+                }
+                if page16(&page[..want]) == u16::from_le_bytes(ck) {
+                    break;
+                }
+                tries += 1;
+                if tries > 12 {
+                    self.out.put(b"\r\ntoo many page errors\r\n");
+                    self.link_write(link, b"ERR\r\n");
+                    return;
+                }
+                self.link_write(link, b"!"); // NAK: resend this page
             }
             if off.is_multiple_of(SECTOR)
                 && self.flash.erase(base + off).is_err()
@@ -978,10 +990,22 @@ impl Shell {
                 self.out.put(b"flash read failed\r\n");
                 return;
             }
-            self.uart.write(&buf[..want]);
-            if !self.uart_wait_token(b".", 800) {
-                self.out.put(b"\r\npeer ACK timeout\r\n");
-                return;
+            // Each page: data + 2-byte checksum, then wait for the peer's
+            // `.` (ok) or `!` (resend). Bounded retries per page.
+            let ck = page16(&buf[..want]).to_le_bytes();
+            let mut tries = 0u32;
+            loop {
+                self.uart.write(&buf[..want]);
+                self.uart.write(&ck);
+                if self.uart_wait_ack(800) {
+                    break; // "." -- page accepted
+                }
+                tries += 1;
+                if tries > 12 {
+                    self.out
+                        .put(b"\r\npeer ACK timeout / too many retries\r\n");
+                    return;
+                }
             }
             off += want as u32;
         }
@@ -1059,6 +1083,52 @@ impl Shell {
         }
     }
 
+    /// Fill `buf` from `link`, blocking with an idle timeout. Err on timeout.
+    fn recv_bytes(&mut self, link: Link, buf: &mut [u8]) -> Result<(), ()> {
+        let mut got = 0usize;
+        let mut idle = 0u32;
+        while got < buf.len() {
+            let n = self.link_read(link, &mut buf[got..]);
+            if n == 0 {
+                idle += 1;
+                if idle > 500 {
+                    return Err(());
+                }
+                hl::sleep_for(10);
+            } else {
+                idle = 0;
+                got += n;
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait for a page ACK over UART: `.` = ok (true), `!` = resend (false).
+    /// Times out to false after ~units*10 ms of no data.
+    fn uart_wait_ack(&mut self, units: u32) -> bool {
+        let mut idle = 0u32;
+        let mut rx = [0u8; 16];
+        loop {
+            let n = self.uart.read(&mut rx);
+            if n == 0 {
+                idle += 1;
+                if idle > units {
+                    return false;
+                }
+                hl::sleep_for(10);
+                continue;
+            }
+            for &b in &rx[..n] {
+                if b == b'.' {
+                    return true;
+                }
+                if b == b'!' {
+                    return false;
+                }
+            }
+        }
+    }
+
     /// Send protocol bytes (GO / . / OK / ERR) back over a transport link.
     /// For USB, flush the console buffer first so ordering is preserved.
     fn link_write(&mut self, link: Link, data: &[u8]) {
@@ -1132,6 +1202,11 @@ fn subcommand_rest<'a>(line: &'a str, verb: &str) -> &'a str {
 enum Link {
     Usb,
     Uart,
+}
+
+/// 16-bit additive checksum of a page, for per-page integrity over UART.
+fn page16(data: &[u8]) -> u16 {
+    data.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16))
 }
 
 /// Parse and range-check the `<size-hex> <crc32-hex>` update arguments.
