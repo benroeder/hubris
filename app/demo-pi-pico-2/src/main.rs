@@ -8,7 +8,6 @@
 // Pull in the PAC so its interrupt vector table is linked into the image.
 use rp235x_pac as _;
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m_rt::entry;
 
 mod image_version {
@@ -18,60 +17,48 @@ mod image_version {
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
 
-// --- AMP milestone 1: launch a bare payload on core 1 -------------------------
+// --- AMP milestone B2: run a second Hubris kernel on core 1 -------------------
 //
 // Optional multicore experiment (branch rp2350-amp). Core 0 runs single-core
-// Hubris exactly as before; just before starting the kernel it wakes core 1
-// with a minimal bare-metal payload that has NO kernel -- it only writes a
-// shared mailbox in RAM so we can confirm, over the debug probe (`--core 1`),
-// that core 1 launched and is running our code. Nothing here touches the
-// kernel or any peripheral core 0 owns.
+// Hubris as before; just before starting its own kernel it copies core 1's
+// separately-built Hubris image into the upper half of SRAM and launches core 1
+// at that image's reset vector. Core 1 then runs its OWN independent kernel
+// (jefe + a liveness "beat" task + idle). The two kernels share nothing but the
+// SIO FIFO and a shared-SRAM region (0x20080000). Verify over `--core 1`: the
+// beat task writes 0xBEA71234 + an incrementing heartbeat at 0x20080000.
 
-/// Shared mailbox: [0] = magic ("core 1 reached my code"), [1] = heartbeat.
-/// Read these over SWD to see core 1 alive. `#[used]`/no-mangle so the symbol
-/// address is easy to find with `nm`.
-#[no_mangle]
-#[used]
-static CORE1_MAILBOX: [AtomicU32; 4] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
+/// Core 1's Hubris kernel image, built by `app/demo-pi-pico-2-core1` and linked
+/// at CORE1_LOAD_ADDR. Embedded in core 0's image and copied into place at boot
+/// -- no second LOAD_MAP entry needed.
+static CORE1_IMAGE: &[u8] = include_bytes!("core1.bin");
 
-/// Core 1's stack (1 KiB) -- it has no kernel, so this is its whole stack.
-static mut CORE1_STACK: [u32; 256] = [0; 256];
+/// Where core 1's image is linked / copied to (its vector table base).
+const CORE1_LOAD_ADDR: u32 = 0x2004_0000;
 
-const CORE1_MAGIC: u32 = 0xC0FF_EE01;
-
-/// Bare payload that runs on core 1 after launch: announce via the mailbox,
-/// then act as a compute engine over the SIO inter-core FIFO -- read each
-/// request word from core 0 and reply with `req*2 + 1` -- while bumping a
-/// heartbeat. Loop-only (no stack-heavy calls) so the compiler emits no
-/// RCP/canary ops core 1's coprocessor is not salted for.
-extern "C" fn core1_main() -> ! {
-    let sio = unsafe { &*rp235x_pac::SIO::ptr() };
-    CORE1_MAILBOX[0].store(CORE1_MAGIC, Ordering::SeqCst);
-    let mut beat: u32 = 0;
-    loop {
-        if sio.fifo_st().read().vld().bit_is_set() {
-            let req = sio.fifo_rd().read().bits();
-            let reply = req.wrapping_mul(2).wrapping_add(1);
-            while sio.fifo_st().read().rdy().bit_is_clear() {}
-            sio.fifo_wr().write(|w| unsafe { w.bits(reply) });
-        }
-        beat = beat.wrapping_add(1);
-        CORE1_MAILBOX[1].store(beat, Ordering::SeqCst);
+/// Copy core 1's kernel image into its SRAM region and launch core 1 at its
+/// reset vector, so it runs its own Hubris kernel.
+fn launch_core1_kernel(sio: &rp235x_pac::SIO) {
+    // SAFETY: CORE1_LOAD_ADDR..+len is core 1's SRAM region, disjoint from
+    // core 0's (memory-pico-2.toml vs -core1.toml); core 1 is still parked.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            CORE1_IMAGE.as_ptr(),
+            CORE1_LOAD_ADDR as *mut u8,
+            CORE1_IMAGE.len(),
+        );
     }
+    cortex_m::asm::dsb(); // image must be visible before core 1 fetches it
+    // Vector table at the load address: [0] = initial SP, [1] = reset entry.
+    let vt = CORE1_LOAD_ADDR as *const u32;
+    let sp = unsafe { vt.read() };
+    let entry = unsafe { vt.add(1).read() };
+    launch_core1(sio, CORE1_LOAD_ADDR, sp, entry);
 }
 
-/// Wake core 1 (asleep in the bootrom) and start it at `core1_main`, using the
-/// SIO inter-core FIFO handshake from datasheet sec 5.3:
+/// Wake core 1 (asleep in the bootrom) and start it at (vtor, sp, entry) using
+/// the SIO inter-core FIFO handshake from datasheet sec 5.3:
 /// send {0, 0, 1, VTOR, SP, entry}, each echoed back before advancing.
-fn launch_core1(sio: &rp235x_pac::SIO) {
-    let vtor = 0x2000_0000u32; // the RAM image's vector table (unused by the loop)
-    let sp = core::ptr::addr_of!(CORE1_STACK) as u32 + 256 * 4;
-    let entry = core1_main as *const () as u32 | 1; // thumb bit
+fn launch_core1(sio: &rp235x_pac::SIO, vtor: u32, sp: u32, entry: u32) {
     let seq = [0u32, 0, 1, vtor, sp, entry];
     let mut i = 0usize;
     while i < seq.len() {
@@ -271,10 +258,11 @@ fn main() -> ! {
         .scratch2()
         .write(|w| unsafe { w.bits(id as u32) });
 
-    // AMP milestone 1: wake core 1 with the bare payload before core 0 enters
-    // the kernel. Core 0 continues to single-core Hubris; core 1 spins its loop
-    // and reports via CORE1_MAILBOX (read it over `probe-rs --core 1`).
-    launch_core1(&p.SIO);
+    // AMP B2: copy core 1's Hubris image into its SRAM region and launch its
+    // kernel before core 0 enters its own kernel. Core 0 stays single-core
+    // Hubris; core 1 runs its own kernel + tasks (see the beat heartbeat at
+    // 0x20080000 over `probe-rs --core 1`).
+    launch_core1_kernel(&p.SIO);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }

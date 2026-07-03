@@ -18,9 +18,17 @@ start = true
 stacksize = 512
 notifications = ["fault", "timer"]
 
+[tasks.beat]
+name = "task-rp235x-core1-beat"
+priority = 1
+max-sizes = {flash = 2048, ram = 512}
+stacksize = 384
+start = true
+extern-regions = ["shared"]
+
 [tasks.idle]
 name = "task-idle"
-priority = 1
+priority = 2
 max-sizes = {flash = 128, ram = 256}
 stacksize = 256
 start = true

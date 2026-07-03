@@ -1,0 +1,16 @@
+[package]
+name = "task-rp235x-core1-beat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../../sys/userlib" }
+
+[[bin]]
+name = "task-rp235x-core1-beat"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

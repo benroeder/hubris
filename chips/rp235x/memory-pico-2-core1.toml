@@ -14,3 +14,11 @@ size = 0x2_0000        # 128 KiB data/stacks for core 1
 read = true
 write = true
 execute = false
+
+# Shared SRAM (SRAM8/9, outside both cores' pools) for the inter-core mailbox /
+# liveness heartbeat. Granted to the core-1 beat task via extern-regions.
+[[shared]]
+address = 0x2008_0000
+size = 0x1000
+read = true
+write = true
