@@ -44,6 +44,14 @@ rx 15 bytes: hello from A
 
 Reverse direction works the same (`uart send` on B, `uart recv` on A).
 
+Both directions verified on hardware: A's `HELLO-A-to-B` arrives on B, B's
+`REPLY-B-to-A` arrives on A, byte-for-byte.
+
+Tip: prove the wiring first with a single-board loopback -- one jumper GP0->GP1
+on each board, then `status` should report `uart: rx=... LOOP-OK`. That
+isolates a bad wire / wrong hole / bare pad from an interconnect mistake before
+you cross-wire the two boards.
+
 ## Speed test
 
 `uart bench [n]` sends N bytes (default 4096) and times it. `write` blocks on the
@@ -64,13 +72,20 @@ uart rx: <bytes> bytes in 3000 ms = <B/s> B/s (<pct>% of 11520 theoretical)
 
 ### Measured
 
-UART0 at 115200 8N1, theoretical max 11520 B/s (10 bits/byte). Measured on
-hardware:
+UART0 at 115200 8N1, theoretical max 11520 B/s (10 bits/byte). Verified on
+hardware with **two boards cross-wired** (this exact link):
 
 ```
-uart bench 4096  -> 11636 B/s (101% of theoretical)
-uart bench 16384 -> 11546 B/s (100% of theoretical)
+Board A -> B messaging:  "HELLO-A-to-B" received on B   (14 bytes, exact)
+Board B -> A messaging:  "REPLY-B-to-A" received on A   (14 bytes, exact)
+
+uart bench 16384 (sender):  16384 bytes in 1419 ms = 11546 B/s (100% of max)
+uart rxbench     (receiver): 16384 bytes received -- zero loss
 ```
+
+The link runs at UART line rate with no dropped bytes (the receiver counted
+exactly the 16384 bytes sent). `rxbench` reports a lower B/s only because it
+averages over a fixed 3 s window rather than the 1.4 s burst.
 
 UART runs essentially at line rate -- the byte period (~87 us) dwarfs the
 per-byte IPC/FIFO-poll overhead, so the driver keeps the wire full. (The tiny
