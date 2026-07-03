@@ -39,12 +39,19 @@ size = 0x7fe0
 read = true
 execute = true
 
-# The whole flash, read-only, through the *uncached XIP mirror*
-# (XIP_NOCACHE_NOALLOC_BASE) -- lets the flash driver read any flash address.
-# The mirror is used instead of XIP_BASE because the driver's own code region
-# lives inside 0x10xxxxxx, and ARMv8-M PMSAv8 prohibits overlapping MPU
-# regions (overlap is UNPREDICTABLE; observed as the task faulting at start).
+# The whole flash, read-only, through the uncached *no-translate* XIP mirror
+# (XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE, 0x1c000000) -- lets the flash driver
+# read any *physical* flash address.
+#
+# The no-translate mirror (not the plain uncached 0x14000000) is essential for
+# A/B: when the boot ROM launches an image from a partition, it programs QMI
+# address translation (ATRANS) so the running image sees ITS OWN partition
+# remapped to XIP offset 0. A read through a translated window (0x10.../0x14...)
+# therefore returns the running partition, not physical flash -- so the driver
+# could not see the partition table or the other slot, and its reads did not
+# match its (physical) QMI direct-mode writes. 0x1c000000 bypasses ATRANS, so
+# reads and writes share one physical address space.
 [[xip]]
-address = 0x1400_0000
+address = 0x1c00_0000
 size = 0x40_0000
 read = true

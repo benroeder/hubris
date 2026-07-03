@@ -157,6 +157,7 @@ impl Shell {
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
             "adc" => self.cmd_adc(words.next(), words.next()),
+            "slot" => self.cmd_slot(),
             "update" => self.cmd_update(words.next(), words.next()),
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
@@ -586,6 +587,65 @@ impl Shell {
     /// a `.` so the host self-paces (the USB RX ring is finite). Safe while
     /// running because the whole image executes from SRAM; only a power cut
     /// mid-update leaves flash inconsistent (recover via BOOTSEL).
+    /// Where an `update` should write. Detects an A/B partition table at
+    /// flash 0 (PICOBIN marker + PARTITION_TABLE item) and returns the base of
+    /// the *lower-versioned* partition; otherwise 0 (single image in place).
+    fn cmd_slot(&mut self) {
+        let mut hdr = [0u8; 8];
+        let n = self.flash.read(0, &mut hdr).unwrap_or(0);
+        self.out.put(b"flash[0..8] n=");
+        self.out.put_u32(n as u32);
+        self.out.put(b" bytes=");
+        for &b in &hdr {
+            self.out.put_hex_byte(b);
+            self.out.put(b" ");
+        }
+        let mut va = [0u8; 4];
+        let mut vb = [0u8; 4];
+        let _ = self.flash.read(0x2000 + 0x184, &mut va);
+        let _ = self.flash.read(0x42000 + 0x184, &mut vb);
+        self.out.put(b"\r\nverA=");
+        self.out.put_hex32(u32::from_le_bytes(va));
+        self.out.put(b" verB=");
+        self.out.put_hex32(u32::from_le_bytes(vb));
+        self.out.put(b" target=0x");
+        let t = self.update_target_base();
+        self.out.put_hex32(t);
+        self.out.put(b"\r\n");
+    }
+
+    fn update_target_base(&mut self) -> u32 {
+        // Partition layout matches app/demo-pi-pico-2's provisioned table.
+        const PART_A: u32 = 0x0000_2000;
+        const PART_B: u32 = 0x0004_2000;
+        // IMAGE_DEF version value: block at image+0x160, version word +0x24.
+        const VER_OFF: u32 = 0x160 + 0x24;
+
+        let mut hdr = [0u8; 8];
+        if self.flash.read(0, &mut hdr).unwrap_or(0) < 8 {
+            return 0;
+        }
+        let marker = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        // hdr[4] is the first block item's type byte (0x0a = PARTITION_TABLE).
+        if marker != 0xffff_ded3 || hdr[4] != 0x0a {
+            return 0; // no A/B table: single image, write slot 0
+        }
+        let ver = |s: &mut Self, part: u32| -> u32 {
+            let mut v = [0u8; 4];
+            if s.flash.read(part + VER_OFF, &mut v).unwrap_or(0) < 4 {
+                0
+            } else {
+                u32::from_le_bytes(v)
+            }
+        };
+        // Write to the stale (lower-version) partition; ties go to A.
+        if ver(self, PART_A) <= ver(self, PART_B) {
+            PART_A
+        } else {
+            PART_B
+        }
+    }
+
     fn cmd_update(&mut self, size: Option<&str>, crc: Option<&str>) {
         const SECTOR: u32 = 4096;
         const PAGE: u32 = 256;
@@ -603,7 +663,16 @@ impl Shell {
             return;
         }
 
-        self.out.put(b"GO\r\n");
+        // Pick where to write. If a partition table is present (A/B mode), the
+        // incoming image goes into the *inactive* partition -- the one with the
+        // lower IMAGE_DEF version, since the ROM booted the higher one -- and
+        // the new (higher-versioned) image wins on the next reboot without
+        // ever overwriting the image we are running from. Without a partition
+        // table (single image) we write slot 0 in place.
+        let base = self.update_target_base();
+        self.out.put(b"target flash 0x");
+        self.out.put_hex32(base);
+        self.out.put(b"\r\nGO\r\n");
         self.out.flush();
 
         let mut page = [0u8; PAGE as usize];
@@ -628,11 +697,13 @@ impl Shell {
                 }
             }
             // Erase each sector as we first touch it.
-            if off.is_multiple_of(SECTOR) && self.flash.erase(off).is_err() {
+            if off.is_multiple_of(SECTOR)
+                && self.flash.erase(base + off).is_err()
+            {
                 self.out.put(b"\r\nerase failed\r\n");
                 return;
             }
-            if self.flash.program(off, &page[..want]).is_err() {
+            if self.flash.program(base + off, &page[..want]).is_err() {
                 self.out.put(b"\r\nprogram failed\r\n");
                 return;
             }
@@ -649,7 +720,7 @@ impl Shell {
         let mut buf = [0u8; PAGE as usize];
         while off < size {
             let want = (size - off).min(PAGE) as usize;
-            let Ok(n) = self.flash.read(off, &mut buf[..want]) else {
+            let Ok(n) = self.flash.read(base + off, &mut buf[..want]) else {
                 self.out.put(b"\r\nreadback failed\r\n");
                 return;
             };

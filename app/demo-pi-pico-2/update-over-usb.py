@@ -56,10 +56,12 @@ def main():
         if done % 16384 < 256:
             print(f"  {min(done, len(image))}/{len(image)} bytes")
 
-    result = read_until(fd, b"\r\n", 30)
-    tail = read_until(fd, b"reboot", 30) if b"OK" not in result else result
-    print(tail.decode("ascii", "replace").strip().splitlines()[-1])
-    if b"OK" not in tail:
+    # After the last page the board prints the CRC verdict, ending in "apply"
+    # (success) or "retry the update" (mismatch).
+    result = read_until(fd, b"apply\r\n", 30)
+    line = result.decode("ascii", "replace").strip().splitlines()[-1]
+    print(line)
+    if b"OK" not in result:
         sys.exit("update FAILED -- board not rebooted; safe to retry")
 
     print(f"transfer+verify took {time.time() - t0:.1f}s; rebooting...")
