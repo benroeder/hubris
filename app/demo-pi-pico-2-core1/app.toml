@@ -26,9 +26,17 @@ stacksize = 384
 start = true
 extern-regions = ["shared"]
 
+[tasks.fifo]
+name = "task-rp235x-core1-fifo"
+priority = 2
+max-sizes = {flash = 4096, ram = 1024}
+stacksize = 512
+uses = ["sio"]
+start = true
+
 [tasks.idle]
 name = "task-idle"
-priority = 2
+priority = 3
 max-sizes = {flash = 128, ram = 256}
 stacksize = 256
 start = true
