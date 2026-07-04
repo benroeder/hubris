@@ -167,7 +167,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "bench" => self.cmd_bench(words.next(), words.next()),
-            "core1" => self.cmd_core1(words.next()),
+            "core1" => self.cmd_core1(words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -403,13 +403,16 @@ impl Shell {
     /// `bench all [n]` -- run every bus back-to-back and print one comparison
     /// table. UART (TX) and SPI (loopback/controller) bench standalone; I2C
     /// needs a target on the bus, so `bench all 42` benches address 0x42 too.
-    /// AMP: send a number to core 1 over the inter-core mailbox and print its
-    /// reply. Core 1 (a bare compute payload) answers with `n*2 + 1`. This is a
-    /// task on core 0 posting work across cores via normal Hubris IPC to the
-    /// mailbox driver, which bridges to the SIO FIFO.
-    fn cmd_core1(&mut self, arg: Option<&str>) {
-        let Some(n) = arg.and_then(|a| a.parse::<u32>().ok()) else {
-            self.out.put(b"usage: core1 <n>\r\n");
+    /// AMP: `core1 <n>` sends a number to core 1 over the inter-core mailbox and
+    /// prints its reply (`n*2 + 1`); `core1 stress <count>` hammers the path.
+    /// The mailbox driver bridges core 0's IPC to the SIO FIFO, answered by a
+    /// task on core 1's own kernel.
+    fn cmd_core1(&mut self, a: Option<&str>, b: Option<&str>) {
+        if a == Some("stress") {
+            return self.core1_stress(b);
+        }
+        let Some(n) = a.and_then(|s| s.parse::<u32>().ok()) else {
+            self.out.put(b"usage: core1 <n> | core1 stress <count>\r\n");
             return;
         };
         let reply = self.mailbox.exchange(n);
@@ -425,6 +428,42 @@ impl Shell {
             b" (n*2+1, correct)\r\n" as &[u8]
         } else {
             b" (unexpected)\r\n"
+        });
+    }
+
+    /// Stress the cross-core mailbox: `count` exchanges with distinct values,
+    /// verifying every reply. Reports rate and any wrong/timed-out answers --
+    /// proof the two-kernel FIFO path is correct under sustained load.
+    fn core1_stress(&mut self, arg: Option<&str>) {
+        let count = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(2000);
+        let t0 = sys_get_timer().now;
+        let mut bad = 0u32;
+        let mut timeouts = 0u32;
+        let mut i = 0u32;
+        while i < count {
+            let r = self.mailbox.exchange(i);
+            if r == 0xffff_ffff {
+                timeouts += 1;
+            } else if r != i.wrapping_mul(2).wrapping_add(1) {
+                bad += 1;
+            }
+            i += 1;
+        }
+        let ms = (sys_get_timer().now - t0) as u32;
+        self.out.put(b"stress: ");
+        self.out.put_u32(count);
+        self.out.put(b" exchanges in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms (");
+        self.out.put_u32(count.wrapping_mul(1000).checked_div(ms).unwrap_or(0));
+        self.out.put(b" exch/s), bad=");
+        self.out.put_u32(bad);
+        self.out.put(b" timeouts=");
+        self.out.put_u32(timeouts);
+        self.out.put(if bad == 0 && timeouts == 0 {
+            b" -- PASS\r\n" as &[u8]
+        } else {
+            b" -- FAIL\r\n"
         });
     }
 

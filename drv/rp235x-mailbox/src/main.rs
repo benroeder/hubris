@@ -18,11 +18,11 @@
 
 use core::convert::Infallible;
 use idol_runtime::RequestError;
-use userlib::{RecvMessage, hl};
+use userlib::RecvMessage;
 
-/// Bounded spin for a core-1 reply, in ~1 ms sleep units. Core 1 answers in
-/// microseconds; this only bounds a wedged/absent core.
-const REPLY_TIMEOUT: u32 = 200;
+/// Bounded busy-spin for a core-1 reply. Core 1 answers in microseconds; this
+/// large bound only trips if core 1 is wedged or absent (~tens of ms).
+const REPLY_SPINS: u32 = 5_000_000;
 
 struct ServerImpl {
     sio: rp235x_pac::SIO,
@@ -42,14 +42,15 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
         // FIFO, so no SEV is needed to wake it.
         while self.sio.fifo_st().read().rdy().bit_is_clear() {}
         self.sio.fifo_wr().write(|w| unsafe { w.bits(req) });
-        // Wait for the reply, bounded.
+        // Spin-wait for the reply. Core 1's fifo task answers in microseconds,
+        // so a busy spin is far faster than yielding a 1 ms tick; the bound
+        // only guards a wedged/absent core.
         let mut spins = 0u32;
         while self.sio.fifo_st().read().vld().bit_is_clear() {
             spins += 1;
-            if spins > REPLY_TIMEOUT {
+            if spins > REPLY_SPINS {
                 return Ok(0xffff_ffff);
             }
-            hl::sleep_for(1);
         }
         Ok(self.sio.fifo_rd().read().bits())
     }

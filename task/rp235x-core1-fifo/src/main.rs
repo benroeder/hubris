@@ -10,15 +10,16 @@
 //! `core1 <n>` work in the two-kernel model -- cross-core IPC between two
 //! independent Hubris kernels.
 //!
-//! It polls the FIFO but yields with a 1 ms sleep between checks so it never
-//! starves core 1's other tasks (jefe/beat/idle). A later revision can make it
-//! interrupt-driven off SIO_IRQ_FIFO.
+//! It busy-polls the FIFO for lowest latency. It runs at priority 2, below the
+//! beat task (1); Hubris preempts a running task when a higher-priority one
+//! becomes runnable via interrupt, so core 1's SysTick still wakes `beat` on
+//! time despite this tight loop. (A later revision can make it interrupt-driven
+//! off SIO_IRQ_FIFO so `idle` can WFI too.)
 
 #![no_std]
 #![no_main]
 
 extern crate userlib;
-use userlib::hl;
 
 #[export_name = "main"]
 fn main() -> ! {
@@ -26,12 +27,11 @@ fn main() -> ! {
     // are core-local, so this reads/writes core 1's end of the inter-core FIFO.
     let sio = unsafe { &*rp235x_pac::SIO::ptr() };
     loop {
-        while sio.fifo_st().read().vld().bit_is_set() {
+        if sio.fifo_st().read().vld().bit_is_set() {
             let req = sio.fifo_rd().read().bits();
             let reply = req.wrapping_mul(2).wrapping_add(1);
             while sio.fifo_st().read().rdy().bit_is_clear() {}
             sio.fifo_wr().write(|w| unsafe { w.bits(reply) });
         }
-        hl::sleep_for(1);
     }
 }
