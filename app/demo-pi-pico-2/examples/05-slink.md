@@ -71,6 +71,33 @@ run of 1200 us marks, 0x00 the shortest 600 us marks, 0x55/0xaa the alternating
 worst case; all pass, so the sender's timing and the receiver's width
 classification are solid.
 
+## Stress test (`slink flood` / `slink soak`)
+`slink flood <n>` sends `n` self-checking frames `[seq, seq^0xa5, seq+0x33]`
+back-to-back (seq wraps 0..255, so `n>=256` exercises **every byte value**);
+`slink soak <n> <ms>` receives and validates each independently (so a dropped
+frame never desyncs the rest) and reports errors plus the measured mark-width
+extremes.
+
+```
+# Board B:                     # Board A:
+hubris> slink soak 1000 90000  hubris> slink flood 1000
+```
+
+Verified on hardware:
+
+| Run | Frames | Errors | ones width (nom 1200) | zeros width (nom 600) |
+|---|---|---|---|---|
+| idle          | 500  | **0** | 1185-1195 us | 590-600 us |
+| under IRQ load | 1000 | **0** | 1165-1195 us | 570-600 us |
+
+Zero bit errors over 1500 frames total, both directions and every byte value.
+The second run adds heavy USB-RX interrupt load to the listener *during* its
+bit-timing: the measured width spread widens from ~10 us to ~30 us -- visible
+SysTick/USB-IRQ jitter -- but stays far from the 900/1800 us decision thresholds,
+so the protocol's +-20% tolerance absorbs it with no errors. That margin is the
+headline result: the bit-bang timing is solid enough to survive real interrupt
+load.
+
 ## Notes
 - **Timing** is `cortex_m::asm::delay` (150 cycles/us @ 150 MHz) for the sender;
   the receiver measures each LOW mark by counting fixed delay steps. The marks

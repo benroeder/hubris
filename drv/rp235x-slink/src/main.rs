@@ -54,6 +54,11 @@ fn dly_us(us: u32) {
 
 struct ServerImpl {
     sio: rp235x_pac::SIO,
+    /// Measured LOW-mark width extremes (us) from the last `soak`, per symbol.
+    min1: u32,
+    max1: u32,
+    min0: u32,
+    max0: u32,
 }
 
 impl ServerImpl {
@@ -101,6 +106,97 @@ impl ServerImpl {
         }
         us
     }
+
+    /// Record a measured mark width `w` for a one (`is_one`) or zero, tracking
+    /// the min/max seen this soak.
+    fn note_width(&mut self, w: u32, is_one: bool) {
+        let (min, max) = if is_one {
+            (&mut self.min1, &mut self.max1)
+        } else {
+            (&mut self.min0, &mut self.max0)
+        };
+        if *min == 0 || w < *min {
+            *min = w;
+        }
+        if w > *max {
+            *max = w;
+        }
+    }
+
+    /// Receive one frame, waiting up to `timeout_ms` for its SYNC. Returns the
+    /// packed frame (count<<24 | b0<<16 | b1<<8 | b2), or 0 on timeout/noise.
+    /// Updates the per-symbol width stats as it classifies each mark.
+    fn recv_frame(&mut self, timeout_ms: u32) -> u32 {
+        // Wait (bounded) for the line to fall -- the start of a mark.
+        let mut waited_us = 0u32;
+        while self.is_high() {
+            dly_us(100);
+            waited_us += 100;
+            if waited_us >= timeout_ms.saturating_mul(1000) {
+                return 0;
+            }
+        }
+        // The first mark must be SYNC, else it's noise.
+        if self.measure_low() < T_SYNC {
+            return 0;
+        }
+        // Collect bits until the line stays idle (end of frame).
+        let mut bytes = [0u8; 3];
+        let mut nbits = 0u32;
+        let mut nbytes = 0usize;
+        loop {
+            // HIGH delimiter/idle; a long gap ends the frame.
+            let mut gap = 0u32;
+            while self.is_high() {
+                dly_us(20);
+                gap += 20;
+                if gap > FRAME_GAP_US {
+                    return pack(&bytes, nbytes);
+                }
+            }
+            // Next mark.
+            let w = self.measure_low();
+            if w >= T_SYNC {
+                // Unexpected re-sync: restart the frame.
+                bytes = [0; 3];
+                nbits = 0;
+                nbytes = 0;
+                continue;
+            }
+            let bit = if w >= T_ONE {
+                self.note_width(w, true);
+                1
+            } else if w >= T_ZERO {
+                self.note_width(w, false);
+                0
+            } else {
+                continue; // glitch, ignore
+            };
+            if nbytes < 3 {
+                bytes[nbytes] = (bytes[nbytes] << 1) | bit;
+            }
+            nbits += 1;
+            if nbits == 8 {
+                nbits = 0;
+                nbytes += 1;
+                if nbytes == 3 {
+                    return pack(&bytes, 3);
+                }
+            }
+        }
+    }
+}
+
+/// Self-checking stress frame for sequence `seq`: [seq, seq^0xa5, seq+0x33].
+/// The listener validates it independently, so no index sync is needed and a
+/// dropped frame does not desync the rest.
+fn stress_frame(seq: u8) -> [u8; 3] {
+    [seq, seq ^ 0xa5, seq.wrapping_add(0x33)]
+}
+
+fn frame_valid(b0: u8, b1: u8, b2: u8) -> bool {
+    let f = stress_frame(b0);
+    b1 == f[1] && b2 == f[2]
 }
 
 impl idl::InOrderRp235xSlinkImpl for ServerImpl {
@@ -130,61 +226,84 @@ impl idl::InOrderRp235xSlinkImpl for ServerImpl {
         _: &RecvMessage,
         timeout_ms: u32,
     ) -> Result<u32, RequestError<Infallible>> {
-        // Wait (bounded) for the line to fall -- the start of a mark.
-        let mut waited_us = 0u32;
-        while self.is_high() {
-            dly_us(100);
-            waited_us += 100;
-            if waited_us >= timeout_ms.saturating_mul(1000) {
-                return Ok(0);
+        Ok(self.recv_frame(timeout_ms))
+    }
+
+    fn flood(
+        &mut self,
+        _: &RecvMessage,
+        n: u32,
+    ) -> Result<(), RequestError<Infallible>> {
+        // Send n self-checking frames back-to-back. `seq` wraps 0..255, so
+        // n >= 256 exercises every byte value. The ~8 ms inter-frame idle lets
+        // the listener finalize each frame (>FRAME_GAP) and re-arm for the next.
+        let mut seq = 0u8;
+        for _ in 0..n {
+            let f = stress_frame(seq);
+            self.release();
+            dly_us(LINE_READY_US);
+            self.mark(SYNC_US);
+            for &b in &f {
+                self.send_byte(b);
             }
+            self.release();
+            dly_us(5000);
+            seq = seq.wrapping_add(1);
         }
-        // The first mark must be SYNC, else it's noise.
-        if self.measure_low() < T_SYNC {
-            return Ok(0);
-        }
-        // Collect bits until the line stays idle (end of frame).
-        let mut bytes = [0u8; 3];
-        let mut nbits = 0u32;
-        let mut nbytes = 0usize;
-        loop {
-            // HIGH delimiter/idle; a long gap ends the frame.
-            let mut gap = 0u32;
-            while self.is_high() {
-                dly_us(20);
-                gap += 20;
-                if gap > FRAME_GAP_US {
-                    return Ok(pack(&bytes, nbytes));
-                }
+        Ok(())
+    }
+
+    fn soak(
+        &mut self,
+        _: &RecvMessage,
+        n: u32,
+        timeout_ms: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // Reset width stats, then receive up to n frames, validating each
+        // self-checking frame. Returns (bad << 16) | good.
+        self.min1 = 0;
+        self.max1 = 0;
+        self.min0 = 0;
+        self.max0 = 0;
+        let mut good = 0u32;
+        let mut bad = 0u32;
+        let mut received = 0u32;
+        // Keep listening for the whole `timeout_ms` budget (a single quiet
+        // gap is not the end -- the sender may not have started, or is between
+        // frames). Each recv_frame waits up to `per` ms for the next SYNC.
+        let start = userlib::sys_get_timer().now;
+        let deadline = start + timeout_ms as u64;
+        while received < n && userlib::sys_get_timer().now < deadline {
+            let r = self.recv_frame(300);
+            if r == 0 {
+                continue; // no frame in this slice; keep waiting
             }
-            // Next mark.
-            let w = self.measure_low();
-            if w >= T_SYNC {
-                // Unexpected re-sync: restart the frame.
-                bytes = [0; 3];
-                nbits = 0;
-                nbytes = 0;
-                continue;
-            }
-            let bit = if w >= T_ONE {
-                1
-            } else if w >= T_ZERO {
-                0
+            received += 1;
+            let cnt = (r >> 24) & 0xff;
+            let b0 = (r >> 16) as u8;
+            let b1 = (r >> 8) as u8;
+            let b2 = r as u8;
+            if cnt == 3 && frame_valid(b0, b1, b2) {
+                good += 1;
             } else {
-                continue; // glitch, ignore
-            };
-            if nbytes < 3 {
-                bytes[nbytes] = (bytes[nbytes] << 1) | bit;
-            }
-            nbits += 1;
-            if nbits == 8 {
-                nbits = 0;
-                nbytes += 1;
-                if nbytes == 3 {
-                    return Ok(pack(&bytes, 3));
-                }
+                bad += 1;
             }
         }
+        Ok((bad << 16) | (good & 0xffff))
+    }
+
+    fn margin_ones(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Infallible>> {
+        Ok((self.min1 << 16) | (self.max1 & 0xffff))
+    }
+
+    fn margin_zeros(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Infallible>> {
+        Ok((self.min0 << 16) | (self.max0 & 0xffff))
     }
 }
 
@@ -225,7 +344,13 @@ fn main() -> ! {
     p.SIO.gpio_out_clr().write(|w| unsafe { w.bits(1 << PIN) });
     p.SIO.gpio_oe_clr().write(|w| unsafe { w.bits(1 << PIN) });
 
-    let mut server = ServerImpl { sio: p.SIO };
+    let mut server = ServerImpl {
+        sio: p.SIO,
+        min1: 0,
+        max1: 0,
+        min0: 0,
+        max0: 0,
+    };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {
         idol_runtime::dispatch(&mut incoming, &mut server);

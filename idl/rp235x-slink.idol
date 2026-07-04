@@ -21,5 +21,29 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "flood": (
+            description: "Stress sender: transmit `n` self-checking 3-byte frames [seq, seq^0xa5, seq+0x33] back-to-back (seq wraps 0..255, so n>=256 covers every byte value).",
+            args: { "n": "u32" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
+        "soak": (
+            description: "Stress listener: receive up to `n` frames within `timeout_ms`, validating each self-checking frame. Returns (bad<<16)|good. Also records per-symbol mark-width min/max (see margin_ones/zeros).",
+            args: { "n": "u32", "timeout_ms": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+        "margin_ones": (
+            description: "Measured LOW-mark width (us) for logical ones during the last soak: (min<<16)|max.",
+            args: {},
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+        "margin_zeros": (
+            description: "Measured LOW-mark width (us) for logical zeros during the last soak: (min<<16)|max.",
+            args: {},
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
     },
 )

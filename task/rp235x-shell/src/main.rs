@@ -1290,9 +1290,53 @@ impl Shell {
                 }
                 self.out.put(b"\r\n");
             }
-            _ => self
-                .out
-                .put(b"usage: slink send <hex..> | slink listen [ms]\r\n"),
+            Some("flood") => {
+                let n = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(256);
+                self.out.put(b"flooding ");
+                self.out.put_u32(n);
+                self.out.put(b" frames...\r\n");
+                self.out.flush();
+                self.slink.flood(n);
+                self.out.put(b"flood done (");
+                self.out.put_u32(n);
+                self.out.put(b" frames sent)\r\n");
+            }
+            Some("soak") => {
+                let n = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(256);
+                let ms =
+                    b.and_then(|s| s.parse::<u32>().ok()).unwrap_or(60000);
+                self.out.put(b"soaking up to ");
+                self.out.put_u32(n);
+                self.out.put(b" frames...\r\n");
+                self.out.flush();
+                let r = self.slink.soak(n, ms);
+                let good = r & 0xffff;
+                let bad = r >> 16;
+                let m1 = self.slink.margin_ones();
+                let m0 = self.slink.margin_zeros();
+                self.out.put(b"soak: good=");
+                self.out.put_u32(good);
+                self.out.put(b" bad=");
+                self.out.put_u32(bad);
+                self.out.put(b" (");
+                self.out.put(if bad == 0 && good > 0 {
+                    b"PASS" as &[u8]
+                } else {
+                    b"CHECK"
+                });
+                self.out.put(b")\r\n  mark width us: ones ");
+                self.out.put_u32(m1 >> 16);
+                self.out.put(b"-");
+                self.out.put_u32(m1 & 0xffff);
+                self.out.put(b" (nom 1200), zeros ");
+                self.out.put_u32(m0 >> 16);
+                self.out.put(b"-");
+                self.out.put_u32(m0 & 0xffff);
+                self.out.put(b" (nom 600)\r\n");
+            }
+            _ => self.out.put(
+                b"usage: slink send <hex..> | listen [ms] | flood <n> | soak <n> [ms]\r\n",
+            ),
         }
     }
 
