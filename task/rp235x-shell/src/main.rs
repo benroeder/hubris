@@ -181,6 +181,16 @@ impl Shell {
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
+            "crash" => {
+                // Fault this task on purpose (read an unmapped address) to test
+                // fault isolation: jefe restarts the shell, and core 1's kernel
+                // -- a separate AMP instance -- is completely unaffected.
+                self.out.put(b"crashing core-0 shell (jefe restarts it)...\r\n");
+                self.out.flush();
+                unsafe {
+                    core::ptr::read_volatile(0xdead_0000 as *const u32);
+                }
+            }
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
