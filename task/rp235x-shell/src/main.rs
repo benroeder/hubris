@@ -176,6 +176,17 @@ impl Shell {
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
+            "crash" => {
+                // Fault this task on purpose (read an unmapped address) to test
+                // that jefe restarts the shell and it re-attaches to the USB
+                // console.
+                self.out.put(b"crashing shell (jefe should restart me)...\r\n");
+                self.out.flush();
+                // Precisely-attributed task fault (undefined instruction).
+                unsafe {
+                    core::arch::asm!("udf #0");
+                }
+            }
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
