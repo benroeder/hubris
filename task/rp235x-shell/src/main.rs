@@ -21,6 +21,7 @@ use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
 use drv_rp235x_pwm_api::Rp235xPwm;
+use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -34,6 +35,7 @@ task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
+task_slot!(SLINK, slink_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -72,6 +74,8 @@ const HELP: &[u8] = b"commands:\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
   push <size> <crc>     stream own flash image to a peer over UART\r\n\
+  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
+  slink listen [ms]     wait for an S-Link frame; print the bytes\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -83,6 +87,7 @@ struct Shell {
     flash: Rp235xFlash,
     adc: Rp235xAdc,
     pwm: Rp235xPwm,
+    slink: Rp235xSlink,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -176,6 +181,12 @@ impl Shell {
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
+            "slink" => self.cmd_slink(
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+            ),
             "reboot" => self.cmd_reboot(words.next()),
             _ => {
                 self.out.put(b"unknown command: ");
@@ -1220,6 +1231,71 @@ impl Shell {
         }
     }
 
+    /// Sony S-Link / Control-A1 on GP4: `slink send <hex> <hex> [hex]` bit-bangs
+    /// a 2-3 byte frame; `slink listen [ms]` waits for one and prints its bytes.
+    fn cmd_slink(
+        &mut self,
+        sub: Option<&str>,
+        a: Option<&str>,
+        b: Option<&str>,
+        c: Option<&str>,
+    ) {
+        match sub {
+            Some("send") => {
+                let p = |s: Option<&str>| {
+                    s.and_then(|x| u8::from_str_radix(x, 16).ok())
+                };
+                let (Some(b0), Some(b1)) = (p(a), p(b)) else {
+                    self.out.put(b"usage: slink send <hex> <hex> [hex]\r\n");
+                    return;
+                };
+                let (b2, n) = match p(c) {
+                    Some(b2) => (b2, 3u8),
+                    None => (0, 2),
+                };
+                self.slink.send(b0, b1, b2, n);
+                self.out.put(b"sent ");
+                self.out.put_u32(n as u32);
+                self.out.put(b" bytes: ");
+                self.out.put_hex_byte(b0);
+                self.out.put(b" ");
+                self.out.put_hex_byte(b1);
+                if n == 3 {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(b2);
+                }
+                self.out.put(b"\r\n");
+            }
+            Some("listen") => {
+                let ms = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(5000);
+                self.out.put(b"listening ");
+                self.out.put_u32(ms);
+                self.out.put(b" ms...\r\n");
+                self.out.flush();
+                let r = self.slink.listen(ms);
+                let n = (r >> 24) & 0xff;
+                if n == 0 {
+                    self.out.put(b"no frame (timeout)\r\n");
+                    return;
+                }
+                self.out.put(b"rx ");
+                self.out.put_u32(n);
+                self.out.put(b" bytes: ");
+                self.out.put_hex_byte((r >> 16) as u8);
+                self.out.put(b" ");
+                self.out.put_hex_byte((r >> 8) as u8);
+                if n == 3 {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(r as u8);
+                }
+                self.out.put(b"\r\n");
+            }
+            _ => self
+                .out
+                .put(b"usage: slink send <hex..> | slink listen [ms]\r\n"),
+        }
+    }
+
     fn cmd_reboot(&mut self, mode: Option<&str>) {
         let bootsel = match mode {
             Some("bootsel") => 1,
@@ -1332,6 +1408,7 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        slink: Rp235xSlink::from(SLINK.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],

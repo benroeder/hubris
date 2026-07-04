@@ -1,0 +1,25 @@
+// Sony S-Link / Control-A1 driver API (branch slink).
+//
+// A single bidirectional open-collector control line (idle HIGH, active-LOW
+// pulses whose width encodes the symbol: SYNC 2400us, one 1200us, zero 600us,
+// each followed by a ~600us HIGH delimiter). Bytes are MSB-first; a frame is
+// 2-3 bytes (device id + command(s)). Bit-banged on GP4, reusing the existing
+// board-to-board straight wire (I2C SDA position) + ground.
+
+Interface(
+    name: "Rp235xSlink",
+    ops: {
+        "send": (
+            description: "Transmit an S-Link frame of `n` (2 or 3) bytes b0,b1,b2, MSB-first.",
+            args: { "b0": "u8", "b1": "u8", "b2": "u8", "n": "u8" },
+            reply: Simple("()"),
+            idempotent: true,
+        ),
+        "listen": (
+            description: "Wait up to `timeout_ms` for one frame. Returns packed (count<<24)|(b0<<16)|(b1<<8)|b2, or 0 on timeout.",
+            args: { "timeout_ms": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+    },
+)
