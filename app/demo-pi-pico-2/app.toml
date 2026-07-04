@@ -13,9 +13,9 @@ stacksize = 640
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 4096, ram = 1024}
+max-sizes = {flash = 4096, ram = 2048}
 start = true
-stacksize = 512
+stacksize = 1024
 notifications = ["fault", "timer"]
 
 [tasks.usb]
