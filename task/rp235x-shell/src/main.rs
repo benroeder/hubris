@@ -182,13 +182,13 @@ impl Shell {
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
             "crash" => {
-                // Fault this task on purpose (read an unmapped address) to test
-                // fault isolation: jefe restarts the shell, and core 1's kernel
-                // -- a separate AMP instance -- is completely unaffected.
-                self.out.put(b"crashing core-0 shell (jefe restarts it)...\r\n");
+                // Fault this task on purpose to test that jefe restarts the
+                // shell (and, on AMP, that core 1's kernel is unaffected).
+                self.out.put(b"crashing shell (jefe should restart me)...\r\n");
                 self.out.flush();
+                // Precisely-attributed task fault (undefined instruction).
                 unsafe {
-                    core::ptr::read_volatile(0xdead_0000 as *const u32);
+                    core::arch::asm!("udf #0");
                 }
             }
             "reboot" => self.cmd_reboot(words.next()),

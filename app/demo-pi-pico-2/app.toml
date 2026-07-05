@@ -13,9 +13,9 @@ stacksize = 640
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 4096, ram = 1024}
+max-sizes = {flash = 4096, ram = 2048}
 start = true
-stacksize = 512
+stacksize = 1024
 notifications = ["fault", "timer"]
 
 [tasks.usb]
@@ -117,6 +117,15 @@ max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "mailbox_driver"]
+
+[tasks.hiffy]
+name = "task-hiffy"
+priority = 4
+max-sizes = {flash = 32768, ram = 32768}
+stacksize = 2048
+start = true
+features = ["micro"]
+notifications = ["timer"]
 
 [tasks.idle]
 name = "task-idle"
