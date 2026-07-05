@@ -20,5 +20,11 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "bulk_bench": (
+            description: "One-way bulk transfer speed test: for `iters` rounds, write `len` (<=4096) bytes into the shared SRAM buffer, ring the FIFO doorbell, and wait for core 1 to read+checksum them. Returns elapsed milliseconds.",
+            args: { "len": "u32", "iters": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
     },
 )

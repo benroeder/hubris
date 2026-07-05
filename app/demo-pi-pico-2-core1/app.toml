@@ -32,6 +32,7 @@ priority = 2
 max-sizes = {flash = 4096, ram = 1024}
 stacksize = 512
 uses = ["sio"]
+extern-regions = ["shared_buf"]
 start = true
 
 [tasks.idle]

@@ -55,3 +55,12 @@ execute = true
 address = 0x1c00_0000
 size = 0x40_0000
 read = true
+
+# Shared SRAM9 buffer (0x20081000, 4 KiB) for the one-way bulk cross-core
+# transfer test: core 0 writes it, doorbells core 1 over the FIFO, core 1 reads
+# it. Granted to the mailbox driver (core 0) and the core-1 fifo task.
+[[shared_buf]]
+address = 0x2008_1000
+size = 0x1000
+read = true
+write = true

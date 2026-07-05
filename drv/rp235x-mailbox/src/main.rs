@@ -20,6 +20,11 @@ use core::convert::Infallible;
 use idol_runtime::RequestError;
 use userlib::RecvMessage;
 
+extern "C" {
+    /// Shared SRAM bulk-transfer buffer (granted via extern-regions).
+    static mut __REGION_SHARED_BUF_BASE: [u8; 0];
+}
+
 /// Bounded busy-spin for a core-1 reply. Core 1 answers in microseconds; this
 /// large bound only trips if core 1 is wedged or absent (~tens of ms).
 const REPLY_SPINS: u32 = 5_000_000;
@@ -79,6 +84,50 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
             }
             let _ = self.sio.fifo_rd().read().bits();
             i += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
+
+    fn bulk_bench(
+        &mut self,
+        _: &RecvMessage,
+        len: u32,
+        iters: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // One-way bulk transfer: each round, fill `len` bytes of the shared
+        // buffer (core 0 produces), doorbell core 1 (bit31 | len), and wait for
+        // its checksum ack (core 1 consumed). Throughput = iters*len / elapsed.
+        let len = len.min(4096);
+        let words = (len / 4) as usize;
+        let buf = &raw mut __REGION_SHARED_BUF_BASE as *mut u32;
+        let start = userlib::sys_get_timer().now;
+        let mut it = 0u32;
+        while it < iters {
+            // Write the buffer (varying so it isn't optimized to a constant).
+            let mut i = 0usize;
+            while i < words {
+                unsafe {
+                    buf.add(i).write_volatile(it.wrapping_add(i as u32));
+                }
+                i += 1;
+            }
+            // Doorbell + wait for the consume ack.
+            while self.sio.fifo_st().read().vld().bit_is_set() {
+                let _ = self.sio.fifo_rd().read().bits();
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio
+                .fifo_wr()
+                .write(|w| unsafe { w.bits(0x8000_0000 | len) });
+            let mut spins = 0u32;
+            while self.sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = self.sio.fifo_rd().read().bits();
+            it += 1;
         }
         Ok((userlib::sys_get_timer().now - start) as u32)
     }

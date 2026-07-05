@@ -45,7 +45,7 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   bench all [addr]      throughput of every bus in one table\r\n\
-  core1 <n>|stress <c>|speed <c>   AMP cross-core mailbox (exchange/stress/speed)\r\n\
+  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -167,7 +167,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "bench" => self.cmd_bench(words.next(), words.next()),
-            "core1" => self.cmd_core1(words.next(), words.next()),
+            "core1" => self.cmd_core1(words.next(), words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -418,12 +418,15 @@ impl Shell {
     /// prints its reply (`n*2 + 1`); `core1 stress <count>` hammers the path.
     /// The mailbox driver bridges core 0's IPC to the SIO FIFO, answered by a
     /// task on core 1's own kernel.
-    fn cmd_core1(&mut self, a: Option<&str>, b: Option<&str>) {
+    fn cmd_core1(&mut self, a: Option<&str>, b: Option<&str>, c: Option<&str>) {
         if a == Some("stress") {
             return self.core1_stress(b);
         }
         if a == Some("speed") {
             return self.core1_speed(b);
+        }
+        if a == Some("bulk") {
+            return self.core1_bulk(b, c);
         }
         let Some(n) = a.and_then(|s| s.parse::<u32>().ok()) else {
             self.out.put(b"usage: core1 <n> | core1 stress <count>\r\n");
@@ -503,6 +506,29 @@ impl Shell {
         self.out.put(b" exch/s, ");
         self.out.put_u64(kb_per_s);
         self.out.put(b" KB/s (8 B/exchange on the FIFO)\r\n");
+    }
+
+    /// One-way bulk transfer ceiling: `core1 bulk <len> <iters>` moves `len`
+    /// bytes (<=4096) through shared SRAM `iters` times -- core 0 writes the
+    /// buffer, doorbells core 1, core 1 reads+checksums it. Reports MB/s of
+    /// core->core payload.
+    fn core1_bulk(&mut self, a: Option<&str>, b: Option<&str>) {
+        let len = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(4096);
+        let iters = b.and_then(|s| s.parse::<u32>().ok()).unwrap_or(50_000);
+        let ms = self.mailbox.bulk_bench(len, iters);
+        let bytes = (len as u64).wrapping_mul(iters as u64);
+        let kb_per_s =
+            bytes.wrapping_mul(1000).checked_div(ms as u64).unwrap_or(0) / 1024;
+        self.out.put(b"core1 bulk: ");
+        self.out.put_u32(iters);
+        self.out.put(b" x ");
+        self.out.put_u32(len);
+        self.out.put(b" B in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(kb_per_s);
+        self.out
+            .put(b" KB/s one-way (core0->shared SRAM->core1)\r\n");
     }
 
     fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {
