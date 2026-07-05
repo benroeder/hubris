@@ -110,6 +110,15 @@ stacksize = 2048
 start = true
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver"]
 
+[tasks.hiffy]
+name = "task-hiffy"
+priority = 4
+max-sizes = {flash = 32768, ram = 32768}
+stacksize = 2048
+start = true
+features = ["micro"]
+notifications = ["timer"]
+
 [tasks.idle]
 name = "task-idle"
 priority = 5
