@@ -152,10 +152,16 @@ cfg_if::cfg_if! {
 // │ ┌──────────┐                                                                    │
 // └─┤ Humility ├────────────────────────────────────────────────────────────────────┘
 //   └──────────┘
+// `#[used]` so the linker/LTO never elides these even when a particular op set
+// (e.g. the `testsuite` build) does not read a given buffer -- Humility requires
+// all of them to be present in the image to drive hiffy.
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_TEXT: [u8; HIFFY_TEXT_SIZE] = [0; HIFFY_TEXT_SIZE];
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_DATA: [u8; HIFFY_DATA_SIZE] = [0; HIFFY_DATA_SIZE];
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_RSTACK: [u8; HIFFY_RSTACK_SIZE] = [0; HIFFY_RSTACK_SIZE];
 
