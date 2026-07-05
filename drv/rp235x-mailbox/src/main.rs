@@ -54,6 +54,34 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
         }
         Ok(self.sio.fifo_rd().read().bits())
     }
+
+    fn bench(
+        &mut self,
+        _: &RecvMessage,
+        n: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // Time `n` round-trip exchanges in a tight loop -- the cross-core
+        // transfer rate of the SIO-FIFO mailbox, free of per-call IPC overhead.
+        let start = userlib::sys_get_timer().now;
+        let mut i = 0u32;
+        while i < n {
+            while self.sio.fifo_st().read().vld().bit_is_set() {
+                let _ = self.sio.fifo_rd().read().bits();
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio.fifo_wr().write(|w| unsafe { w.bits(i) });
+            let mut spins = 0u32;
+            while self.sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = self.sio.fifo_rd().read().bits();
+            i += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {

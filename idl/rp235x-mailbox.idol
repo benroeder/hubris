@@ -14,5 +14,11 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "bench": (
+            description: "Cross-core transfer speed test: do `n` round-trip exchanges over the SIO FIFO in a tight loop (one IPC), returning the elapsed milliseconds. Measures the raw FIFO+core-1 rate without per-call IPC overhead.",
+            args: { "n": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
     },
 )

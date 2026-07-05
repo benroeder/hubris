@@ -45,7 +45,7 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   bench all [addr]      throughput of every bus in one table\r\n\
-  core1 <n>             send n to core 1 (AMP); prints its reply (n*2+1)\r\n\
+  core1 <n>|stress <c>|speed <c>   AMP cross-core mailbox (exchange/stress/speed)\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -184,7 +184,8 @@ impl Shell {
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell (and, on AMP, that core 1's kernel is unaffected).
-                self.out.put(b"crashing shell (jefe should restart me)...\r\n");
+                self.out
+                    .put(b"crashing shell (jefe should restart me)...\r\n");
                 self.out.flush();
                 // Precisely-attributed task fault (undefined instruction).
                 unsafe {
@@ -421,6 +422,9 @@ impl Shell {
         if a == Some("stress") {
             return self.core1_stress(b);
         }
+        if a == Some("speed") {
+            return self.core1_speed(b);
+        }
         let Some(n) = a.and_then(|s| s.parse::<u32>().ok()) else {
             self.out.put(b"usage: core1 <n> | core1 stress <count>\r\n");
             return;
@@ -465,7 +469,8 @@ impl Shell {
         self.out.put(b" exchanges in ");
         self.out.put_u32(ms);
         self.out.put(b" ms (");
-        self.out.put_u32(count.wrapping_mul(1000).checked_div(ms).unwrap_or(0));
+        self.out
+            .put_u32(count.wrapping_mul(1000).checked_div(ms).unwrap_or(0));
         self.out.put(b" exch/s), bad=");
         self.out.put_u32(bad);
         self.out.put(b" timeouts=");
@@ -475,6 +480,29 @@ impl Shell {
         } else {
             b" -- FAIL\r\n"
         });
+    }
+
+    /// Cross-core transfer speed: `n` round-trip exchanges timed inside the
+    /// mailbox driver (one IPC), so the number reflects the raw SIO-FIFO +
+    /// core-1 rate, not the per-command shell IPC (which caps `core1 stress`).
+    /// Each exchange moves a 32-bit word each way = 8 bytes over the FIFO.
+    fn core1_speed(&mut self, arg: Option<&str>) {
+        let n = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1_000_000);
+        let ms = self.mailbox.bench(n);
+        let exch_per_s = (n as u64)
+            .wrapping_mul(1000)
+            .checked_div(ms as u64)
+            .unwrap_or(0);
+        let kb_per_s = exch_per_s.wrapping_mul(8) / 1024;
+        self.out.put(b"core1 speed: ");
+        self.out.put_u32(n);
+        self.out.put(b" round-trips in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(exch_per_s);
+        self.out.put(b" exch/s, ");
+        self.out.put_u64(kb_per_s);
+        self.out.put(b" KB/s (8 B/exchange on the FIFO)\r\n");
     }
 
     fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {
