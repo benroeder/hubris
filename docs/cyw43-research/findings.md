@@ -243,3 +243,19 @@ needs physical investigation -- confirm the board is a Pico 2 W, measure GP25,
 and check the probe/rig for anything tied to GP25/24/29 (though those are
 internal to the CYW43 on the W and not on the header). The PIO gSPI PHY itself
 is correct and ready; it is blocked on CS reaching the chip.
+
+## 15. CS (GP25) hard-held HIGH -- confirmed hardware, not drive strength
+Bumped GP25 drive to 12 mA (pad 0x76, matching embassy). CS STILL reads high
+while SIO drives it low (SIO OUT bit25=0). A 12 mA push-pull that cannot pull a
+pin below Vih means a HARD external hold-high (equiv < ~250 ohm, or a driver /
+short), not a normal pull-up. Pin map re-verified against the Pico 2 W datasheet:
+GP23=WL_ON, GP24=DIO, GP25=CS, GP29=CLK -- all correct.
+
+=> Physical investigation needed on the target board's GP25:
+- Confirm the board really is a Pico 2 W (not a plain Pico 2).
+- Meter GP25 vs 3V3 / GND for a short or hard pull while the board runs.
+- Check the probe rig / any hat/jumper touching GP25 (GP23-25/29 are internal to
+  the CYW43 on the W and NOT on the 40-pin header, so external wiring should be
+  impossible -- which points at the board itself or the specific unit).
+The PIO gSPI PHY + init are correct and will read FEEDBEAD once CS reaches the
+chip low. Instrumentation left in cyw43_pio_detect (CYW43_PIO[0..3]).

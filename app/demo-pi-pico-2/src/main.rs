@@ -175,7 +175,8 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
             w.od().clear_bit();
             w.iso().clear_bit();
-            w.ie().set_bit()
+            w.ie().set_bit();
+            unsafe { w.drive().bits(3) } // 12 mA (embassy uses 12 mA)
         });
         p.IO_BANK0
             .gpio(pin as usize)
