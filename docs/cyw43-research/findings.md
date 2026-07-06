@@ -598,3 +598,19 @@ confirm the fw version didn't return (id-match issue). NEXT: confirm fw version 
 diff MicroPython's firmware; or pivot to scan/join (same working ioctl path, no
 gpioout needed) to prove Wi-Fi. Everything up to and including arbitrary ioctls
 works; only gpioout is blocked.
+
+## 33. *** LED WORKS -- full Wi-Fi ioctl path proven end-to-end ***
+gpioout finally ACCEPTED (CDC status 0) and the onboard WL_GPIO0 LED BLINKS,
+driven from Hubris on the RP2350.
+ROOT CAUSE of the persistent -23: a byte-order typo in the "gpio" word. LE
+encoding of "gpio" = 'g'|'p'<<8|'i'<<16|'o'<<24 = 0x6f697067, but I had
+0x6f696770 = bytes 'p','g','i','o' = "pgio" -> the iovar was "pgioout", unknown
+-> BCME_UNSUPPORTED (-23). ("out\0"=0x0074756f and "clmload" encoded symmetrically
+by luck, so only gpioout failed while CLM/country/up all succeeded, which is what
+made it so baffling.) Verified along the way: firmware 7.95.61 identical to
+MicroPython's, NVRAM identical (muxenab=0x100), CLM loads (clmload_status=0),
+frame layout byte-for-byte vs cyw43_ll.c. The full working recipe: PIO gSPI ->
+firmware upload -> boot -> SDPCM/CDC ioctls with proper flow control (tx_seq +
+bus_data_credit, response demux by CDC id) -> CLM -> bus:txglom -> apsta ->
+gpioout. WIFI BRING-UP COMPLETE (LED milestone). NEXT: scan/join reuse this exact
+ioctl path; then move the whole stack into the drv/rp235x-cyw43 task.

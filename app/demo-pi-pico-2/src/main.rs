@@ -789,27 +789,111 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         }
         let clm = do_ioctl(0x107, 1, &clm_pl, 8 + 12 + 984, &mut tx_seq, &mut credit, &mut fr);
         CYW43_PIO[11].store(clm, SeqCst);
-        // 1b. bus:txglom=0 and apsta=1 (create the STA interface) -- embassy sets
-        //     these before country; gpioout needs the interface to exist.
+        // Verify the CLM actually loaded: GET "clmload_status" (embassy asserts 0).
+        {
+            let mut gg = 0u32;
+            while credit == tx_seq && gg < 8000 {
+                gg += 1;
+                let (got, chan, _s, bdc, _i) = rx(&mut fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(credit as u32) & 0xFF) <= 20 {
+                        credit = bdc as u8;
+                    }
+                } else {
+                    cortex_m::asm::delay(10_000);
+                }
+            }
+            let mut b = [0u32; 40];
+            let pb: usize = 64;
+            let tot = 12 + 16 + pb;
+            b[0] = 0xE000_0000 | tot as u32;
+            b[1] = (tot as u32 & 0xFFFF) | (((!(tot as u32)) & 0xFFFF) << 16);
+            b[2] = 0x0C00_0000 | tx_seq as u32;
+            b[4] = 0x0000_0106; // WLC_GET_VAR
+            b[5] = pb as u32;
+            b[6] = (9 << 16); // GET (kind 0), id=9
+            b[8] = 0x6c6d_6c63; // "clml"
+            b[9] = 0x5f64_616f; // "oad_"
+            b[10] = 0x7461_7473; // "stat"
+            b[11] = 0x0000_7375; // "us\0"
+            xfer(&b[..8 + pb.div_ceil(4)], &mut [0u32; 1]);
+            tx_seq = tx_seq.wrapping_add(1);
+            for _ in 0..3000u32 {
+                let (got, chan, _s, bdc, rid) = rx(&mut fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(credit as u32) & 0xFF) <= 20 {
+                        credit = bdc as u8;
+                    }
+                    if chan == 0 && rid == 9 {
+                        let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+                        CYW43_PIO[13].store(fr[hl + 3], SeqCst); // GET CDC status
+                        CYW43_PIO[14].store(fr[hl + 4], SeqCst); // clmload_status (want 0)
+                        break;
+                    }
+                } else {
+                    cortex_m::asm::delay(20_000);
+                }
+            }
+        }
+        // Match cyw43_ll_bus_init: after the CLM, bus:txglom=0 and apsta=1 -- then
+        // drive the LED via gpioout, BEFORE any WLC_UP (once the interface is up
+        // the chip reassigns WL_GPIO0 and gpioout returns -23).
         let txglom = [0x3a737562, 0x6c67_7874, 0x0000_6d6f, 0x0000_0000]; // "bus:txglom\0"+le32(0)
         do_ioctl(0x107, 5, &txglom, 11 + 4, &mut tx_seq, &mut credit, &mut fr);
         let apsta = [0x74737061, 0x0001_0061, 0x0000_0000]; // "apsta\0" + le32(1)
         do_ioctl(0x107, 6, &apsta, 6 + 4, &mut tx_seq, &mut credit, &mut fr);
-        // 2. country: SET_VAR "country" + CountryInfo{abbrev "XX", rev -1, code "XX"}.
-        let country = [0x6e75_6f63, 0x0079_7274, 0x0000_5858, 0xFFFF_FFFF, 0x0000_5858];
-        let cc = do_ioctl(0x107, 2, &country, 8 + 12, &mut tx_seq, &mut credit, &mut fr);
-        CYW43_PIO[13].store(cc, SeqCst);
-        cortex_m::asm::delay(6_000_000); // set-country takes ~32 ms
-        // 3. WLC_UP (bring the interface up); no payload.
-        let up = do_ioctl(2, 3, &[], 0, &mut tx_seq, &mut credit, &mut fr);
-        CYW43_PIO[14].store(up, SeqCst);
-        // 4. gpioout: SET_VAR "gpioout" mask=1<<0 value=1<<0 -> LED ON.
-        let gpioout = [0x6f69_6770, 0x0074_756f, 0x0000_0001, 0x0000_0001];
-        let g = do_ioctl(0x107, 4, &gpioout, 8 + 8, &mut tx_seq, &mut credit, &mut fr);
-        CYW43_PIO[12].store(g, SeqCst); // 0 = LED should be ON (currently -23)
-        CYW43_PIO[15].store(0xDEAD_5EED, SeqCst);
+        // cur_etheraddr (MAC from nvram 00:A0:50:b5:59:5e) -- bus_init's last step.
+        let mac = [0x5f72_7563, 0x6568_7465, 0x6464_6172, 0xa000_0072, 0x5e59_b550];
+        do_ioctl(0x107, 7, &mac, 14 + 6, &mut tx_seq, &mut credit, &mut fr);
+        // Blink WL_GPIO0 forever via gpioout, honouring SDPCM flow control.
+        CYW43_PIO[15].store(0x11ED_B11C, SeqCst);
+        let mut i = 0u32;
         loop {
-            cortex_m::asm::nop();
+            let mut gg = 0u32;
+            while credit == tx_seq && gg < 8000 {
+                gg += 1;
+                let (got, chan, _s, bdc, _i) = rx(&mut fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(credit as u32) & 0xFF) <= 20 {
+                        credit = bdc as u8;
+                    }
+                } else {
+                    cortex_m::asm::delay(10_000);
+                }
+            }
+            let val = if i & 1 == 0 { 1u32 } else { 0u32 };
+            let id = 10 + (i & 0xFF);
+            let mut b = [0u32; 16];
+            let tot = 12 + 16 + 16usize;
+            b[0] = 0xE000_0000 | tot as u32;
+            b[1] = (tot as u32 & 0xFFFF) | (((!(tot as u32)) & 0xFFFF) << 16);
+            b[2] = 0x0C00_0000 | tx_seq as u32;
+            b[4] = 0x0000_0107; // SET_VAR
+            b[5] = 16;
+            b[6] = 0x0000_0002 | (id << 16);
+            b[8] = 0x6f69_7067; // "gpio" (LE: 'g' 'p' 'i' 'o')
+            b[9] = 0x0074_756f; // "out\0"
+            b[10] = 0x0000_0001; // mask = 1<<0
+            b[11] = val; // value (on/off)
+            xfer(&b[..12], &mut [0u32; 1]);
+            tx_seq = tx_seq.wrapping_add(1);
+            for _ in 0..2000u32 {
+                let (got, chan, _s, bdc, rid) = rx(&mut fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(credit as u32) & 0xFF) <= 20 {
+                        credit = bdc as u8;
+                    }
+                    if chan == 0 && rid == id {
+                        let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+                        CYW43_PIO[12].store(fr[hl + 3], SeqCst); // gpioout status
+                        break;
+                    }
+                } else {
+                    cortex_m::asm::delay(20_000);
+                }
+            }
+            cortex_m::asm::delay(30_000_000); // ~200 ms
+            i = i.wrapping_add(1);
         }
     }
 
