@@ -304,3 +304,29 @@ register level, yet the chip returns no FEEDBEAD. Remaining work needs wire-leve
 visibility (logic analyzer on GP24/25/29) or a faithful re-port; the `gpio` shell
 cmd + a future `wifi` shell cmd give a live debug loop (suspend the LED with
 `led off` first, since GP25 = LED = CS).
+
+## 18. Matched pico-sdk exactly + loopback: PIO clock works, still no response
+Researched the canonical pico-sdk C driver (cyw43_bus_pio_spi.c/.pio) and matched
+every difference from mine:
+- Per-transaction pio_sm_restart (clears ISR/OSR/shift counters/PC) +
+  pio_sm_clkdiv_restart + clear_fifos (FJOIN_RX toggle) -- we were missing these.
+- Pads: DIO pull-DOWN + schmitt, CLK pull-DOWN, WL_ON pull-UP.
+- X/Y loaded via FIFO put + `out x/y,32` (autopull), not `set`.
+- Confirmed byte-order: pico-sdk's DMA bswap+MSB-first-shift == our direct FIFO
+  push of the swapped u32 (equivalent wire order), so bswap is NOT the issue.
+Result: still all-0 from the CYW43.
+
+Loopback validation via the peer (user's hint -- same rig as the SPI tests):
+pointed a write-only PIO gSPI at the HEADER pins GP18=CLK/GP19=DIO/GP17=CS (wired
+to the peer's SPI) and had the peer capture. The peer CAPTURED 8 bytes => our PIO
+CLOCK generation works and reaches a peer. Data read back as 0x55 (alternating),
+not the command A0 04 40 00 -- but that is likely a PL022 CPOL/CPHA mismatch (the
+peer isn't a clean logic analyzer), so it's inconclusive on the data path.
+
+STATE: board+rig validated (SPI 56 KB/s, UART), CYW43 alive (drives DIO), PIO
+clock confirmed, gSPI matches pico-sdk AND embassy byte-for-byte -- yet no
+FEEDBEAD. This is past what's resolvable without wire visibility. Recommend a
+cheap USB logic analyzer (~$10-15 Saleae clone, sigrok/PulseView) on GP24/25/29:
+it will show in minutes whether CS is low, CLK toggles at the chip, the command
+bits are right, and if the chip drives a response. Every software avenue against
+three reference implementations has been exhausted.

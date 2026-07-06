@@ -146,6 +146,84 @@ const DIO: u32 = 24; // gSPI DIO (half-duplex data)
 const CS: u32 = 25; // gSPI CS
 const CLK: u32 = 29; // gSPI CLK
 
+// --- Loopback validation: clock the gSPI command out on the HEADER SPI pins ---
+// (GP17=CS, GP18=CLK, GP19=DIO) which are wired to the peer board's SPI, so the
+// peer (as an SPI peripheral) captures what our PIO gSPI actually produces --
+// validating the PIO output independently of the CYW43. Expect the peer to
+// receive the command bytes A0 04 40 00 (0xA004_4000 MSB-first).
+fn pio_output_test(p: &rp235x_pac::Peripherals) {
+    const TCS: u32 = 17;
+    const TCLK: u32 = 18;
+    const TDIO: u32 = 19;
+    let sio = &p.SIO;
+    p.PADS_BANK0
+        .gpio(TCS as usize)
+        .modify(|_, w| w.od().clear_bit().iso().clear_bit().ie().set_bit());
+    p.IO_BANK0
+        .gpio(TCS as usize)
+        .gpio_ctrl()
+        .modify(|_, w| unsafe { w.funcsel().bits(5) });
+    sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << TCS) });
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << TCS) });
+    for pin in [TCLK, TDIO] {
+        p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
+            w.od().clear_bit();
+            w.iso().clear_bit();
+            w.ie().set_bit()
+        });
+        p.IO_BANK0
+            .gpio(pin as usize)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(6) });
+    }
+    let pio = &p.PIO0;
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    // Write-only: 0:out pins,1 side0  1:jmp x-- 0 side1. wrap 1 -> 0.
+    for (i, insn) in [0x6001u16, 0x1020].iter().enumerate() {
+        pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
+    }
+    let sm = pio.sm(0);
+    sm.sm_clkdiv()
+        .write(|w| unsafe { w.int().bits(600).frac().bits(0) }); // ~125 kHz
+    sm.sm_shiftctrl().modify(|_, w| unsafe {
+        w.out_shiftdir().clear_bit();
+        w.autopull().set_bit();
+        w.pull_thresh().bits(0)
+    });
+    sm.sm_pinctrl().modify(|_, w| unsafe {
+        w.sideset_count().bits(1);
+        w.sideset_base().bits(TCLK as u8);
+        w.out_base().bits(TDIO as u8);
+        w.out_count().bits(1);
+        w.set_base().bits(TDIO as u8);
+        w.set_count().bits(1)
+    });
+    sm.sm_execctrl()
+        .modify(|_, w| unsafe { w.wrap_top().bits(1).wrap_bottom().bits(0) });
+    let cmd = ((1u32 << 30) | (0x14 << 11) | 4).rotate_left(16); // 0xA004_4000
+    sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << TCS) }); // CS low
+    cortex_m::asm::delay(15_000);
+    let set_pin = |pin: u32, insn: u16| {
+        sm.sm_pinctrl()
+            .modify(|_, w| unsafe { w.set_base().bits(pin as u8) });
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn) });
+    };
+    set_pin(TCLK, 0xE081);
+    set_pin(TCLK, 0xE000);
+    set_pin(TDIO, 0xE081);
+    set_pin(TDIO, 0xE000);
+    pio.ctrl()
+        .modify(|_, w| unsafe { w.sm_restart().bits(1).clkdiv_restart().bits(1) });
+    pio.txf(0).write(|w| unsafe { w.bits(31) });
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+    pio.txf(0).write(|w| unsafe { w.bits(cmd) });
+    cortex_m::asm::delay(150_000 * 3); // ~3 ms to clock 32 bits at 125 kHz
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << TCS) }); // CS high
+}
+// -----------------------------------------------------------------------------
+
 // --- P2/P3: CYW43439 gSPI chip-detect over PIO --------------------------------
 //
 // The bit-bang could not clock the half-duplex gSPI; this drives it with a PIO
@@ -462,6 +540,7 @@ fn main() -> ! {
     // P2/P3: chip-detect the CYW43439 over PIO-driven gSPI (result in CYW43_PIO,
     // want 0xBEADFEED). Harmless on a plain Pico 2 (GP23-29 float).
     cyw43_pio_detect(&p);
+    let _ = pio_output_test; // loopback validator (peer-captured; kept for reuse)
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
