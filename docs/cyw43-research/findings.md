@@ -374,3 +374,31 @@ decisive test: run the raw gSPI read in MicroPython on a COLD boot (before any
 WLAN.active). If it fails cold too, the chip needs a fuller reset/init than our
 WL_ON toggle; if it works cold, the Hubris boot/context differs. (Hubris flashes
 over SWD; MicroPython needs BOOTSEL.)
+
+## 21. THE TWO requirements found (via MicroPython): clock >=4MHz + PRIMING LOOP
+Iterating live on the working chip in MicroPython (rp2.PIO) pinned BOTH things
+our Hubris code was missing:
+1. **Clock >= 4 MHz PIO** (~2 MHz SDIO). Below that -> garbage (0x03030303). Our
+   early Hubris ran 0.5-1 MHz.
+2. **PRIMING LOOP.** The CYW43 gSPI returns GARBAGE on the FIRST transaction
+   after power-up and locks on from the 2nd. Proven: 4 reads at 16 MHz ->
+   read0=0x03030303, reads 1..3 = **0xbeadfeed**. This is why embassy LOOPS
+   `read32_swapped(0x14) until FEEDBEAD`; we did a single read. Each rp2 read is
+   a FRESH StateMachine (pio_sm_init: disable+clear_fifos+restart+clkdiv_restart
+   +jmp), and looping those primes the chip.
+
+Ported to Hubris (16.7 MHz clock, 32-pass priming loop with full clean per pass)
+-- config verified byte-identical to MicroPython's working SM (shift=0x30000,
+pinctrl=0x241c7718, funcsels, pads, DBG_PADOE) -- but our RAW-REGISTER drive still
+reads 0. Reproduced in MicroPython: rp2.StateMachine + Y=63 + loop = reliable
+0xbeadfeed, but the SAME sequence done via raw machine.mem32 pokes = 0/garbage,
+inconsistently. So the last gap is a subtle SM-driving detail in the raw register
+sequence that rp2.StateMachine gets right and our hand-rolled poke order doesn't
+(candidates: exact pindir setup via set_pindirs_with_mask, OSR/autopull state
+before `out y`, the enable/put(cmd) ordering).
+
+NEXT (clean, well-scoped): dump EVERY register write rp2.StateMachine.__init__ +
+active() makes (instrument MicroPython, or read pico-sdk pio_sm_init +
+sm_set_pindirs_with_mask + the cyw43 read fn) and replicate that exact byte
+sequence. Everything else is proven: hardware works, chip-detect returns
+0xFEEDBEAD, clock + priming requirements known, config matched.
