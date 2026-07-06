@@ -508,17 +508,15 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     xfer(&[cmd_word(true, 1, 0x1000F, 1), 0], &mut [0u32; 1]); // PULL_UP = 0
     let _ = { let mut r = [0u32; 2]; xfer(&[cmd_word(false, 1, 0x1000F, 1)], &mut r); r[1] };
     xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x10], &mut [0u32; 1]); // HT_AVAIL_REQ
-    let mut htpre = 0u32;
     let mut htprespin = 0u32;
-    loop {
+    let htpre = loop {
         let mut r = [0u32; 2];
         xfer(&[cmd_word(false, 1, 0x1000E, 1)], &mut r);
-        htpre = r[1];
         htprespin += 1;
-        if (htpre & 0x80) != 0 || htprespin >= 8000 {
-            break;
+        if (r[1] & 0x80) != 0 || htprespin >= 8000 {
+            break r[1];
         }
-    }
+    };
     CYW43_PIO[11].store(htpre, SeqCst); // pre-download HT clock (want 0x80 lane)
 
     // 6. Windowed backplane read: point the 32 KiB window at CHIPCOMMON_BASE
@@ -644,32 +642,28 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // Wait for the firmware to bring up the HT clock (CHIP_CLOCK_CSR & 0x80) --
     // this is the firmware signalling it has started. We just poll (the running
     // firmware manages the clock; requesting HT ourselves interferes).
-    let mut ht = 0u32;
     let mut htspin = 0u32;
-    loop {
+    let ht = loop {
         let mut r = [0u32; 2];
         xfer(&[cmd_word(false, 1, 0x1000E, 1)], &mut r);
-        ht = r[1];
         htspin += 1;
-        if (ht & 0x80) != 0 || htspin >= 12000 {
-            break;
+        if (r[1] & 0x80) != 0 || htspin >= 12000 {
+            break r[1];
         }
-    }
+    };
     // Lower the F2 watermark and enable the F2-packet interrupt.
     xfer(&[cmd_word(true, 1, 0x1_0008, 1), 0x20], &mut [0u32; 1]); // FUNCTION2_WATERMARK
     xfer(&[cmd_word(true, 0, 0x06, 2), 0x0020], &mut [0u32; 1]); // BUS_INTERRUPT_ENABLE = F2
     // Poll REG_BUS_STATUS (F0 0x8) for STATUS_F2_RX_READY (0x20).
-    let mut f2 = 0u32;
     let mut f2spin = 0u32;
-    loop {
+    let f2 = loop {
         let mut r = [0u32; 1];
         xfer(&[cmd_word(false, 0, 0x8, 4)], &mut r);
-        f2 = r[0];
         f2spin += 1;
-        if (f2 & 0x20) != 0 || f2spin >= 8000 {
-            break;
+        if (r[0] & 0x20) != 0 || f2spin >= 8000 {
+            break r[0];
         }
-    }
+    };
 
     CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);
     CYW43_PIO[6].store(if magic_ok { magic } else { 0xBAD0_0001 }, SeqCst); // NVRAM magic
