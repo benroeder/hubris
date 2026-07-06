@@ -354,3 +354,23 @@ slew to CLK; (3) PIO0 vs PIO2 (shouldn't matter -- pico-sdk uses PIO2 only
 because MicroPython claimed 0/1). Also revisit the reset/power timing and the
 boot-vs-runtime context. Note: MicroPython can be re-flashed anytime from
 scratchpad/mp_pico2w.uf2 to re-introspect; Hubris re-flash via probe-rs/picotool.
+
+## 20. FOUND the working config in MicroPython; porting to Hubris (cold-chip?)
+Live MicroPython rp2.PIO experiment on the working chip: our EXACT gSPI approach
+(low-speed program, cmd 0xA004_4000, shift-left autopull/autopush, sideset=CLK
+out/in/set=DIO) reads **0xBEADFEED at PIO clock >= 4 MHz** (garbage < 4 MHz). So
+the gSPI logic/program/command are CORRECT; the CYW43 gSPI just has an effective
+minimum clock (~2 MHz SDIO). Our early Hubris runs at 0.5-1 MHz were below it.
+
+Ported to Hubris (clkdiv=4 -> 37.5 MHz PIO; switched PIO0->PIO2 like MicroPython;
+matched pads). Verified via probe that Hubris now byte-matches the working config:
+SM shift=0x30000, pinctrl=0x241c7718, DBG_PADOE bit29(CLK)=out bit24(DIO)=in, SM
+clocking (PC stalled at instr 4 `in`, RXSTALL). Yet DIO reads 0 -> chip silent in
+Hubris.
+
+Only remaining difference: chip RESET/POWER state. The MicroPython experiment ran
+AFTER WLAN.active(True) had warmed the chip; Hubris hits it cold at boot. Next
+decisive test: run the raw gSPI read in MicroPython on a COLD boot (before any
+WLAN.active). If it fails cold too, the chip needs a fuller reset/init than our
+WL_ON toggle; if it works cold, the Hubris boot/context differs. (Hubris flashes
+over SWD; MicroPython needs BOOTSEL.)

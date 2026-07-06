@@ -292,7 +292,7 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         p.IO_BANK0
             .gpio(pin as usize)
             .gpio_ctrl()
-            .modify(|_, w| unsafe { w.funcsel().bits(6) });
+            .modify(|_, w| unsafe { w.funcsel().bits(8) }); // PIO2 (as MicroPython)
     }
     // Match pico-sdk pads: DIO pull-DOWN + schmitt/hysteresis, CLK pull-DOWN,
     // WL_ON pull-UP.
@@ -315,7 +315,11 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // .side_set 1 (CLK): 0:out pins,1 side0  1:jmp x-- 0 side1  2:set pindirs,0
     // side0  3:nop side0  4(lp2):in pins,1 side1  5:jmp y-- 4 side0.
     const GSPI: [u16; 6] = [0x6001, 0x1020, 0xE080, 0xA042, 0x4801, 0x0044];
-    let pio = &p.PIO0;
+    // Use PIO2 (like MicroPython/pico-sdk), not PIO0 -- the last unmatched
+    // variable. Bring it out of reset first.
+    p.RESETS.reset().modify(|_, w| w.pio2().clear_bit());
+    while p.RESETS.reset_done().read().pio2().bit_is_clear() {}
+    let pio = &p.PIO2;
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
     for (i, insn) in GSPI.iter().enumerate() {
         pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
@@ -324,10 +328,11 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     pio.input_sync_bypass()
         .write(|w| unsafe { w.bits(1 << DIO) });
     let sm = pio.sm(0);
-    // ~7.5 MHz SDIO: PIO clk = 150 MHz / 10 = 15 MHz, /2 per bit = 7.5 MHz. The
-    // very slow 500 kHz may not suit the chip's default high-speed gSPI mode.
+    // The CYW43 gSPI has an effective MINIMUM clock (~2 MHz SDIO) -- verified on
+    // the live chip via MicroPython: PIO clock < 4 MHz returns garbage, >= 4 MHz
+    // reads 0xBEADFEED. Run PIO at 150/4 = 37.5 MHz -> 18.75 MHz SDIO.
     sm.sm_clkdiv()
-        .write(|w| unsafe { w.int().bits(10).frac().bits(0) });
+        .write(|w| unsafe { w.int().bits(4).frac().bits(0) });
     // MSB-first (shift left), autopull/autopush at 32 bits (thresh 0 == 32).
     sm.sm_shiftctrl().modify(|_, w| unsafe {
         w.out_shiftdir().clear_bit();
@@ -368,18 +373,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     set_pin(CLK, 0xE000); // set pins, 0     (CLK low)
     set_pin(DIO, 0xE081); // set pindirs, 1  (DIO output)
     set_pin(DIO, 0xE000); // set pins, 0     (DIO low)
-    // pico-sdk does this EVERY transaction and we were missing it: clear the
-    // FIFOs (toggle FJOIN_RX) and RESTART the SM (ISR/OSR/shift counters/PC) +
-    // the clock divider, so no stale shift state carries over from the P1 echo
-    // program or the previous poke sequence.
-    sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
-    sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
-    pio.ctrl()
-        .modify(|_, w| unsafe { w.sm_restart().bits(1).clkdiv_restart().bits(1) });
-    // Load X = 31 (32 write bits) and Y = 255 (256 read bits, scan) the pico-sdk
-    // way: put the count in the FIFO and `out x/y, 32` autopulls it.
-    pio.txf(0).write(|w| unsafe { w.bits(31) });
-    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
+    // Verified-working drive (matches the live MicroPython experiment): set X=31
+    // (32 write bits), Y=255 (256 read bits) via the FIFO, jmp to the start,
+    // enable, then push the command. No sm_restart/clear_fifos -- those broke it.
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0xE03F) }); // set x,31
     pio.txf(0).write(|w| unsafe { w.bits(255) });
     sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
     sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
