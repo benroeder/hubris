@@ -656,3 +656,14 @@ resets. Also use userlib::hl::sleep_for (timer, preemption-safe) for the post-bo
 settle, not busy delays. Idol verified via humility hiffy: get_mac => 2c:cf:67:e8:
 5a:18, led(on/off) works, scan => 13 APs. Hubris ALLOWS sharing a peripheral across
 tasks (map shows [sio] gpio_driver, cyw43). DIAG[16] static = bring-up telemetry.
+
+## 37. AP mode -- open SoftAP for provisioning (Phase 1 of the captive portal)
+Added Cyw43::ap_start (+ Idol "ap" op, shell `wifi ap`): brings up an OPEN SoftAP
+"Pico2W-Setup" on ch 6, mirroring cyw43_ll_wifi_ap_init/set_up for the open case.
+Added an `iface` arg to do_ioctl/do_ioctl_b -> CDC flags |= iface<<12 (STA=0,
+AP=1). Sequence: country + WLC_UP -> ampdu_ba_wsize=2 -> bsscfg:ssid=[AP=1,len,
+ssid] -> WLC_SET_CHANNEL=6 -> bsscfg:wsec=[AP=1,0] -> mfp=0/gmode=1/2g_mrate=22/
+dtim=1 (AP iface) -> bss=[AP=1,up=1]. bss-up ioctl returned status 0. NEXT phases
+(the real work): F2 DATA path (Ethernet over SDPCM ch 2), smoltcp, DHCP server,
+DNS hijack, HTTP captive portal, credential storage, STA join. See
+[[pico2w-iot-provisioning]].

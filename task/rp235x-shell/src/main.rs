@@ -934,7 +934,18 @@ impl Shell {
                     Err(_) => self.out.put(b"scan failed\r\n"),
                 }
             }
-            _ => self.out.put(b"usage: wifi mac|status|on|off|scan\r\n"),
+            Some("ap") => {
+                self.out.put(b"starting AP 'Pico2W-Setup'...\r\n");
+                match self.cyw43.ap() {
+                    Ok(s) => {
+                        self.out.put(b"ap up, bss status = ");
+                        self.out.put_u32(s);
+                        self.out.put(b"\r\n");
+                    }
+                    Err(_) => self.out.put(b"ap failed\r\n"),
+                }
+            }
+            _ => self.out.put(b"usage: wifi mac|status|on|off|scan|ap\r\n"),
         }
     }
 

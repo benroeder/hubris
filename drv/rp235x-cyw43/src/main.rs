@@ -263,6 +263,7 @@ impl Cyw43 {
         &mut self,
         cmd: u32,
         id: u32,
+        iface: u32,
         payload: &[u32],
         pbytes: usize,
         fr: &mut [u32; 512],
@@ -284,7 +285,7 @@ impl Cyw43 {
         b[2] = 0x0C00_0000 | self.tx_seq as u32;
         b[4] = cmd;
         b[5] = pbytes as u32;
-        b[6] = 0x0000_0002 | (id << 16);
+        b[6] = 0x0000_0002 | (iface << 12) | (id << 16);
         for (k, &word) in payload.iter().enumerate() {
             b[8 + k] = word;
         }
@@ -313,6 +314,7 @@ impl Cyw43 {
         kind: u32,
         cmd: u32,
         id: u32,
+        iface: u32,
         payload: &[u8],
         cdc_len: usize,
         fr: &mut [u32; 512],
@@ -334,7 +336,7 @@ impl Cyw43 {
         b[2] = 0x0C00_0000 | self.tx_seq as u32;
         b[4] = cmd;
         b[5] = cdc_len as u32;
-        b[6] = kind | (id << 16);
+        b[6] = kind | (iface << 12) | (id << 16);
         for (j, &byte) in payload.iter().enumerate() {
             b[8 + j / 4] |= (byte as u32) << (8 * (j % 4));
         }
@@ -476,10 +478,10 @@ impl Cyw43 {
         // Control-plane init: CLM -> bus:txglom -> apsta -> read MAC.
         me.load_clm(aux, fr)?;
         let txglom = [0x3a73_7562, 0x6c67_7874, 0x0000_6d6f, 0x0000_0000];
-        me.do_ioctl(0x107, 5, &txglom, 11 + 4, fr);
+        me.do_ioctl(0x107, 5, 0, &txglom, 11 + 4, fr);
         let apsta = [0x7473_7061, 0x0001_0061, 0x0000_0000];
-        me.do_ioctl(0x107, 6, &apsta, 6 + 4, fr);
-        let mac_stat = me.do_ioctl_b(0, 0x106, 7, b"cur_etheraddr\0", 14 + 6, fr);
+        me.do_ioctl(0x107, 6, 0, &apsta, 6 + 4, fr);
+        let mac_stat = me.do_ioctl_b(0, 0x106, 7, 0, b"cur_etheraddr\0", 14 + 6, fr);
         if mac_stat == 0 {
             let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
             let w0 = fr[hl + 4];
@@ -601,8 +603,8 @@ impl Cyw43 {
         evt[27] = 0x40;
         evt[30] = 0x20; // event 69 (ESCAN_RESULT)
         evt[32] = 0x01;
-        self.do_ioctl_b(2, 0x107, 8, &evt, 40, fr);
-        self.do_ioctl_b(2, 2, 9, &[], 0, fr); // WLC_UP
+        self.do_ioctl_b(2, 0x107, 8, 0, &evt, 40, fr);
+        self.do_ioctl_b(2, 2, 9, 0, &[], 0, fr); // WLC_UP
         let mut esc = [0u8; 80];
         esc[..6].copy_from_slice(b"escan\0");
         esc[6] = 1;
@@ -612,7 +614,7 @@ impl Cyw43 {
         esc[50..56].iter_mut().for_each(|x| *x = 0xff);
         esc[56] = 2;
         esc[58..74].iter_mut().for_each(|x| *x = 0xff);
-        self.do_ioctl_b(2, 0x107, 10, &esc, 80, fr);
+        self.do_ioctl_b(2, 0x107, 10, 0, &esc, 80, fr);
         let mut events = 0u32;
         for _ in 0..15_000u32 {
             let (got, chan, _s, bdc, _i) = self.rx(fr);
@@ -627,11 +629,57 @@ impl Cyw43 {
         }
         events
     }
+
+    /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
+    /// Mirrors cyw43_ll_wifi_ap_init/set_up for the open case. AP-interface
+    /// (iface 1) ioctls: mfp, gmode, 2g_mrate, dtim. Returns the bss-up status.
+    fn ap_start(&mut self, ssid: &[u8], fr: &mut [u32; 512]) -> u32 {
+        let n = ssid.len().min(32);
+        // Radio on: country + WLC_UP (as cyw43_wifi_on before ap_init).
+        let country = [0x6e75_6f63, 0x0079_7274, 0x0000_5858, 0xFFFF_FFFF, 0x0000_5858];
+        self.do_ioctl(0x107, 40, 0, &country, 8 + 12, fr);
+        self.do_ioctl_b(2, 2, 41, 0, &[], 0, fr); // WLC_UP
+        // ampdu_ba_wsize = 2 (STA).
+        let mut abw = [0u8; 20];
+        abw[..15].copy_from_slice(b"ampdu_ba_wsize\0");
+        abw[15] = 2;
+        self.do_ioctl_b(2, 0x107, 42, 0, &abw, 19, fr);
+        // bsscfg:ssid = [AP=1, ssid_len, ssid[32]] (AP index carried in payload).
+        let mut sb = [0u8; 52];
+        sb[..12].copy_from_slice(b"bsscfg:ssid\0");
+        sb[12] = 1;
+        sb[16] = n as u8;
+        sb[20..20 + n].copy_from_slice(&ssid[..n]);
+        self.do_ioctl_b(2, 0x107, 43, 0, &sb, 52, fr);
+        // Channel 6 (STA).
+        self.do_ioctl(30, 44, 0, &[6], 4, fr);
+        // bsscfg:wsec = [AP=1, 0=open].
+        let mut ws = [0u8; 20];
+        ws[..12].copy_from_slice(b"bsscfg:wsec\0");
+        ws[12] = 1;
+        self.do_ioctl_b(2, 0x107, 45, 0, &ws, 20, fr);
+        // mfp = 0, gmode = 1, 2g_mrate = 22, dtim = 1 (all on the AP interface).
+        let mut mfp = [0u8; 8];
+        mfp[..4].copy_from_slice(b"mfp\0");
+        self.do_ioctl_b(2, 0x107, 46, 1, &mfp, 8, fr);
+        self.do_ioctl(110, 47, 1, &[1], 4, fr);
+        let mut mr = [0u8; 16];
+        mr[..9].copy_from_slice(b"2g_mrate\0");
+        mr[9] = 22;
+        self.do_ioctl_b(2, 0x107, 48, 1, &mr, 13, fr);
+        self.do_ioctl(78, 49, 1, &[1], 4, fr);
+        // Bring the AP up: bss = [AP=1, up=1].
+        let mut bss = [0u8; 12];
+        bss[..4].copy_from_slice(b"bss\0");
+        bss[4] = 1;
+        bss[8] = 1;
+        self.do_ioctl_b(2, 0x107, 50, 0, &bss, 12, fr)
+    }
 }
 
 /// The CLM ioctl, split out so the streaming borrow of `clm_pl` ends first.
 fn me_do_clm(me: &mut Cyw43, clm_pl: &[u32; 251], fr: &mut [u32; 512]) -> u32 {
-    me.do_ioctl(0x107, 1, clm_pl, 8 + 12 + 984, fr)
+    me.do_ioctl(0x107, 1, 0, clm_pl, 8 + 12 + 984, fr)
 }
 
 /// One-time hardware setup: pad config, funcsel, CYW43 power-on (gSPI mode),
@@ -743,6 +791,12 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
         _: &RecvMessage,
     ) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.scan(&mut self.fr))
+    }
+    fn ap(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Cyw43Error>> {
+        Ok(self.wifi.ap_start(b"Pico2W-Setup", &mut self.fr))
     }
 }
 

@@ -25,5 +25,9 @@ Interface(
             description: "Run an active Wi-Fi scan; returns the number of AP result frames seen.",
             reply: Result(ok: "u32", err: CLike("Cyw43Error")),
         ),
+        "ap": (
+            description: "Bring up an open SoftAP 'Pico2W-Setup' for provisioning; returns the bss-up status (0 = ok).",
+            reply: Result(ok: "u32", err: CLike("Cyw43Error")),
+        ),
     },
 )
