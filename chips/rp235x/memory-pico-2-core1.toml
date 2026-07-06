@@ -19,14 +19,7 @@ execute = false
 # liveness heartbeat. Granted to the core-1 beat task via extern-regions.
 [[shared]]
 address = 0x2008_0000
-size = 0x1000
+size = 0x2000
 read = true
 write = true
 
-# Shared SRAM9 buffer (0x20081000, 4 KiB) -- the bulk-transfer buffer core 0
-# writes and this core's fifo task reads. Distinct from `shared` (0x20080000).
-[[shared_buf]]
-address = 0x2008_1000
-size = 0x1000
-read = true
-write = true

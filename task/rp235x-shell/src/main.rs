@@ -428,6 +428,9 @@ impl Shell {
         if a == Some("bulk") {
             return self.core1_bulk(b, c);
         }
+        if a == Some("pipe") {
+            return self.core1_pipe(b);
+        }
         let Some(n) = a.and_then(|s| s.parse::<u32>().ok()) else {
             self.out.put(b"usage: core1 <n> | core1 stress <count>\r\n");
             return;
@@ -529,6 +532,25 @@ impl Shell {
         self.out.put_u64(kb_per_s);
         self.out
             .put(b" KB/s one-way (core0->shared SRAM->core1)\r\n");
+    }
+
+    /// Pipelined bulk: `core1 pipe <iters>` transfers `iters` x 2 KiB blocks
+    /// double-buffered, so core 0 fills one buffer while core 1 drains the
+    /// other in parallel (buffers in different SRAM banks) -- the payoff of two
+    /// cores. Compare to `core1 bulk` (sequential write-then-read).
+    fn core1_pipe(&mut self, a: Option<&str>) {
+        let iters = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(100_000);
+        let ms = self.mailbox.bulk_pipe(iters);
+        let bytes = (iters as u64).wrapping_mul(2048);
+        let kb_per_s =
+            bytes.wrapping_mul(1000).checked_div(ms as u64).unwrap_or(0) / 1024;
+        self.out.put(b"core1 pipe: ");
+        self.out.put_u32(iters);
+        self.out.put(b" x 2048 B in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(kb_per_s);
+        self.out.put(b" KB/s one-way (pipelined, 2 SRAM banks)\r\n");
     }
 
     fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {

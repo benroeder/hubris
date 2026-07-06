@@ -21,13 +21,26 @@ use idol_runtime::RequestError;
 use userlib::RecvMessage;
 
 extern "C" {
-    /// Shared SRAM bulk-transfer buffer (granted via extern-regions).
-    static mut __REGION_SHARED_BUF_BASE: [u8; 0];
+    /// Shared 8 KiB SRAM window (granted via extern-regions). Layout: beat
+    /// mailbox at +0; bulk buffer 0 at +0x800 (SRAM8); buffer 1 at +0x1000
+    /// (SRAM9) -- two different banks so a producer write and consumer read
+    /// don't contend, which is what makes the pipelined transfer scale.
+    static mut __REGION_SHARED_BASE: [u8; 0];
 }
+
+/// 2 KiB per bulk buffer (512 words); buffers at these offsets from the base.
+const BUF_WORDS: usize = 512;
+const BUF0_OFF: usize = 0x800 / 4;
+const BUF1_OFF: usize = 0x1000 / 4;
 
 /// Bounded busy-spin for a core-1 reply. Core 1 answers in microseconds; this
 /// large bound only trips if core 1 is wedged or absent (~tens of ms).
 const REPLY_SPINS: u32 = 5_000_000;
+
+/// Base of the shared window as a `*mut u32`.
+fn shared_words() -> *mut u32 {
+    &raw mut __REGION_SHARED_BASE as *mut u32
+}
 
 struct ServerImpl {
     sio: rp235x_pac::SIO,
@@ -94,16 +107,15 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
         len: u32,
         iters: u32,
     ) -> Result<u32, RequestError<Infallible>> {
-        // One-way bulk transfer: each round, fill `len` bytes of the shared
-        // buffer (core 0 produces), doorbell core 1 (bit31 | len), and wait for
-        // its checksum ack (core 1 consumed). Throughput = iters*len / elapsed.
-        let len = len.min(4096);
+        // Non-pipelined one-way bulk: each round, fill `len` bytes of buffer 0
+        // (core 0 produces), doorbell core 1 (bit31, bit30=0 = single), wait for
+        // its checksum ack. Core-0 write and core-1 read are SEQUENTIAL.
+        let len = len.min((BUF_WORDS * 4) as u32);
         let words = (len / 4) as usize;
-        let buf = &raw mut __REGION_SHARED_BUF_BASE as *mut u32;
+        let buf = unsafe { shared_words().add(BUF0_OFF) };
         let start = userlib::sys_get_timer().now;
         let mut it = 0u32;
         while it < iters {
-            // Write the buffer (varying so it isn't optimized to a constant).
             let mut i = 0usize;
             while i < words {
                 unsafe {
@@ -111,7 +123,6 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
                 }
                 i += 1;
             }
-            // Doorbell + wait for the consume ack.
             while self.sio.fifo_st().read().vld().bit_is_set() {
                 let _ = self.sio.fifo_rd().read().bits();
             }
@@ -128,6 +139,66 @@ impl idl::InOrderRp235xMailboxImpl for ServerImpl {
             }
             let _ = self.sio.fifo_rd().read().bits();
             it += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
+
+    fn bulk_pipe(
+        &mut self,
+        _: &RecvMessage,
+        iters: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // PIPELINED one-way bulk: double-buffered producer/consumer. Core 0
+        // fills buffer (block&1) and rings a "ready" doorbell (bit31|bit30|b);
+        // core 1 reads+sums that buffer and acks. With 2 buffers in different
+        // SRAM banks, core 0 fills one while core 1 drains the other IN
+        // PARALLEL -- the point of two cores. A 2-credit window keeps core 0 at
+        // most one buffer ahead; acks arrive in order so a generic credit count
+        // frees the right buffer.
+        let base = shared_words();
+        // Drop any stale acks.
+        while self.sio.fifo_st().read().vld().bit_is_set() {
+            let _ = self.sio.fifo_rd().read().bits();
+        }
+        let start = userlib::sys_get_timer().now;
+        let mut credits = 2u32;
+        let mut block = 0u32;
+        let wait_ack = |sio: &rp235x_pac::SIO| {
+            let mut spins = 0u32;
+            while sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = sio.fifo_rd().read().bits();
+        };
+        while block < iters {
+            if credits == 0 {
+                wait_ack(&self.sio);
+                credits += 1;
+            }
+            credits -= 1;
+            let b = (block & 1) as usize;
+            let off = BUF0_OFF + b * (BUF1_OFF - BUF0_OFF);
+            let buf = unsafe { base.add(off) };
+            let mut i = 0usize;
+            while i < BUF_WORDS {
+                unsafe {
+                    buf.add(i).write_volatile(block.wrapping_add(i as u32));
+                }
+                i += 1;
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio
+                .fifo_wr()
+                .write(|w| unsafe { w.bits(0xc000_0000 | b as u32) });
+            block += 1;
+        }
+        // Drain the in-flight buffers' acks.
+        while credits < 2 {
+            wait_ack(&self.sio);
+            credits += 1;
         }
         Ok((userlib::sys_get_timer().now - start) as u32)
     }

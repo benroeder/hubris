@@ -108,7 +108,7 @@ priority = 3
 max-sizes = {flash = 8192, ram = 1024}
 stacksize = 512
 uses = ["sio"]
-extern-regions = ["shared_buf"]
+extern-regions = ["shared"]
 start = true
 
 [tasks.shell]
