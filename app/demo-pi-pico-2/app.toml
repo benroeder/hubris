@@ -119,6 +119,14 @@ start = true
 features = ["micro"]
 notifications = ["timer"]
 
+[tasks.auxflash]
+name = "drv-rp235x-auxflash-server"
+priority = 3
+max-sizes = {flash = 16384, ram = 8192}
+stacksize = 4096
+extern-regions = ["cyw43_fw"]
+start = true
+
 [tasks.idle]
 name = "task-idle"
 priority = 5
