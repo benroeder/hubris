@@ -565,3 +565,18 @@ flags=Set(2), id. mask=1<<0, value=1<<0 (on). Blinks by toggling value with
 seq/id incrementing each frame. [15]=0x11EDB11C when the loop finished.
 (Pending: physical confirmation the LED blinks; if not, read the F2 response and
 check the CDC status, and add CLM/country init first.)
+
+## 31. ioctl path works; gpioout returns -23 (needs CLM/init) -- LED pending
+Built the SDPCM/CDC ioctl send + a demux receiver (read F2 frames, skip async
+events on channel 1, find the CONTROL-channel-0 response, return its CDC status).
+Sent SET_VAR "gpioout" (mask=1<<0, value=1<<0) to drive WL_GPIO0 (onboard LED).
+RESULT: the chip PARSES and RESPONDS -- CDC status = -23 = BCME_UNSUPPORTED. So
+the frame is correct but the firmware won't do gpioout until its control-layer
+init runs. Per embassy control.rs init(): load CLM (SET_VAR "clmload" with the
+984-byte WCLM blob at auxflash mirror 0x1c238700 + a 12-byte DownloadHeader
+{flag=BEGIN|END|HANDLER_VER=0x1006, type=CLM=2, len, crc=0}), then "country",
+then WLC_UP, then gpioout works. First CLM-upload attempt HANGS on the ~1 KB F2
+write/response -- large-frame F2 transfer over the hand-rolled PIO needs more
+work (the small ioctl round-trips fine). NEXT: debug the large F2 transfer (or
+chunk it), finish the CLM+country+up init -> LED, then scan/join. This whole
+control layer belongs in the drv/rp235x-cyw43 task, not the pre-kernel probe.

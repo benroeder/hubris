@@ -438,15 +438,21 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         for &word in out_words {
             // Pace to the SM via the TX-FIFO level (FLEVEL bits [3:0] = SM0 TX
             // count): push only when the 4-deep FIFO has room. Without this a
-            // burst overruns the FIFO and words are silently dropped.
-            while (pio.flevel().read().bits() & 0xF) >= 4 {}
+            // burst overruns the FIFO and words are silently dropped. Bounded so a
+            // stalled SM can't hang the CPU.
+            let mut s = 0u32;
+            while (pio.flevel().read().bits() & 0xF) >= 4 && s < 100_000 {
+                s += 1;
+            }
             pio.txf(0).write(|w| unsafe { w.bits(word) });
         }
         for slot in in_words.iter_mut() {
+            // A valid word arrives within ~2 us; fail fast if it doesn't so a
+            // short/absent frame doesn't waste ~1 ms per missing word.
             let mut spins = 0u32;
             while pio.fstat().read().rxempty().bits() & 1 != 0 {
                 spins += 1;
-                if spins > 200_000 {
+                if spins > 8_000 {
                     break;
                 }
             }
@@ -684,30 +690,48 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // Frame = SdpcmHeader(12) + CdcHeader(16) + "gpioout\0"(8) + mask(4) + val(4)
     // = 44 bytes. wlan_write prepends the gSPI cmd (WRITE INC F2 addr0 len44).
     if (f2 & 0x20) != 0 {
-        // Blink WL_GPIO0 ~10 times so it's visible; increment the SDPCM sequence
-        // and CDC id each frame (the chip tracks them).
-        for i in 0..20u32 {
-            let val = if i & 1 == 0 { 1u32 } else { 0u32 }; // on / off
-            let seq = i & 0xFF;
-            let id = (i + 1) & 0xFFFF;
-            let led_frame: [u32; 12] = [
-                0xE000_0000 | 44, // gSPI cmd: WRITE|INC func2 addr0 len=44
-                0xFFD3_002C, // SDPCM len=44, len_inv=0xFFD3
-                0x0C00_0000 | seq, // seq, channel=CONTROL, header_length=12
-                0x0000_0000,
-                0x0000_0107, // CDC cmd = SET_VAR (263)
-                0x0000_0010, // CDC len = 16
-                0x0000_0002 | (id << 16), // CDC flags=Set(2), id
-                0x0000_0000, // CDC status
-                0x6f69_6770, // "gpio"
-                0x0074_756f, // "out\0"
-                0x0000_0001, // mask = 1<<0
-                val, // value (LED on/off)
-            ];
-            xfer(&led_frame, &mut [0u32; 1]);
-            cortex_m::asm::delay(30_000_000); // ~200 ms
-        }
-        CYW43_PIO[15].store(0x11ED_B11C, SeqCst); // LED blink sequence done
+        // send_recv: write an already-built frame (out[0] = gSPI cmd), then read
+        // F2 frames until the CONTROL-channel (0) ioctl response, returning its
+        // CDC status (0 = accepted). Skips async events (channel 1).
+        let send_recv = |out: &[u32]| -> u32 {
+            xfer(out, &mut [0u32; 1]);
+            let mut fr = [0u32; 64];
+            let mut status = 0xEEEE_EEEEu32;
+            let mut tries = 0u32;
+            while tries < 800 {
+                tries += 1;
+                let mut r = [0u32; 1];
+                xfer(&[cmd_word(false, 0, 0x8, 4)], &mut r);
+                if (r[0] & 0x100) == 0 {
+                    cortex_m::asm::delay(20_000);
+                    continue;
+                }
+                let len = ((r[0] >> 9) & 0x7FF) as usize;
+                if len < 12 {
+                    break;
+                }
+                let w = len.div_ceil(4).min(64);
+                xfer(&[cmd_word(false, 2, 0, len as u32)], &mut fr[..w]);
+                if (fr[1] >> 8) & 0xFF == 0 {
+                    let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+                    status = fr[hl + 3];
+                    break;
+                }
+            }
+            status
+        };
+        // Send the LED-on gpioout ioctl and capture the CDC status. (Currently
+        // returns -23 = BCME_UNSUPPORTED: the firmware needs its CLM/country/up
+        // init before gpioout is available. That control-layer init is the next
+        // step -- see findings.md.)
+        let led: [u32; 12] = [
+            0xE000_0000 | 44, 0xFFD3_002C, 0x0C00_0000, 0x0000_0000, 0x0000_0107,
+            0x0000_0010, 0x0001_0002, 0x0000_0000, 0x6f69_6770, 0x0074_756f,
+            0x0000_0001, 0x0000_0001,
+        ];
+        let gpio_status = send_recv(&led);
+        CYW43_PIO[12].store(gpio_status, SeqCst); // gpioout CDC status
+        CYW43_PIO[15].store(0xDEAD_5EED, SeqCst);
     }
 
     CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);
