@@ -627,3 +627,14 @@ the "gpio"-style byte-order bug. The count loop is slow (each iter does a gSPI
 status read) -- 15k iters ~10 s covers the scan; 90k iters overran the probe
 wait. NEXT: proper SDPCM/BDC/event parser to list all SSIDs+RSSI (belongs in the
 drv/rp235x-cyw43 task, not the pre-kernel probe).
+
+## 35. *** SCAN lists real SSIDs on-device: darkworks, darkworksiot, USB-Insight-Hub ***
+Extended the scan to store each ESCAN_RESULT's BssInfo ssid region (frame words
+31..39, i.e. ssid_len at byte 124) into a SSIDS[] static, read back over the
+probe. Live result: "USB-Insight-Hub-b43a45b54af4", "darkworksiot", "darkworks"
+-- the real nearby networks. Duplicates = multiple beacons/probe-resps per AP
+across the scan window (dedup by BSSID later). One frame (AP 7) decoded short --
+the fixed word-31 offset holds for most escan_result frames but a proper parser
+(BDC data_offset + event header walk) is needed for 100%. Full Wi-Fi RECEIVE
+path now proven: PIO gSPI -> fw -> ioctls -> events -> BssInfo -> SSID. This
+closes Wi-Fi bring-up on the probe; the productionization is the driver task.

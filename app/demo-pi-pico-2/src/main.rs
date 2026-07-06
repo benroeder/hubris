@@ -259,6 +259,12 @@ static CYW43_PIO: [core::sync::atomic::AtomicU32; 16] = [
 static SCAN_FRAME: [core::sync::atomic::AtomicU32; 128] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 128];
 
+/// Per-AP SSID region (BssInfo ssid_len+ssid, frame words 31..39) x up to 16 APs.
+#[no_mangle]
+#[used]
+static SSIDS: [core::sync::atomic::AtomicU32; 128] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 128];
+
 // Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h,
 // packed little-endian and zero-padded to a word. Written near the top of WLAN
 // RAM during firmware download; the firmware reads it to find its calibration.
@@ -969,6 +975,13 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
                     credit = bdc as u8;
                 }
                 if chan == 1 {
+                    // Capture the BssInfo ssid region (words 31..39) for each AP.
+                    if events < 16 {
+                        for k in 0..8usize {
+                            SSIDS[events as usize * 8 + k]
+                                .store(fr[31 + k], SeqCst);
+                        }
+                    }
                     events += 1;
                 }
             } else {
