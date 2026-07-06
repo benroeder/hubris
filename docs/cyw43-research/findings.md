@@ -158,3 +158,41 @@ memory-mapped XIP mirror (0x1c20_0000 + offset) instead of driving a QSPI chip,
 and the write/erase/redundancy ops stubbed (the blob is flashed once, externally).
 It reuses drv-auxflash-api + the tlvc crate. Built alongside the cyw43 driver
 (its only client), which calls `get_blob_by_tag(*b"WIFI")` and streams it.
+
+## 11. gSPI decode: logical layer CONFIRMED vs embassy; PHY needs PIO
+Cross-checked the bit-bang against the authoritative embassy `cyw43` source
+(cyw43/src/spi.rs + consts.rs). Our LOGICAL layer is exactly right:
+- `cmd_word(write,incr,func,addr,len) = (write<<31)|(incr<<30)|(func&3)<<28
+  |(addr&0x1FFFF)<<11|(len&0x7FF)` -- identical to ours.
+- `swap16(x) = x.rotate_left(16)`; FUNC_BUS=0, REG_BUS_TEST_RO=0x14, FEEDBEAD.
+- Init: pwr LOW 20 ms, HIGH **250 ms** (not the datasheet's 50 ms), then loop
+  `read32_swapped(FUNC_BUS, 0x14)` until it returns FEEDBEAD. read32_swapped
+  swap16's BOTH cmd and response, so on the wire the raw response is
+  swap16(FEEDBEAD) = **0xBEADFEED** (what our probe should see with the swapped
+  command 0xA004_4000).
+- Then write REG_BUS_CTRL = WORD_LENGTH_32|HIGH_SPEED|INTERRUPT_POLARITY_HIGH|
+  WAKE_UP | 0x4<<(8*RESP_DELAY) | STATUS_ENABLE<<(8*STATUS_ENABLE) |
+  INTR_WITH_STATUS<<(8*STATUS_ENABLE); afterwards normal (un-swapped) reads work.
+  F0 reads have NO response delay; backplane (F1) reads use SPI_RESP_DELAY_F1
+  padding (WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE).
+
+Bit-bang result (GP23/24/25/29, matrix of swap x sample-edge x turnaround, 250 ms
+power): never 0xBEADFEED. Got periodic/noise artifacts (0x06060606 is period-8 =
+our own clock aliasing, plus 0x7d5bfdda/0xfab7fbb4 = a floating/mis-clocked DIO).
+CONCLUSION: bit-banging cannot reliably clock the half-duplex gSPI (DIO turnaround
++ sub-us setup/hold). embassy/pico-sdk/PicoWi ALL use a PIO program for the PHY --
+that is the correct next step.
+
+## 12. NEXT: PIO gSPI PHY (milestone 1, proper)
+Build a first RP2350 PIO capability + a gSPI PHY state machine:
+- A PIO program that shifts out the 32-bit cmd MSB-first on GP24, turns the pin
+  around (OUT->IN), and shifts in the response -- CS=GP25, CLK=GP29, the SDIO
+  clock derived from a PIO clock divider. Model on the pico-sdk `cyw43_bus_pio`
+  / embassy `cyw43-pio` program (both public).
+- A Hubris `rp235x-pio` driver (none exists yet -- this is the first PIO use in
+  the port; reusable for other PIO peripherals later).
+- The cyw43 driver then implements the embassy `SpiBusCyw43` contract
+  (`cmd_read`/`cmd_write`) over the PIO SM, runs the init above to read FEEDBEAD,
+  then streams the WIFI blob (from the auxflash server) to the chip.
+The firmware-storage half (auxflash) is already done + verified; the PHY is the
+remaining prerequisite for chip-detect and everything after.

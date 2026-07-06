@@ -134,20 +134,26 @@ fn cyw43_probe(p: &rp235x_pac::Peripherals) {
     lo(DIO);
     oe(WL_ON, true);
     lo(WL_ON);
-    cortex_m::asm::delay(150_000_000 / 100); // ~10 ms with WL_ON low
+    cortex_m::asm::delay(150_000 * 20); // 20 ms with WL_ON low (embassy timing)
 
-    // Power up the WLAN section, wait the datasheet's 50 ms out-of-reset.
+    // Power up the WLAN section. embassy waits 250 ms out-of-reset (not the
+    // datasheet's 50 ms) -- the chip is not ready before then.
     hi(WL_ON);
-    cortex_m::asm::delay(150_000 * 60); // ~60 ms
+    cortex_m::asm::delay(150_000 * 250); // 250 ms
 
-    // One gSPI transaction: clock out `cmd` (32b, MSB first) then, if reading,
-    // clock in 32 bits. Default (pre-high-speed) mode: sample on rising edge.
-    let xfer = |cmd: u32, read: bool| -> u32 {
+    // Parameterized gSPI read of F0 0x14: clock out the command (32b MSB-first;
+    // `swap` = send the two 16-bit halves swapped, the classic power-up quirk),
+    // insert `dummy` turnaround clocks, then clock in 32 bits sampling on the
+    // rising edge (`fall`=false) or after the falling edge (`fall`=true). We
+    // sweep these because the exact power-up framing has to be pinned on-target.
+    let cmd = (1u32 << 30) | (0x14 << 11) | 4; // read F0 0x14, 4 B = 0x4000_A004
+    let read14 = |swap: bool, fall: bool, dummy: u32| -> u32 {
+        let word = if swap { cmd.rotate_left(16) } else { cmd };
         lo(CS);
         d();
         oe(DIO, true);
         for i in (0..32).rev() {
-            if (cmd >> i) & 1 == 1 {
+            if (word >> i) & 1 == 1 {
                 hi(DIO);
             } else {
                 lo(DIO);
@@ -157,10 +163,22 @@ fn cyw43_probe(p: &rp235x_pac::Peripherals) {
             d();
             lo(CLK);
         }
+        oe(DIO, false);
+        for _ in 0..dummy {
+            hi(CLK);
+            d();
+            lo(CLK);
+            d();
+        }
         let mut val = 0u32;
-        if read {
-            oe(DIO, false);
-            for _ in 0..32 {
+        for _ in 0..32 {
+            if fall {
+                hi(CLK);
+                d();
+                lo(CLK);
+                d();
+                val = (val << 1) | rd();
+            } else {
                 hi(CLK);
                 d();
                 val = (val << 1) | rd();
@@ -173,17 +191,11 @@ fn cyw43_probe(p: &rp235x_pac::Peripherals) {
         val
     };
 
-    // Command word: [wr:1|incr:1|func:2|addr:17|len:11]. Read F0(0) 0x14, 4 B.
-    let cmd = (1u32 << 30) | (0x14 << 11) | 4; // 0x4000_A004
-    // Try: normal order, 16-bit-word-swapped order (the classic gSPI quirk),
-    // and after writing the bus-control reg to disable swap + high speed.
-    CYW43_PROBE[0].store(xfer(cmd, true), SeqCst);
-    CYW43_PROBE[1].store(xfer(cmd.rotate_left(16), true), SeqCst);
-    let ctrl = (1u32 << 31) | (0x00 << 11) | 4; // write F0 0x00, 4 B
-    xfer(ctrl, false);
-    xfer(0x0002_04b3u32.rotate_left(16), false); // bus-control value (swapped)
-    CYW43_PROBE[2].store(xfer(cmd, true), SeqCst);
-    CYW43_PROBE[3].store(0x600d_0000 | (rd() & 1), SeqCst); // sentinel: probe ran
+    // Matrix: want one of these to read 0xFEEDBEAD (or a clean swap of it).
+    CYW43_PROBE[0].store(read14(true, false, 0), SeqCst); // swap, rising
+    CYW43_PROBE[1].store(read14(true, true, 0), SeqCst); //  swap, falling
+    CYW43_PROBE[2].store(read14(true, false, 1), SeqCst); // swap, rising, +1 dummy
+    CYW43_PROBE[3].store(read14(false, true, 0), SeqCst); // no-swap, falling
 }
 // -----------------------------------------------------------------------------
 
