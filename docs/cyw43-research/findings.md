@@ -431,3 +431,32 @@ CONFIRMED FACTS (unchanged): CYW43 hardware works (MicroPython WiFi, 6 APs),
 chip-detect returns 0xFEEDBEAD via rp2, clock must be >=4 MHz PIO, and the read
 must be looped (first read = garbage). MicroPython flashes over SWD now too
 (scratchpad/mp.bin), so no BOOTSEL dance for future debugging.
+
+## 23. *** SOLVED: CYW43 chip-detect WORKS in Hubris (0xFEEDBEAD) ***
+Root cause: my HAND-ASSEMBLED PIO program had 3 wrong instruction encodings,
+present in every test AND in the Hubris driver the whole time. Dumping
+MicroPython's rp2 ASSEMBLER output exposed it:
+  wrong:   [0x6001, 0x1020, 0xE080, 0xA042, 0x4801, 0x0044]
+  correct: [0x6001, 0x1040, 0xE080, 0xA042, 0x5001, 0x0084]
+  - `jmp x--`: I used condition !X (0x1020); X-- is 0x1040.
+  - `in pins,1 side1`: I misplaced the side-set bit (0x4801 = side0+delay8);
+    correct is 0x5001.
+  - `jmp y--`: I used X-- (0x0044); Y-- is 0x0084.
+This is why the isolation (rp2's CORRECT program + my raw read) always worked
+while my own setup (my wrong program) never did -- every register matched, only
+the program bytes differed.
+
+Result on the live Pico 2 W in HUBRIS: CYW43_PIO[0] = 0xBEADFEED (= swap16 of
+FEEDBEAD) on pass 2 (pass 1 = priming garbage). CHIP DETECTED.
+
+The complete working recipe (all verified on hardware):
+- PIO2 SM0, GP24=DIO/GP29=CLK funcsel 8, GP23=WL_ON/GP25=CS SIO.
+- 6-instr low-speed gSPI program (correct bytes above), wrap 0->5.
+- clkdiv ~16 MHz (>=4 MHz required), shift-left autopull/autopush thresh 32,
+  sideset=CLK out/set/in=DIO, input_sync_bypass on DIO.
+- Power WL_ON low 20 ms / high 250 ms (DIO SIO-low = gSPI mode select).
+- Per read: CS pulse, clear FIFOs, DIO pindir out, SM restart + clkdiv restart,
+  load X=31/Y=63 via FIFO+autopull (restart empties OSR so autopull works),
+  jmp 0, enable, push cmd 0xA004_4000, read.
+- LOOP the read until 0xBEADFEED (the chip's FIRST read after power-up is
+  garbage; it locks on from the 2nd). Milestone 1 (chip-detect) COMPLETE.

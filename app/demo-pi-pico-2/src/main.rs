@@ -314,7 +314,11 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // determines exactly when the read samples relative to the response.
     // .side_set 1 (CLK): 0:out pins,1 side0  1:jmp x-- 0 side1  2:set pindirs,0
     // side0  3:nop side0  4(lp2):in pins,1 side1  5:jmp y-- 4 side0.
-    const GSPI: [u16; 6] = [0x6001, 0x1020, 0xE080, 0xA042, 0x4801, 0x0044];
+    // Assembled bytes verified against MicroPython's rp2 assembler (my earlier
+    // hand-assembly had 3 wrong encodings: jmp x-- was !X, `in` had the side-set
+    // bit misplaced, jmp y-- was x--). 0:out pins,1 side0  1:jmp x-- 0 side1
+    // 2:set pindirs,0 side0  3:nop side0  4:in pins,1 side1  5:jmp y-- 4 side0.
+    const GSPI: [u16; 6] = [0x6001, 0x1040, 0xE080, 0xA042, 0x5001, 0x0084];
     // Use PIO2 (like MicroPython/pico-sdk), not PIO0 -- the last unmatched
     // variable. Bring it out of reset first.
     p.RESETS.reset().modify(|_, w| w.pio2().clear_bit());
@@ -332,7 +336,7 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // the live chip via MicroPython. Run PIO at 150/9 = ~16.7 MHz -> ~8.3 MHz
     // SDIO (well inside the known-good 4-32 MHz range).
     sm.sm_clkdiv()
-        .write(|w| unsafe { w.int().bits(9).frac().bits(0) });
+        .write(|w| unsafe { w.int().bits(9).frac().bits(0x60) }); // 16 MHz (rp2)
     // MSB-first (shift left), autopull/autopush at 32 bits (thresh 0 == 32).
     sm.sm_shiftctrl().modify(|_, w| unsafe {
         w.out_shiftdir().clear_bit();
@@ -361,33 +365,34 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             .modify(|_, w| unsafe { w.set_base().bits(pin as u8) });
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn) });
     };
-    // PRIMING LOOP: the CYW43 gSPI returns garbage on the FIRST transaction after
-    // power-up and locks on from the 2nd (embassy loops read 0x14 until FEEDBEAD;
-    // verified on the live chip: read 1 = garbage, reads 2+ = 0xBEADFEED). Each
-    // pass is a full clean transaction: pulse CS, drive CLK/DIO out-low, set
-    // X=31 (write 32b) / Y=63 (read 64b), run, read the first word.
+    // Set CLK + DIO output-low once (cyw43_spi_init on the live chip).
+    set_pin(CLK, 0xE081);
+    set_pin(CLK, 0xE000);
+    set_pin(DIO, 0xE081);
+    set_pin(DIO, 0xE000);
+    // PRIMING LOOP (byte-for-byte the sequence PROVEN to read 0xBEADFEED on the
+    // live chip via MicroPython): the CYW43 gSPI returns garbage on the first
+    // transaction after power-up and locks on from the 2nd, so loop until
+    // 0xBEADFEED. Per pass, pico-sdk's pio-read order: pulse CS, disable, clear
+    // FIFOs, DIO pindir out, restart SM + clkdiv (this empties the OSR so the
+    // following autopulls work), load X=31 and Y=63 via the FIFO (put + `out
+    // x/y,32`), jmp to the program start, enable, push the command, read.
     let mut result = 0u32;
     let mut pass = 0u32;
     loop {
-        // Full clean per pass = pico-sdk pio_sm_init (what a fresh rp2
-        // StateMachine does): disable, clear FIFOs, restart SM + clkdiv. Without
-        // this the SM carries stale shift state and every read after the first
-        // returns 0.
+        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
+        cortex_m::asm::delay(1500);
+        sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
+        cortex_m::asm::delay(30_000); // ~200 us settle
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
+        set_pin(DIO, 0xE081); // DIO pindir out (turnaround left it input)
         pio.ctrl().modify(|_, w| unsafe {
             w.sm_restart().bits(1).clkdiv_restart().bits(1)
         });
-        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high (pulse)
-        cortex_m::asm::delay(1500);
-        sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
-        cortex_m::asm::delay(30_000); // ~200 us settle (VSYS-ADC RC on GP25)
-        set_pin(CLK, 0xE081); // CLK pindir out
-        set_pin(CLK, 0xE000); // CLK low
-        set_pin(DIO, 0xE081); // DIO pindir out
-        set_pin(DIO, 0xE000); // DIO low
-        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0xE03F) }); // set x,31
+        pio.txf(0).write(|w| unsafe { w.bits(31) });
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
         pio.txf(0).write(|w| unsafe { w.bits(63) });
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
