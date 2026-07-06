@@ -413,15 +413,14 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // 1. Prime + chip-detect: read F0 TEST_RO (0x14) swap16'd until FEEDBEAD -- the
     //    first transaction after power-up is garbage, the chip locks on from 2nd.
     let read_ro = swap16(cmd_word(false, 0x14));
-    let mut chip = 0u32;
     let mut pass = 0u32;
-    loop {
-        chip = swap16(xfer(31, 63, &[read_ro]));
+    let chip = loop {
+        let c = swap16(xfer(31, 63, &[read_ro]));
         pass += 1;
-        if chip == 0xFEED_BEAD || pass >= 32 {
-            break;
+        if c == 0xFEED_BEAD || pass >= 32 {
+            break c;
         }
-    }
+    };
     // 2. Prove the WRITE path: write F0 TEST_RW (0x18) = 0x12345678, read it back.
     xfer(63, 31, &[swap16(cmd_word(true, 0x18)), swap16(0x1234_5678)]);
     let rw = swap16(xfer(31, 63, &[swap16(cmd_word(false, 0x18))]));
