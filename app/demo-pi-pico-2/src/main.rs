@@ -75,6 +75,71 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
 /// protocol; 0 is free for the application.
 const BOOTSEL_MAGIC: u32 = 0xb007_5e1f;
 
+// --- PIO plumbing proof (scope P1: first PIO use on the port) -----------------
+//
+// Before the gSPI PHY, prove the RP2350 PIO works at all under our port: load a
+// tiny 3-instruction "echo" program (TXF -> OSR -> ISR -> RXF) into PIO0 SM0 and
+// confirm a value written to the TX FIFO comes back from the RX FIFO. No pins,
+// no clock rate dependence -- this isolates the plumbing (reset, instruction
+// memory load, SM config, FIFO access) from the gSPI complexity. Result in the
+// probe-readable PIO_PROBE static (nm + `probe-rs read`).
+#[no_mangle]
+#[used]
+static PIO_PROBE: [core::sync::atomic::AtomicU32; 2] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+fn pio_echo_test(p: &rp235x_pac::Peripherals) {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    // Bring PIO0 out of reset (privileged, pre-kernel).
+    p.RESETS.reset().modify(|_, w| w.pio0().clear_bit());
+    while p.RESETS.reset_done().read().pio0().bit_is_clear() {}
+
+    let pio = &p.PIO0;
+    // Ensure SM0 is stopped before we reconfigure it.
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+
+    // Echo program (hand-assembled; each is one 16-bit PIO instruction):
+    //   0: pull block     (100 00000 1 0 1 00000 = 0x80A0)  OSR <- TXF
+    //   1: mov isr, osr   (101 00000 110 00 111 = 0xA0C7)  ISR <- OSR
+    //   2: push block     (100 00000 0 0 1 00000 = 0x8020)  RXF <- ISR
+    // then wrap 2 -> 0.
+    const PROG: [u16; 3] = [0x80A0, 0xA0C7, 0x8020];
+    for (i, insn) in PROG.iter().enumerate() {
+        pio.instr_mem(i)
+            .write(|w| unsafe { w.bits(*insn as u32) });
+    }
+
+    let sm = pio.sm(0);
+    // Wrap after instr 2 back to instr 0; explicit pull/push (no autopull/push).
+    sm.sm_execctrl()
+        .modify(|_, w| unsafe { w.wrap_top().bits(2).wrap_bottom().bits(0) });
+    sm.sm_shiftctrl()
+        .modify(|_, w| w.autopull().clear_bit().autopush().clear_bit());
+    // Force PC to 0 (execute `jmp 0` = 0x0000 immediately).
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) });
+
+    // Enable SM0.
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+
+    // Push a test value; expect the same value back from the RX FIFO.
+    const TEST: u32 = 0xc0de_1234;
+    pio.txf(0).write(|w| unsafe { w.bits(TEST) });
+    let mut spins = 0u32;
+    while pio.fstat().read().rxempty().bits() & 1 != 0 {
+        spins += 1;
+        if spins > 1_000_000 {
+            PIO_PROBE[1].store(0xdead_0000, SeqCst); // timed out: RXF stayed empty
+            return;
+        }
+    }
+    PIO_PROBE[0].store(pio.rxf(0).read().bits(), SeqCst); // want 0xc0de_1234
+    PIO_PROBE[1].store(0x5010_0000 | (spins & 0xffff), SeqCst); // ran + spin count
+}
+// -----------------------------------------------------------------------------
+
 // --- Pico 2 W CYW43439 gSPI chip-detect (branch pico2w-wifi) ------------------
 //
 // First bring-up step: bit-bang the CYW43439 gSPI just enough to read its
@@ -316,6 +381,9 @@ fn main() -> ! {
     p.WATCHDOG
         .scratch2()
         .write(|w| unsafe { w.bits(id as u32) });
+
+    // P1: prove PIO works (echo through PIO0 SM0; result in PIO_PROBE).
+    pio_echo_test(&p);
 
     // Pico 2 W: probe the CYW43439 over bit-banged gSPI (results in CYW43_PROBE,
     // read over the debug probe). Harmless on a plain Pico 2 (GP23-29 float).
