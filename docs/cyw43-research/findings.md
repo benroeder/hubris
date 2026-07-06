@@ -667,3 +667,19 @@ dtim=1 (AP iface) -> bss=[AP=1,up=1]. bss-up ioctl returned status 0. NEXT phase
 (the real work): F2 DATA path (Ethernet over SDPCM ch 2), smoltcp, DHCP server,
 DNS hijack, HTTP captive portal, credential storage, STA join. See
 [[pico2w-iot-provisioning]].
+
+## 38. F2 DATA path RX proven -- decoded a real mDNS packet from the phone
+Added data_poll (Idol op) counting channel-2 (DATA) frames. When an iPhone joins
+the open SoftAP it associates fine and sends real IP traffic; captured + decoded
+a live frame: SDPCM(len 459, chan 2) + 2B pad + BDC(flags 0x20, data_offset 1) ->
+Ethernet (dst 01:00:5e:00:00:fb, type 0x0800) -> IPv4 (proto 17) -> UDP :5353
+mDNS to 224.0.0.251. KEY for smoltcp RX: the Ethernet frame starts at byte
+18 + BDC.data_offset*4 (= 22 here); BDC.data_offset is frame byte 17. "unable to
+join" on iOS = missing DHCP, NOT an association failure (the phone clearly assoc'd
++ sent traffic). AP SSID now hubris-<64-bit chip id> (= USB serial id), read from
+watchdog scratch1/2. GOTCHA: adding "watchdog" to cyw43 uses hit the RP2350 MPU
+per-task region cap (2 mem + 6 periph = 8 > 7) -> xtask dist PANICKED (dist.rs:689
+`7 - n` underflow) and silently kept flashing the STALE binary; fixed by moving the
+PIO2-out-of-reset to the privileged pre-kernel main and dropping "resets" from the
+task. Next: build the smoltcp phy::Device on send_frame/recv_frame (TX + this RX
+offset), then DHCP/DNS/HTTP.

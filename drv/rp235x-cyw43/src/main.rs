@@ -391,15 +391,6 @@ impl Cyw43 {
             me.ssid[7 + i] = HEX[((id >> (60 - 4 * i)) & 0xf) as usize];
         }
         me.ssid_len = 23;
-        // Mirror the computed SSID into DATA_FRAME[0..8] so it can be read back
-        // over the probe (verifies the board-id SSID; overwritten by data_poll).
-        for k in 0..8usize {
-            let w = (me.ssid[k * 4] as u32)
-                | (me.ssid[k * 4 + 1] as u32) << 8
-                | (me.ssid[k * 4 + 2] as u32) << 16
-                | (me.ssid[k * 4 + 3] as u32) << 24;
-            DATA_FRAME[k].store(w, SeqCst);
-        }
         // cyw43_spi_init: CLK + DIO output-low.
         me.set_pin(CLK, 0xE081);
         me.set_pin(CLK, 0xE000);
