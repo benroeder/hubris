@@ -488,3 +488,16 @@ Extended the boot probe with the embassy init prologue past bus config:
 The whole gSPI + backplane stack is now proven. NEXT: reset the WLAN ARM core,
 stream the 224 KB WIFI blob (from the memory-mapped auxflash region at 0x1c200000)
 into WLAN RAM via windowed backplane writes, bring the core out of reset, LED.
+
+## 26. FIRMWARE DOWNLOAD verified -- 231 KB streamed into WLAN RAM
+Streamed the WIFI blob (memory-mapped auxflash mirror, TLV-C body at 0x1c200048,
+231077 bytes -- note the TLV-C chunk header is 12 bytes: tag+len+header_cksum, so
+body is at tag+12 not tag+8) into WLAN-core RAM (backplane addr 0) via windowed
+backplane WRITE BURSTS: 64 words/burst, chunked to the 32 KiB window, cmd is
+WRITE|INC F1 with the 32-bit flag, len = n*4 bytes, then n data words (xfer waits
+on TX-FIFO not-full so bursts don't TXOVER). Verified at RAM[0]/[0x8000]/[0x38000]
+against the source -> 0x600D600D. Chip-reset prep first: disable WLAN + SOCSRAM
+cores, reset SOCSRAM up, 43439 socsram_init (bp_write32 socsram+0x10=3, +0x44=0).
+Backplane windowing works for LOW/MID/HIGH SBADDR alike (0x8000/0x10000/0x18000
+all verified). NEXT: write NVRAM + magic at top of RAM, reset_core_up(WLAN),
+check core is up, then drive the LED (WL_GPIO0) once firmware runs.

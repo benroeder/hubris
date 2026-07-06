@@ -398,6 +398,11 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
         for &word in out_words {
+            // Wait for TX-FIFO space so multi-word bursts don't overflow (TXOVER).
+            let mut s = 0u32;
+            while pio.fstat().read().txfull().bits() & 1 != 0 && s < 200_000 {
+                s += 1;
+            }
             pio.txf(0).write(|w| unsafe { w.bits(word) });
         }
         for slot in in_words.iter_mut() {
@@ -538,13 +543,34 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     reset_core_up(SOCSRAM_WRAP);
     bp_write32(SOCSRAM_BASE + 0x10, 3);
     bp_write32(SOCSRAM_BASE + 0x44, 0);
-    bp_write32(0, 0xDEAD_BEEF); // WLAN RAM (ATCM base = 0)
-    let ram_rb = bp_read32(0);
-    let core_up = bp_read8(WLAN_WRAP + RESETCTRL); // WLAN still in reset here (0x1)
-
-    CYW43_PIO[5].store(ram_rb, SeqCst); // want 0xDEADBEEF (WLAN RAM read/write)
-    CYW43_PIO[6].store(chip_id, SeqCst); // duplicate of [4] for alignment
-    CYW43_PIO[7].store(core_up, SeqCst); // WLAN RESETCTRL (0x1 = in reset, expected)
+    // FIRMWARE DOWNLOAD: stream the WIFI blob from the memory-mapped auxflash
+    // region (no-translate XIP mirror; the WIFI TLV-C body is at 0x1c200048,
+    // 231077 bytes) into WLAN-core RAM (ATCM base = 0) via windowed backplane
+    // bursts, chunked to <=255 words and never crossing the 32 KiB window.
+    let fw_src = 0x1c20_0048 as *const u32;
+    let fw_len: usize = 231077;
+    let fw_words = fw_len.div_ceil(4);
+    let mut burst = [0u32; 65];
+    let mut widx = 0usize;
+    while widx < fw_words {
+        let addr = (widx * 4) as u32;
+        let window_rem = (0x8000 - (addr & 0x7FFF)) as usize; // bytes to window end
+        let n = (window_rem / 4).min(64).min(fw_words - widx);
+        bp_set_window(addr);
+        burst[0] = cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, (n * 4) as u32);
+        for k in 0..n {
+            burst[1 + k] = unsafe { core::ptr::read_volatile(fw_src.add(widx + k)) };
+        }
+        xfer(&burst[..1 + n], &mut [0u32; 1]);
+        widx += n;
+    }
+    // Verify the download at three spread-out RAM offsets against the source.
+    let ok0 = bp_read32(0) == unsafe { core::ptr::read_volatile(fw_src) };
+    let ok1 = bp_read32(0x8000) == unsafe { core::ptr::read_volatile(fw_src.add(0x8000 / 4)) };
+    let ok2 = bp_read32(0x3_8000) == unsafe { core::ptr::read_volatile(fw_src.add(0x3_8000 / 4)) };
+    CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);
+    CYW43_PIO[6].store(bp_read32(0x8000), SeqCst); // want blob[0x8000]=0xab1e8818
+    CYW43_PIO[7].store(bp_read32(0x3_8000), SeqCst); // want blob[0x38000]=0x13e00161
 
     CYW43_PIO[0].store(chip, SeqCst); // want 0xFEEDBEAD (chip-detect)
     CYW43_PIO[1].store(rw, SeqCst); // want 0x12345678 (write path verified)
