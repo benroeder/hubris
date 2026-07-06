@@ -473,3 +473,18 @@ transaction and ran the embassy init prologue on the live Pico 2 W:
 So the full gSPI byte layer (read8/16/32, write, mode switch) is proven. NEXT:
 ALP/HT clock request + backplane (F1) window access, then stream the WIFI blob
 from the auxflash server into the WLAN core (firmware upload), then LED.
+
+## 25. Backplane (F1) access + ALP clock + chip-ID all verified
+Extended the boot probe with the embassy init prologue past bus config:
+- [2] ALP clock: write8(F1, CHIP_CLOCK_CSR 0x1000E, ALP_AVAIL_REQ 0x08); poll
+  read8 -> 0x48 (ALP_AVAIL 0x40 | ALP_AVAIL_REQ 0x08) on the 1st poll. So direct
+  F1 read/write works, and the ALP clock is up. (Set SPI_RESP_DELAY_F1 0x1d = 4
+  first so F1 reads return [padding, data] -- take the 2nd word.)
+- [4] Windowed backplane read: set the 32 KiB window to CHIPCOMMON_BASE
+  (0x18000000) via SBADDR HIGH/MID/LOW (F1 regs 0x1000C/B/A), read window offset 0
+  with the 32-bit flag (0x8000) -> 0x1545A9AF. Low 16 bits = 0xA9AF = 43439 =
+  the CYW43439 chip id. The windowed path (what firmware upload uses to reach the
+  WLAN-core RAM) works.
+The whole gSPI + backplane stack is now proven. NEXT: reset the WLAN ARM core,
+stream the 224 KB WIFI blob (from the memory-mapped auxflash region at 0x1c200000)
+into WLAN RAM via windowed backplane writes, bring the core out of reset, LED.

@@ -234,7 +234,11 @@ fn pio_output_test(p: &rp235x_pac::Peripherals) {
 // Result (raw wire response) in CYW43_PIO -- expect swap16(FEEDBEAD)=0xBEADFEED.
 #[no_mangle]
 #[used]
-static CYW43_PIO: [core::sync::atomic::AtomicU32; 4] = [
+static CYW43_PIO: [core::sync::atomic::AtomicU32; 8] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
@@ -361,8 +365,8 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     let _ = (cs_pre, cs_post); // (earlier CS-control diagnostic; unused now)
     // gSPI command word [wr|incr|func:2|addr:17|len:11]; the chip powers up in a
     // 16-bit-swapped mode, so pre-config accesses are swap16'd (rotate 16).
-    let cmd_word = |wr: bool, addr: u32| -> u32 {
-        ((wr as u32) << 31) | (1 << 30) | (addr << 11) | 4
+    let cmd_word = |wr: bool, func: u32, addr: u32, len: u32| -> u32 {
+        ((wr as u32) << 31) | (1 << 30) | (func << 28) | (addr << 11) | len
     };
     let swap16 = |x: u32| x.rotate_left(16);
     let set_pin = |pin: u32, insn: u16| {
@@ -371,9 +375,12 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn) });
     };
     // One gSPI transaction: clean the SM (clear FIFOs, restart, empty the OSR so
-    // the X/Y autopulls work), clock out `words` (x_bits+1 bits total), turn DIO
-    // around, clock in y_bits+1 bits, return the first response word.
-    let xfer = |x_bits: u32, y_bits: u32, words: &[u32]| -> u32 {
+    // the X/Y autopulls work), clock out `out_words` (32 bits each), turn DIO
+    // around, clock in `in_words` (32 bits each) filling the slice. The X (write)
+    // and Y (read) bit counts are derived from the slice lengths.
+    let xfer = |out_words: &[u32], in_words: &mut [u32]| {
+        let x_bits = out_words.len() as u32 * 32 - 1;
+        let y_bits = in_words.len() as u32 * 32 - 1;
         sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high (pulse)
         cortex_m::asm::delay(1500);
         sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
@@ -390,19 +397,20 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
-        for &word in words {
+        for &word in out_words {
             pio.txf(0).write(|w| unsafe { w.bits(word) });
         }
-        let mut spins = 0u32;
-        while pio.fstat().read().rxempty().bits() & 1 != 0 {
-            spins += 1;
-            if spins > 200_000 {
-                break;
+        for slot in in_words.iter_mut() {
+            let mut spins = 0u32;
+            while pio.fstat().read().rxempty().bits() & 1 != 0 {
+                spins += 1;
+                if spins > 200_000 {
+                    break;
+                }
             }
+            *slot = pio.rxf(0).read().bits();
         }
-        let r = pio.rxf(0).read().bits();
         sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
-        r
     };
     // CLK + DIO output-low once (cyw43_spi_init).
     set_pin(CLK, 0xE081);
@@ -412,30 +420,67 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
 
     // 1. Prime + chip-detect: read F0 TEST_RO (0x14) swap16'd until FEEDBEAD -- the
     //    first transaction after power-up is garbage, the chip locks on from 2nd.
-    let read_ro = swap16(cmd_word(false, 0x14));
+    let read_ro = swap16(cmd_word(false, 0, 0x14, 4));
     let mut pass = 0u32;
     let chip = loop {
-        let c = swap16(xfer(31, 63, &[read_ro]));
+        let mut b = [0u32; 1];
+        xfer(&[read_ro], &mut b);
         pass += 1;
-        if c == 0xFEED_BEAD || pass >= 32 {
-            break c;
+        let v = swap16(b[0]);
+        if v == 0xFEED_BEAD || pass >= 32 {
+            break v;
         }
     };
-    // 2. Prove the WRITE path: write F0 TEST_RW (0x18) = 0x12345678, read it back.
-    xfer(63, 31, &[swap16(cmd_word(true, 0x18)), swap16(0x1234_5678)]);
-    let rw = swap16(xfer(31, 63, &[swap16(cmd_word(false, 0x18))]));
+    // 2. WRITE path: write F0 TEST_RW (0x18) = 0x12345678, read it back.
+    xfer(
+        &[swap16(cmd_word(true, 0, 0x18, 4)), swap16(0x1234_5678)],
+        &mut [0u32; 1],
+    );
+    let mut b = [0u32; 1];
+    xfer(&[swap16(cmd_word(false, 0, 0x18, 4))], &mut b);
+    let rw = swap16(b[0]);
     // 3. Configure REG_BUS_CTRL (0x00): 32-bit words | high-speed | int-pol-high |
     //    wake | resp-delay 0x4 | status-enable | intr-with-status. After this the
     //    gSPI is 32-bit little-endian -- subsequent access is NON-swapped.
     let bus_ctrl: u32 = 0x1 | 0x10 | 0x20 | 0x80 | (0x4 << 8) | ((0x1 | 0x2) << 16);
-    xfer(63, 31, &[swap16(cmd_word(true, 0x00)), swap16(bus_ctrl)]);
-    // 4. Read TEST_RO again, now NON-swapped -> should be FEEDBEAD directly.
-    let ns = xfer(31, 63, &[cmd_word(false, 0x14)]);
+    xfer(
+        &[swap16(cmd_word(true, 0, 0x00, 4)), swap16(bus_ctrl)],
+        &mut [0u32; 1],
+    );
+    // 4. Set the F1 (backplane) read response delay to 4 bytes = 1 padding word,
+    //    so backplane reads return [padding, data] and we take the 2nd word.
+    xfer(&[cmd_word(true, 0, 0x1d, 1), 4], &mut [0u32; 1]); // write8 F0 SPI_RESP_DELAY_F1
+    // 5. Request the ALP clock on the backplane: write8 F1 CHIP_CLOCK_CSR (0x1000E)
+    //    = ALP_AVAIL_REQ (0x08), then poll read8 until ALP_AVAIL (0x40) is set.
+    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x08], &mut [0u32; 1]);
+    let mut aspin = 0u32;
+    let alp = loop {
+        let mut r = [0u32; 2]; // F1 read returns [padding, data]
+        xfer(&[cmd_word(false, 1, 0x1000E, 1)], &mut r);
+        aspin += 1;
+        // ALP_AVAIL (0x40) may land in any byte lane of the response word.
+        if (r[1] & 0x4040_4040) != 0 || aspin >= 2000 {
+            break r[1];
+        }
+    };
+
+    // 6. Windowed backplane read: point the 32 KiB window at CHIPCOMMON_BASE
+    //    (0x18000000) via the SBADDR registers, then read the chip-ID register
+    //    (window offset 0, with the 32-bit-access flag 0x8000). This exercises the
+    //    same windowed path the firmware upload uses to reach the WLAN core RAM.
+    let win: u32 = 0x1800_0000;
+    xfer(&[cmd_word(true, 1, 0x1000C, 1), (win >> 24) & 0xff], &mut [0u32; 1]); // HIGH
+    xfer(&[cmd_word(true, 1, 0x1000B, 1), (win >> 16) & 0xff], &mut [0u32; 1]); // MID
+    xfer(&[cmd_word(true, 1, 0x1000A, 1), (win >> 8) & 0xff], &mut [0u32; 1]); // LOW
+    let mut cid = [0u32; 2];
+    xfer(&[cmd_word(false, 1, 0x8000, 4)], &mut cid);
+    let chip_id = cid[1];
 
     CYW43_PIO[0].store(chip, SeqCst); // want 0xFEEDBEAD (chip-detect)
     CYW43_PIO[1].store(rw, SeqCst); // want 0x12345678 (write path verified)
-    CYW43_PIO[2].store(ns, SeqCst); // want 0xFEEDBEAD (bus configured, non-swapped)
-    CYW43_PIO[3].store(pass, SeqCst); // detect pass count
+    CYW43_PIO[2].store(alp, SeqCst); // CHIP_CLOCK_CSR (want ALP_AVAIL 0x40 in a lane)
+    CYW43_PIO[3].store(aspin, SeqCst); // ALP poll count
+    CYW43_PIO[4].store(chip_id, SeqCst); // CHIPCOMMON chip-id (low 16 bits = 0x4345)
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
 }
 // -----------------------------------------------------------------------------
