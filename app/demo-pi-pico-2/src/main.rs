@@ -216,10 +216,19 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             .gpio_ctrl()
             .modify(|_, w| unsafe { w.funcsel().bits(6) });
     }
-    // No pull on DIO (embassy uses Pull::None).
+    // Match pico-sdk pads: DIO pull-DOWN + schmitt/hysteresis, CLK pull-DOWN,
+    // WL_ON pull-UP.
+    p.PADS_BANK0.gpio(DIO as usize).modify(|_, w| {
+        w.pue().clear_bit();
+        w.pde().set_bit();
+        w.schmitt().set_bit()
+    });
     p.PADS_BANK0
-        .gpio(DIO as usize)
-        .modify(|_, w| w.pue().clear_bit().pde().clear_bit());
+        .gpio(CLK as usize)
+        .modify(|_, w| w.pue().clear_bit().pde().set_bit());
+    p.PADS_BANK0
+        .gpio(WL_ON as usize)
+        .modify(|_, w| w.pde().clear_bit().pue().set_bit());
 
     // Load the gSPI read program into PIO0 (overwriting the P1 echo program).
     // This is embassy's LOW-SPEED variant (< 75 MHz PIO clock), which is the one
@@ -269,10 +278,8 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // itself selected.
     cortex_m::asm::delay(150_000); // ~1 ms
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
-    // Both CLK (side-set) and DIO must be OUTPUTS driven LOW at idle -- if CLK
-    // idles high the device misreads the first clock edge after CS falls (embassy
-    // does set_pin_dirs(Out) + set_pins(Low) on both). `set pindirs`/`set pins`
-    // act on the SET pins, so point them at CLK, drive it output-low, then DIO.
+    // CLK (side-set) + DIO must be OUTPUTS driven LOW at idle. `set pindirs`/
+    // `set pins` act on the SET pins, so point them at CLK, then DIO.
     let set_pin = |pin: u32, insn: u16| {
         sm.sm_pinctrl()
             .modify(|_, w| unsafe { w.set_base().bits(pin as u8) });
@@ -282,12 +289,19 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     set_pin(CLK, 0xE000); // set pins, 0     (CLK low)
     set_pin(DIO, 0xE081); // set pindirs, 1  (DIO output)
     set_pin(DIO, 0xE000); // set pins, 0     (DIO low)
-    // DIAGNOSTIC: scan a WIDE 256-bit read window (8 words) for ANY response bit,
-    // in case the device answers later than the immediate turnaround. Y=255 (256
-    // bits) via the FIFO: push 255, pull to OSR, out to Y.
-    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0xE03F) }); // set x,31
+    // pico-sdk does this EVERY transaction and we were missing it: clear the
+    // FIFOs (toggle FJOIN_RX) and RESTART the SM (ISR/OSR/shift counters/PC) +
+    // the clock divider, so no stale shift state carries over from the P1 echo
+    // program or the previous poke sequence.
+    sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
+    sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
+    pio.ctrl()
+        .modify(|_, w| unsafe { w.sm_restart().bits(1).clkdiv_restart().bits(1) });
+    // Load X = 31 (32 write bits) and Y = 255 (256 read bits, scan) the pico-sdk
+    // way: put the count in the FIFO and `out x/y, 32` autopulls it.
+    pio.txf(0).write(|w| unsafe { w.bits(31) });
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
     pio.txf(0).write(|w| unsafe { w.bits(255) });
-    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x80A0) }); // pull -> OSR
     sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
     sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
