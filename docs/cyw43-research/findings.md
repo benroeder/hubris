@@ -98,3 +98,21 @@ core-1 AMP bring-up.
 
 Steps 1-3 are a bounded first arc; 4-5 are the big net-stack lift. A natural AMP
 tie-in later: run the net stack on core 1 (dedicated I/O core).
+
+## 8. Milestone 1 progress (bit-banged gSPI chip-detect)
+Board validated first: the RP2350 port runs unchanged on the Pico 2 W (USB shell
+works; note the demo "LED" GP25 is the CYW43 CS here, so no LED blink).
+
+First gSPI attempt is in the app's pre-kernel `main` (`cyw43_probe`, results in
+the probe-readable `CYW43_PROBE[4]` static @ nm; flash over SWD, read via
+`probe-rs read b32`). Pins GP23/24/25/29 as above; WL_ON high + 60 ms; bit-bang a
+32-bit command `[wr|incr|func|addr|len]` then clock in 32 bits.
+
+Observed (NOT yet 0xFEEDBEAD): read0(normal cmd)=0x06060606,
+read1(16-bit-word-swapped cmd)=0x7d5bfdda, read2(after bus-ctrl write)=0. So the
+**chip is powered and gSPI responds with real data** (not floating), but the
+framing is wrong. Tuning knobs to try next: command bit order (LSB vs MSB), the
+sample clock edge (rising vs falling / add a half-cycle), the F0 response-delay /
+leading clocks before data, and the exact 16-bit byte/word swap. Cross-check
+against the embassy `cyw43` `bus.rs` and iosoft PicoWi `spi` init once a working
+mirror URL is found (both repos moved paths).

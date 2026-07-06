@@ -75,6 +75,118 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
 /// protocol; 0 is free for the application.
 const BOOTSEL_MAGIC: u32 = 0xb007_5e1f;
 
+// --- Pico 2 W CYW43439 gSPI chip-detect (branch pico2w-wifi) ------------------
+//
+// First bring-up step: bit-bang the CYW43439 gSPI just enough to read its
+// read-only test register (F0 0x14 == 0xFEEDBEAD) and confirm the link. Pins
+// (Pico 2 W): GP23 = WL_REG_ON, GP24 = DIO (half-duplex), GP25 = CS, GP29 = CLK.
+// Results are stashed in these probe-readable statics (read with `nm` + probe);
+// several command-word orderings are tried because the gSPI byte/word swap
+// after power-up has to be pinned empirically.
+#[no_mangle]
+#[used]
+static CYW43_PROBE: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+const WL_ON: u32 = 23;
+const DIO: u32 = 24;
+const CS: u32 = 25;
+const CLK: u32 = 29;
+
+fn cyw43_probe(p: &rp235x_pac::Peripherals) {
+    use core::sync::atomic::Ordering::SeqCst;
+    let sio = &p.SIO;
+    let hi = |pin: u32| sio.gpio_out_set().write(|w| unsafe { w.bits(1 << pin) });
+    let lo = |pin: u32| sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << pin) });
+    let oe = |pin: u32, out: bool| {
+        if out {
+            sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << pin) });
+        } else {
+            sio.gpio_oe_clr().write(|w| unsafe { w.bits(1 << pin) });
+        }
+    };
+    let rd = || (sio.gpio_in().read().bits() >> DIO) & 1;
+    let d = || cortex_m::asm::delay(150); // ~1 us half-clock (slow, for bring-up)
+
+    // Configure the four CYW43 pins as SIO with input buffers enabled.
+    for pin in [WL_ON, DIO, CS, CLK] {
+        p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
+            w.od().clear_bit();
+            w.iso().clear_bit();
+            w.ie().set_bit()
+        });
+        p.IO_BANK0
+            .gpio(pin as usize)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(5) });
+    }
+    // Idle: CS high, CLK low, DIO low (mode-select gSPI), WL_ON low.
+    oe(CS, true);
+    oe(CLK, true);
+    oe(CLK, true);
+    hi(CS);
+    lo(CLK);
+    oe(DIO, true);
+    lo(DIO);
+    oe(WL_ON, true);
+    lo(WL_ON);
+    cortex_m::asm::delay(150_000_000 / 100); // ~10 ms with WL_ON low
+
+    // Power up the WLAN section, wait the datasheet's 50 ms out-of-reset.
+    hi(WL_ON);
+    cortex_m::asm::delay(150_000 * 60); // ~60 ms
+
+    // One gSPI transaction: clock out `cmd` (32b, MSB first) then, if reading,
+    // clock in 32 bits. Default (pre-high-speed) mode: sample on rising edge.
+    let xfer = |cmd: u32, read: bool| -> u32 {
+        lo(CS);
+        d();
+        oe(DIO, true);
+        for i in (0..32).rev() {
+            if (cmd >> i) & 1 == 1 {
+                hi(DIO);
+            } else {
+                lo(DIO);
+            }
+            d();
+            hi(CLK);
+            d();
+            lo(CLK);
+        }
+        let mut val = 0u32;
+        if read {
+            oe(DIO, false);
+            for _ in 0..32 {
+                hi(CLK);
+                d();
+                val = (val << 1) | rd();
+                lo(CLK);
+                d();
+            }
+        }
+        hi(CS);
+        d();
+        val
+    };
+
+    // Command word: [wr:1|incr:1|func:2|addr:17|len:11]. Read F0(0) 0x14, 4 B.
+    let cmd = (1u32 << 30) | (0x14 << 11) | 4; // 0x4000_A004
+    // Try: normal order, 16-bit-word-swapped order (the classic gSPI quirk),
+    // and after writing the bus-control reg to disable swap + high speed.
+    CYW43_PROBE[0].store(xfer(cmd, true), SeqCst);
+    CYW43_PROBE[1].store(xfer(cmd.rotate_left(16), true), SeqCst);
+    let ctrl = (1u32 << 31) | (0x00 << 11) | 4; // write F0 0x00, 4 B
+    xfer(ctrl, false);
+    xfer(0x0002_04b3u32.rotate_left(16), false); // bus-control value (swapped)
+    CYW43_PROBE[2].store(xfer(cmd, true), SeqCst);
+    CYW43_PROBE[3].store(0x600d_0000 | (rd() & 1), SeqCst); // sentinel: probe ran
+}
+// -----------------------------------------------------------------------------
+
 #[entry]
 fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
@@ -192,6 +304,10 @@ fn main() -> ! {
     p.WATCHDOG
         .scratch2()
         .write(|w| unsafe { w.bits(id as u32) });
+
+    // Pico 2 W: probe the CYW43439 over bit-banged gSPI (results in CYW43_PROBE,
+    // read over the debug probe). Harmless on a plain Pico 2 (GP23-29 float).
+    cyw43_probe(&p);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
