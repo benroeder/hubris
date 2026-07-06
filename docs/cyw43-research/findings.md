@@ -402,3 +402,32 @@ active() makes (instrument MicroPython, or read pico-sdk pio_sm_init +
 sm_set_pindirs_with_mask + the cyw43 read fn) and replicate that exact byte
 sequence. Everything else is proven: hardware works, chip-detect returns
 0xFEEDBEAD, clock + priming requirements known, config matched.
+
+## 22. Deep raw-poke debug: found a real Y-load bug + an unexplained gap
+Instrumented both the WORKING rp2.StateMachine and my raw machine.mem32 drive on
+the live chip and compared register-for-register:
+- State right BEFORE enable is BYTE-IDENTICAL (padoe=0x21000000 DIO+CLK out,
+  padout=0, fdebug=0, fstat=0x0f000f00, pinctrl=0x241c7718). Only PC differs
+  (rp2 program at offset 20 so PC=0x1a; mine at 0).
+- FOUND A REAL BUG: loading Y via `put(N); out(y,32)` (autopull) does NOT work
+  when exec'd via sm_instr while the SM is DISABLED -- autopull doesn't fire, so
+  Y got garbage (FLEVEL showed RX filled to 4 words + RXSTALL => Y was huge, not
+  63). Fix: `set y,31` (immediate) for a single-word read, or an explicit `pull`.
+- BUT even with Y fixed, my raw drive reads 0x0 while rp2 reads 0x03030303 (both
+  first-read garbage) -- the chip drives DIO differently for the two, despite
+  identical clocking/pins/config. Priming (loop) makes rp2 reach 0xBEADFEED;
+  my raw loop never does.
+
+Verdict: hand-rolled raw PIO register pokes do NOT reliably reproduce
+rp2.StateMachine's behavior on this chip, for reasons not visible in the register
+dump (likely exec/enable timing or an RP2350 PIO subtlety). RECOMMENDATION for
+the Hubris driver: do NOT hand-roll the SM drive with raw sm_instr pokes. Use a
+proper PIO StateMachine abstraction -- port `rp235x-hal`'s PIO module or the
+`pio`/`pio-proc` crates (which implement the pico-sdk pio_sm_init + set_pindirs +
+put/exec sequence correctly) -- then the proven recipe applies: 16 MHz clock,
+low-speed program, cmd 0xA004_4000, **loop read 0x14 until 0xBEADFEED** (priming).
+
+CONFIRMED FACTS (unchanged): CYW43 hardware works (MicroPython WiFi, 6 APs),
+chip-detect returns 0xFEEDBEAD via rp2, clock must be >=4 MHz PIO, and the read
+must be looped (first read = garbage). MicroPython flashes over SWD now too
+(scratchpad/mp.bin), so no BOOTSEL dance for future debugging.
