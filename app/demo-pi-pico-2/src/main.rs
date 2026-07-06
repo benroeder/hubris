@@ -690,48 +690,127 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // Frame = SdpcmHeader(12) + CdcHeader(16) + "gpioout\0"(8) + mask(4) + val(4)
     // = 44 bytes. wlan_write prepends the gSPI cmd (WRITE INC F2 addr0 len44).
     if (f2 & 0x20) != 0 {
-        // send_recv: write an already-built frame (out[0] = gSPI cmd), then read
-        // F2 frames until the CONTROL-channel (0) ioctl response, returning its
-        // CDC status (0 = accepted). Skips async events (channel 1).
-        let send_recv = |out: &[u32]| -> u32 {
-            xfer(out, &mut [0u32; 1]);
-            let mut fr = [0u32; 64];
-            let mut status = 0xEEEE_EEEEu32;
-            let mut tries = 0u32;
-            while tries < 800 {
-                tries += 1;
-                let mut r = [0u32; 1];
-                xfer(&[cmd_word(false, 0, 0x8, 4)], &mut r);
-                if (r[0] & 0x100) == 0 {
-                    cortex_m::asm::delay(20_000);
-                    continue;
-                }
-                let len = ((r[0] >> 9) & 0x7FF) as usize;
-                if len < 12 {
-                    break;
-                }
-                let w = len.div_ceil(4).min(64);
-                xfer(&[cmd_word(false, 2, 0, len as u32)], &mut fr[..w]);
-                if (fr[1] >> 8) & 0xFF == 0 {
-                    let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
-                    status = fr[hl + 3];
-                    break;
+        // SDPCM flow control (cyw43_ll.c:651,845): the host may send only while
+        // credit != tx_seq. tx_seq starts 0, credit starts 1; each received SDPCM
+        // header's bus_data_credit advances our credit (if the delta is <= 20).
+        // Every frame we send uses sequence = tx_seq, then tx_seq += 1.
+        let mut tx_seq = 0u8;
+        let mut credit = 1u8;
+        let mut fr = [0u32; 512];
+        // rx: read one F2 frame -> (got, channel, cdc_status, bus_credit, cdc_id).
+        // For a CONTROL frame the CDC id is in flags bits[31:16] (CDCF_IOC_ID).
+        let rx = |fr: &mut [u32; 512]| -> (bool, u32, u32, u32, u32) {
+            let mut rr = [0u32; 1];
+            xfer(&[cmd_word(false, 0, 0x8, 4)], &mut rr);
+            if rr[0] & 0x100 == 0 {
+                return (false, 0xFF, 0, 0xFF, 0);
+            }
+            let len = ((rr[0] >> 9) & 0x7FF) as usize;
+            if len < 12 {
+                return (false, 0xFF, 0, 0xFF, 0);
+            }
+            let w = len.div_ceil(4).min(512);
+            xfer(&[cmd_word(false, 2, 0, len as u32)], &mut fr[..w]);
+            let chan = (fr[1] >> 8) & 0xFF;
+            let bdc = (fr[2] >> 8) & 0xFF; // SdpcmHeader.bus_data_credit
+            let (status, id) = if chan == 0 {
+                let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+                (fr[hl + 3], (fr[hl + 2] >> 16) & 0xFFFF)
+            } else {
+                (0xEEEE_EEEE, 0)
+            };
+            (true, chan, status, bdc, id)
+        };
+        // do_ioctl: one flow-controlled SET_VAR/command. Wait for send credit,
+        // stamp the SDPCM sequence, write [gSPI cmd | SDPCM | CDC | payload],
+        // advance tx_seq, then read frames (each advances credit) until the
+        // CONTROL response, whose CDC status it returns.
+        let do_ioctl = |cmd: u32,
+                        id: u32,
+                        payload: &[u32],
+                        pbytes: usize,
+                        tx_seq: &mut u8,
+                        credit: &mut u8,
+                        fr: &mut [u32; 512]|
+         -> u32 {
+            let mut g = 0u32;
+            while *credit == *tx_seq && g < 8000 {
+                g += 1;
+                let (got, chan, _s, bdc, _i) = rx(fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(*credit as u32) & 0xFF) <= 20 {
+                        *credit = bdc as u8;
+                    }
+                } else {
+                    cortex_m::asm::delay(10_000);
                 }
             }
-            status
+            let mut b = [0u32; 264];
+            let total = 12 + 16 + pbytes;
+            b[0] = 0xE000_0000 | total as u32;
+            b[1] = (total as u32 & 0xFFFF) | (((!(total as u32)) & 0xFFFF) << 16);
+            b[2] = 0x0C00_0000 | *tx_seq as u32;
+            b[4] = cmd;
+            b[5] = pbytes as u32;
+            b[6] = 0x0000_0002 | (id << 16); // flags=Set, id
+            for (k, &w) in payload.iter().enumerate() {
+                b[8 + k] = w;
+            }
+            xfer(&b[..8 + pbytes.div_ceil(4)], &mut [0u32; 1]);
+            *tx_seq = tx_seq.wrapping_add(1);
+            // Read frames until the CONTROL response whose id matches our request.
+            let mut st = 0xEEEE_EEEEu32;
+            for _ in 0..3000u32 {
+                let (got, chan, status, bdc, rid) = rx(fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(*credit as u32) & 0xFF) <= 20 {
+                        *credit = bdc as u8;
+                    }
+                    if chan == 0 && rid == id {
+                        st = status;
+                        break;
+                    }
+                } else {
+                    cortex_m::asm::delay(20_000);
+                }
+            }
+            st
         };
-        // Send the LED-on gpioout ioctl and capture the CDC status. (Currently
-        // returns -23 = BCME_UNSUPPORTED: the firmware needs its CLM/country/up
-        // init before gpioout is available. That control-layer init is the next
-        // step -- see findings.md.)
-        let led: [u32; 12] = [
-            0xE000_0000 | 44, 0xFFD3_002C, 0x0C00_0000, 0x0000_0000, 0x0000_0107,
-            0x0000_0010, 0x0001_0002, 0x0000_0000, 0x6f69_6770, 0x0074_756f,
-            0x0000_0001, 0x0000_0001,
-        ];
-        let gpio_status = send_recv(&led);
-        CYW43_PIO[12].store(gpio_status, SeqCst); // gpioout CDC status
+        // The firmware init the LED (gpioout) needs: CLM -> country -> WLC_UP.
+        // 1. CLM: SET_VAR "clmload" + DownloadHeader + 984-byte WCLM blob.
+        let clm_src = 0x1c23_8700 as *const u32;
+        let mut clm_pl = [0u32; 251];
+        clm_pl[0] = 0x6c6d_6c63; // "clml"
+        clm_pl[1] = 0x0064_616f; // "oad\0"
+        clm_pl[2] = 0x0002_1006; // flag=BEGIN|END|HANDLER_VER, dload_type=CLM
+        clm_pl[3] = 984; // len
+        for k in 0..246 {
+            clm_pl[5 + k] = unsafe { core::ptr::read_volatile(clm_src.add(k)) };
+        }
+        let clm = do_ioctl(0x107, 1, &clm_pl, 8 + 12 + 984, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[11].store(clm, SeqCst);
+        // 1b. bus:txglom=0 and apsta=1 (create the STA interface) -- embassy sets
+        //     these before country; gpioout needs the interface to exist.
+        let txglom = [0x3a737562, 0x6c67_7874, 0x0000_6d6f, 0x0000_0000]; // "bus:txglom\0"+le32(0)
+        do_ioctl(0x107, 5, &txglom, 11 + 4, &mut tx_seq, &mut credit, &mut fr);
+        let apsta = [0x74737061, 0x0001_0061, 0x0000_0000]; // "apsta\0" + le32(1)
+        do_ioctl(0x107, 6, &apsta, 6 + 4, &mut tx_seq, &mut credit, &mut fr);
+        // 2. country: SET_VAR "country" + CountryInfo{abbrev "XX", rev -1, code "XX"}.
+        let country = [0x6e75_6f63, 0x0079_7274, 0x0000_5858, 0xFFFF_FFFF, 0x0000_5858];
+        let cc = do_ioctl(0x107, 2, &country, 8 + 12, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[13].store(cc, SeqCst);
+        cortex_m::asm::delay(6_000_000); // set-country takes ~32 ms
+        // 3. WLC_UP (bring the interface up); no payload.
+        let up = do_ioctl(2, 3, &[], 0, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[14].store(up, SeqCst);
+        // 4. gpioout: SET_VAR "gpioout" mask=1<<0 value=1<<0 -> LED ON.
+        let gpioout = [0x6f69_6770, 0x0074_756f, 0x0000_0001, 0x0000_0001];
+        let g = do_ioctl(0x107, 4, &gpioout, 8 + 8, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[12].store(g, SeqCst); // 0 = LED should be ON (currently -23)
         CYW43_PIO[15].store(0xDEAD_5EED, SeqCst);
+        loop {
+            cortex_m::asm::nop();
+        }
     }
 
     CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);

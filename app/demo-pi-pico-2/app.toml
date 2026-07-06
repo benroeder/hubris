@@ -7,8 +7,8 @@ stacksize = 944
 
 [kernel]
 name = "demo-pi-pico-2"
-requires = {flash = 32768, ram = 4096}
-stacksize = 640
+requires = {flash = 32768, ram = 16384}
+stacksize = 8192
 
 [tasks.jefe]
 name = "task-jefe"

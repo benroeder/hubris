@@ -580,3 +580,21 @@ write/response -- large-frame F2 transfer over the hand-rolled PIO needs more
 work (the small ioctl round-trips fine). NEXT: debug the large F2 transfer (or
 chunk it), finish the CLM+country+up init -> LED, then scan/join. This whole
 control layer belongs in the drv/rp235x-cyw43 task, not the pre-kernel probe.
+
+## 32. Proper SDPCM flow control done; CLM/country/up accepted; gpioout = -23 (WIP)
+Implemented full SDPCM flow control (cyw43_ll.c): tx_seq + credit tracking (may
+send only while credit != tx_seq; each rx SDPCM header's bus_data_credit advances
+credit if delta<=20), response demux by CDC id (flags[31:16]). Frame layout
+VERIFIED byte-for-byte vs the C driver (sdpcm_header_t + ioctl_header_t; flags =
+(id<<16)|SDPCM_SET(2)|(iface<<12)). Ran the real init: CLM (SET_VAR clmload) ->
+bus:txglom=0 -> apsta=1 -> country (CountryInfo XX/-1/XX) -> WLC_UP(2). ALL return
+CDC status 0 (accepted). BUT SET_VAR "gpioout" (mask/value = 1<<0, the WL_GPIO0
+LED, exactly as cyw43_ll_gpio_set) returns CDC status -23 = BCME_UNSUPPORTED,
+regardless of init. So the frame/flow are correct but this firmware rejects
+gpioout. Hypothesis: the embassy support/cyw43-firmware/43439A0.bin variant lacks
+GPIO support, while MicroPython's firmware (WiFi + LED both work on this same
+board) has it -- OR the Pico 2 W LED uses a different mechanism. GET "ver" to
+confirm the fw version didn't return (id-match issue). NEXT: confirm fw version /
+diff MicroPython's firmware; or pivot to scan/join (same working ioctl path, no
+gpioout needed) to prove Wi-Fi. Everything up to and including arbitrary ioctls
+works; only gpioout is blocked.
