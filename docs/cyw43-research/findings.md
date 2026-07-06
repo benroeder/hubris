@@ -259,3 +259,26 @@ GP23=WL_ON, GP24=DIO, GP25=CS, GP29=CLK -- all correct.
   impossible -- which points at the board itself or the specific unit).
 The PIO gSPI PHY + init are correct and will read FEEDBEAD once CS reaches the
 chip low. Instrumentation left in cyw43_pio_detect (CYW43_PIO[0..3]).
+
+## 16. CORRECTION: CS is NOT stuck -- it has RC settling; chip still silent
+The earlier "CS stuck high" (sec 14-15) was a MEASUREMENT ARTIFACT: I read CS
+immediately after driving it low. A clean toggle test with a settling delay
+(rd_cs: drive low, wait ~100us, read) shows CS is fully controllable both before
+AND after power-up AND through the whole PIO/SM setup (all reads = 0). GP25 (CS)
+has an RC on the Pico 2 W (the VSYS-ADC gating net), so it needs ~us to settle
+low. Added a 1 ms settle after CS-low before clocking.
+
+Even so, the device is still silent: OR of a 256-bit read = 0 with NO pull on DIO
+(embassy Pull::None) at 500 kHz and 100 kHz. A clean all-0 with no pull means the
+CYW43 actively holds DIO low (it is alive + powered), but never returns FEEDBEAD.
+
+Verified correct on the RP2350 side (registers): mode-select, low-speed program,
+CLK+DIO output & idle-low, input_sync_bypass, funcsel 6 = PIO0, dbg_padoe DIO+CLK
+outputs, turnaround, CS controllable + settled, clock 100k-500k. Everything the
+docs specify is applied and confirmed by register readback.
+
+=> Exhausted software/register debugging. The definitive next step is a LOGIC
+ANALYZER on GP24 (DIO) / GP25 (CS) / GP29 (CLK): confirm on the WIRE that CS is
+low, CLK toggles cleanly, the 32-bit command (0xA004_4000 MSB-first) is correct,
+and whether the device drives a response. Without wire visibility this is the
+limit of no-guess debugging. The PIO gSPI PHY code is correct and ready.

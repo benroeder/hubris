@@ -184,6 +184,17 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             .modify(|_, w| unsafe { w.funcsel().bits(5) }); // SIO
         sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << pin) });
     }
+    // Localize when CS control is lost: read CS-low BEFORE and AFTER powering the
+    // CYW43 (WL_ON high). rd_cs drives GP25 low, settles, reads it back.
+    let rd_cs = || {
+        sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) });
+        cortex_m::asm::delay(15_000);
+        let v = (sio.gpio_in().read().bits() >> CS) & 1;
+        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
+        v
+    };
+    let cs_pre = rd_cs(); // before power-up: expect 0 (controllable)
+
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS idle high
     sio.gpio_out_clr()
         .write(|w| unsafe { w.bits((1 << WL_ON) | (1 << DIO) | (1 << CLK)) });
@@ -192,6 +203,8 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     cortex_m::asm::delay(150_000 * 20);
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << WL_ON) });
     cortex_m::asm::delay(150_000 * 250);
+
+    let cs_post = rd_cs(); // after power-up: expect 0
 
     // gSPI mode latched -- release the SIO output drivers on DIO + CLK and route
     // them to PIO0 (funcsel 6) so only the PIO drives them.
@@ -203,11 +216,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             .gpio_ctrl()
             .modify(|_, w| unsafe { w.funcsel().bits(6) });
     }
-    // DIAGNOSTIC: pull DIO up. If the device never drives it, the read is all-1s
-    // (floating, pulled up); if the device drives it low, we still see its data.
+    // No pull on DIO (embassy uses Pull::None).
     p.PADS_BANK0
         .gpio(DIO as usize)
-        .modify(|_, w| w.pue().set_bit().pde().clear_bit());
+        .modify(|_, w| w.pue().clear_bit().pde().clear_bit());
 
     // Load the gSPI read program into PIO0 (overwriting the P1 echo program).
     // This is embassy's LOW-SPEED variant (< 75 MHz PIO clock), which is the one
@@ -225,9 +237,9 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     pio.input_sync_bypass()
         .write(|w| unsafe { w.bits(1 << DIO) });
     let sm = pio.sm(0);
-    // ~1 MHz SDIO clock: PIO clk = 150 MHz / 75 = 2 MHz, /2 per bit = 1 MHz.
+    // ~500 kHz SDIO for bring-up: PIO clk = 150 MHz / 150 = 1 MHz, /2 = 500 kHz.
     sm.sm_clkdiv()
-        .write(|w| unsafe { w.int().bits(75).frac().bits(0) });
+        .write(|w| unsafe { w.int().bits(150).frac().bits(0) });
     // MSB-first (shift left), autopull/autopush at 32 bits (thresh 0 == 32).
     sm.sm_shiftctrl().modify(|_, w| unsafe {
         w.out_shiftdir().clear_bit();
@@ -252,10 +264,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // One 32-bit read of F0 0x14. cmd = swap16(cmd_word(READ,INC,0,0x14,4)).
     let cmd = ((1u32 << 30) | (0x14 << 11) | 4).rotate_left(16); // 0xA004_4000
     sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
-    // DIAGNOSTIC: actual pin levels now -- expect WL_ON(23)=1, CS(25)=0. If
-    // CS(25) reads 1 it never went low, so GP29 stays VSYS/ADC (not CLK) and the
-    // device sees no command. (bits: WL_ON 0x800000, DIO 0x1000000, CS 0x2000000)
-    let pins_lvl = sio.gpio_in().read().bits();
+    // CS (GP25) has an RC on the Pico 2 W (the VSYS-ADC gating network), so it
+    // takes time to settle low. Wait before clocking or the chip never sees
+    // itself selected.
+    cortex_m::asm::delay(150_000); // ~1 ms
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
     // Both CLK (side-set) and DIO must be OUTPUTS driven LOW at idle -- if CLK
     // idles high the device misreads the first clock edge after CS falls (embassy
@@ -300,14 +312,13 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         }
         any |= word;
     }
-    // [0] = GP25(CS) IO ctrl (funcsel = low 5 bits, s/b 5 = SIO), [1] = pins,
-    // [2] = GP25 PAD register (od bit7, ie bit6, iso bit8), [3] = SIO OUT.
-    let _ = any;
-    let _ = first;
-    CYW43_PIO[0].store(p.IO_BANK0.gpio(CS as usize).gpio_ctrl().read().bits(), SeqCst);
-    CYW43_PIO[1].store(pins_lvl, SeqCst);
-    CYW43_PIO[2].store(p.PADS_BANK0.gpio(CS as usize).read().bits(), SeqCst);
-    CYW43_PIO[3].store(sio.gpio_out().read().bits(), SeqCst);
+    // [0] = first word (want 0xBEADFEED = swap16(FEEDBEAD)), [1] = OR of the 256
+    // bits (non-zero => the device responded somewhere), [2..3] the pre-power /
+    // post-power CS-control check.
+    CYW43_PIO[0].store(first, SeqCst);
+    CYW43_PIO[1].store(any, SeqCst);
+    CYW43_PIO[2].store(cs_pre, SeqCst);
+    CYW43_PIO[3].store(cs_post, SeqCst);
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
 }
 // -----------------------------------------------------------------------------
