@@ -196,3 +196,22 @@ Build a first RP2350 PIO capability + a gSPI PHY state machine:
   then streams the WIFI blob (from the auxflash server) to the chip.
 The firmware-storage half (auxflash) is already done + verified; the PHY is the
 remaining prerequisite for chip-detect and everything after.
+
+## 13. P1 done, P2 PHY runs (read-window alignment WIP)
+P1 (PIO plumbing proof): VERIFIED. `pio_echo_test` loads a hand-assembled
+3-instruction echo program (pull/mov/push) into PIO0 SM0; PIO_PROBE[0] read back
+0xc0de1234 exactly. Proves reset, instruction-memory load, SM config, FIFO
+access -- AND that our hand-assembled PIO encoding is correct.
+
+P2 (gSPI PHY): the 7-instruction gSPI program runs deterministically (~1 MHz,
+clkdiv 75). Drive: poke X=31/Y=31/pindirs via sm_instr, push swapped cmd
+0xA004_4000, poll RXF. mode-select fix landed -- DIO must be SIO-LOW while WL_ON
+rises to latch gSPI (not SDIO) mode, THEN hand DIO/CLK to PIO funcsel 6; this
+changed the read from 0xffffffff (SDIO/floating) to 0x00000000. Still not
+0xBEADFEED: the read window is misaligned (reading a DIO-low span). This is
+read-phase timing: candidates are the sample edge vs the 2-cycle PIO input
+synchronizer (embassy `in side 1` samples at the rising edge -- may need a
+half-cycle offset), and the turnaround length after `set pindirs, 0`. NEXT
+diagnostic: capture a longer bitstream (2+ words) to locate the response, then
+sweep read-edge/turnaround. Hand-assembled gSPI program:
+[0x6001,0x1020,0xE080,0xB042,0xA042,0x4801,0x0045], wrap 6->0.

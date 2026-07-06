@@ -140,45 +140,36 @@ fn pio_echo_test(p: &rp235x_pac::Peripherals) {
 }
 // -----------------------------------------------------------------------------
 
-// --- Pico 2 W CYW43439 gSPI chip-detect (branch pico2w-wifi) ------------------
+// Pico 2 W CYW43439 gSPI pins (internal RP2350 GPIOs).
+const WL_ON: u32 = 23; // WL_REG_ON (power/reset)
+const DIO: u32 = 24; // gSPI DIO (half-duplex data)
+const CS: u32 = 25; // gSPI CS
+const CLK: u32 = 29; // gSPI CLK
+
+// --- P2/P3: CYW43439 gSPI chip-detect over PIO --------------------------------
 //
-// First bring-up step: bit-bang the CYW43439 gSPI just enough to read its
-// read-only test register (F0 0x14 == 0xFEEDBEAD) and confirm the link. Pins
-// (Pico 2 W): GP23 = WL_REG_ON, GP24 = DIO (half-duplex), GP25 = CS, GP29 = CLK.
-// Results are stashed in these probe-readable statics (read with `nm` + probe);
-// several command-word orderings are tried because the gSPI byte/word swap
-// after power-up has to be pinned empirically.
+// The bit-bang could not clock the half-duplex gSPI; this drives it with a PIO
+// state machine (deterministic timing), the approach embassy/pico-sdk use. A
+// 7-instruction program (hand-assembled) clocks out a 32-bit command MSB-first
+// on DIO (GP24), flips the pin to input, and clocks in the 32-bit response;
+// CLK is side-set on GP29, CS (GP25) + WL_ON (GP23) are CPU-driven (SIO).
+// Result (raw wire response) in CYW43_PIO -- expect swap16(FEEDBEAD)=0xBEADFEED.
 #[no_mangle]
 #[used]
-static CYW43_PROBE: [core::sync::atomic::AtomicU32; 4] = [
-    core::sync::atomic::AtomicU32::new(0),
-    core::sync::atomic::AtomicU32::new(0),
+static CYW43_PIO: [core::sync::atomic::AtomicU32; 2] = [
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
 ];
 
-const WL_ON: u32 = 23;
-const DIO: u32 = 24;
-const CS: u32 = 25;
-const CLK: u32 = 29;
-
-fn cyw43_probe(p: &rp235x_pac::Peripherals) {
+fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     use core::sync::atomic::Ordering::SeqCst;
     let sio = &p.SIO;
-    let hi = |pin: u32| sio.gpio_out_set().write(|w| unsafe { w.bits(1 << pin) });
-    let lo = |pin: u32| sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << pin) });
-    let oe = |pin: u32, out: bool| {
-        if out {
-            sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << pin) });
-        } else {
-            sio.gpio_oe_clr().write(|w| unsafe { w.bits(1 << pin) });
-        }
-    };
-    let rd = || (sio.gpio_in().read().bits() >> DIO) & 1;
-    let d = || cortex_m::asm::delay(150); // ~1 us half-clock (slow, for bring-up)
 
-    // Configure the four CYW43 pins as SIO with input buffers enabled.
-    for pin in [WL_ON, DIO, CS, CLK] {
+    // Start ALL four pins as SIO. Crucially DIO (GP24) must be driven LOW while
+    // WL_ON rises -- that is the gSPI (vs SDIO) mode-select, latched at power-up.
+    // We only hand DIO + CLK to the PIO AFTER the chip is powered and has latched
+    // gSPI mode.
+    for pin in [WL_ON, CS, DIO, CLK] {
         p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
             w.od().clear_bit();
             w.iso().clear_bit();
@@ -187,82 +178,88 @@ fn cyw43_probe(p: &rp235x_pac::Peripherals) {
         p.IO_BANK0
             .gpio(pin as usize)
             .gpio_ctrl()
-            .modify(|_, w| unsafe { w.funcsel().bits(5) });
+            .modify(|_, w| unsafe { w.funcsel().bits(5) }); // SIO
+        sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << pin) });
     }
-    // Idle: CS high, CLK low, DIO low (mode-select gSPI), WL_ON low.
-    oe(CS, true);
-    oe(CLK, true);
-    oe(CLK, true);
-    hi(CS);
-    lo(CLK);
-    oe(DIO, true);
-    lo(DIO);
-    oe(WL_ON, true);
-    lo(WL_ON);
-    cortex_m::asm::delay(150_000 * 20); // 20 ms with WL_ON low (embassy timing)
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS idle high
+    sio.gpio_out_clr()
+        .write(|w| unsafe { w.bits((1 << WL_ON) | (1 << DIO) | (1 << CLK)) });
 
-    // Power up the WLAN section. embassy waits 250 ms out-of-reset (not the
-    // datasheet's 50 ms) -- the chip is not ready before then.
-    hi(WL_ON);
-    cortex_m::asm::delay(150_000 * 250); // 250 ms
+    // Power up: WL_ON low 20 ms (DIO held low = gSPI mode), high 250 ms.
+    cortex_m::asm::delay(150_000 * 20);
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << WL_ON) });
+    cortex_m::asm::delay(150_000 * 250);
 
-    // Parameterized gSPI read of F0 0x14: clock out the command (32b MSB-first;
-    // `swap` = send the two 16-bit halves swapped, the classic power-up quirk),
-    // insert `dummy` turnaround clocks, then clock in 32 bits sampling on the
-    // rising edge (`fall`=false) or after the falling edge (`fall`=true). We
-    // sweep these because the exact power-up framing has to be pinned on-target.
-    let cmd = (1u32 << 30) | (0x14 << 11) | 4; // read F0 0x14, 4 B = 0x4000_A004
-    let read14 = |swap: bool, fall: bool, dummy: u32| -> u32 {
-        let word = if swap { cmd.rotate_left(16) } else { cmd };
-        lo(CS);
-        d();
-        oe(DIO, true);
-        for i in (0..32).rev() {
-            if (word >> i) & 1 == 1 {
-                hi(DIO);
-            } else {
-                lo(DIO);
-            }
-            d();
-            hi(CLK);
-            d();
-            lo(CLK);
-        }
-        oe(DIO, false);
-        for _ in 0..dummy {
-            hi(CLK);
-            d();
-            lo(CLK);
-            d();
-        }
-        let mut val = 0u32;
-        for _ in 0..32 {
-            if fall {
-                hi(CLK);
-                d();
-                lo(CLK);
-                d();
-                val = (val << 1) | rd();
-            } else {
-                hi(CLK);
-                d();
-                val = (val << 1) | rd();
-                lo(CLK);
-                d();
-            }
-        }
-        hi(CS);
-        d();
-        val
-    };
+    // gSPI mode latched -- now route DIO + CLK to PIO0 (funcsel 6).
+    for pin in [DIO, CLK] {
+        p.IO_BANK0
+            .gpio(pin as usize)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(6) });
+    }
 
-    // Matrix: want one of these to read 0xFEEDBEAD (or a clean swap of it).
-    CYW43_PROBE[0].store(read14(true, false, 0), SeqCst); // swap, rising
-    CYW43_PROBE[1].store(read14(true, true, 0), SeqCst); //  swap, falling
-    CYW43_PROBE[2].store(read14(true, false, 1), SeqCst); // swap, rising, +1 dummy
-    CYW43_PROBE[3].store(read14(false, true, 0), SeqCst); // no-swap, falling
+    // Load the gSPI read program into PIO0 (overwriting the P1 echo program).
+    // .side_set 1 (CLK). 0:out pins,1 side0  1:jmp x-- 0 side1  2:set pindirs,0
+    // side0  3:nop side1  4:nop side0  5:in pins,1 side1  6:jmp y-- 5 side0.
+    const GSPI: [u16; 7] =
+        [0x6001, 0x1020, 0xE080, 0xB042, 0xA042, 0x4801, 0x0045];
+    let pio = &p.PIO0;
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    for (i, insn) in GSPI.iter().enumerate() {
+        pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
+    }
+    let sm = pio.sm(0);
+    // ~1 MHz SDIO clock: PIO clk = 150 MHz / 75 = 2 MHz, /2 per bit = 1 MHz.
+    sm.sm_clkdiv()
+        .write(|w| unsafe { w.int().bits(75).frac().bits(0) });
+    // MSB-first (shift left), autopull/autopush at 32 bits (thresh 0 == 32).
+    sm.sm_shiftctrl().modify(|_, w| unsafe {
+        w.out_shiftdir().clear_bit();
+        w.in_shiftdir().clear_bit();
+        w.autopull().set_bit();
+        w.autopush().set_bit();
+        w.pull_thresh().bits(0);
+        w.push_thresh().bits(0)
+    });
+    sm.sm_pinctrl().modify(|_, w| unsafe {
+        w.sideset_count().bits(1);
+        w.sideset_base().bits(CLK as u8);
+        w.out_base().bits(DIO as u8);
+        w.out_count().bits(1);
+        w.set_base().bits(DIO as u8);
+        w.set_count().bits(1);
+        w.in_base().bits(DIO as u8)
+    });
+    sm.sm_execctrl()
+        .modify(|_, w| unsafe { w.wrap_top().bits(6).wrap_bottom().bits(0) });
+
+    // One 32-bit read of F0 0x14. cmd = swap16(cmd_word(READ,INC,0,0x14,4)).
+    let cmd = ((1u32 << 30) | (0x14 << 11) | 4).rotate_left(16); // 0xA004_4000
+    sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    // Poke X=31 (32 write bits), Y=31 (32 read bits), DIO->output, PC=0 via
+    // sm_instr (executes immediately): set x,31 / set y,31 / set pindirs,1 / jmp 0.
+    for insn in [0xE03Fu32, 0xE05F, 0xE081, 0x0000] {
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn as u16) });
+    }
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+    pio.txf(0).write(|w| unsafe { w.bits(cmd) });
+
+    let mut spins = 0u32;
+    while pio.fstat().read().rxempty().bits() & 1 != 0 {
+        spins += 1;
+        if spins > 5_000_000 {
+            CYW43_PIO[1].store(0xdead_0000, SeqCst); // no response clocked in
+            sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
+            return;
+        }
+    }
+    CYW43_PIO[0].store(pio.rxf(0).read().bits(), SeqCst); // want 0xBEADFEED
+    CYW43_PIO[1].store(0x5010_0000 | (spins & 0xffff), SeqCst);
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
 }
 // -----------------------------------------------------------------------------
+
 
 #[entry]
 fn main() -> ! {
@@ -385,9 +382,9 @@ fn main() -> ! {
     // P1: prove PIO works (echo through PIO0 SM0; result in PIO_PROBE).
     pio_echo_test(&p);
 
-    // Pico 2 W: probe the CYW43439 over bit-banged gSPI (results in CYW43_PROBE,
-    // read over the debug probe). Harmless on a plain Pico 2 (GP23-29 float).
-    cyw43_probe(&p);
+    // P2/P3: chip-detect the CYW43439 over PIO-driven gSPI (result in CYW43_PIO,
+    // want 0xBEADFEED). Harmless on a plain Pico 2 (GP23-29 float).
+    cyw43_pio_detect(&p);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
