@@ -116,3 +116,21 @@ sample clock edge (rising vs falling / add a half-cycle), the F0 response-delay 
 leading clocks before data, and the exact 16-bit byte/word swap. Cross-check
 against the embassy `cyw43` `bus.rs` and iosoft PicoWi `spi` init once a working
 mirror URL is found (both repos moved paths).
+
+## 9. Flash / SRAM budget (reserved region for the blob)
+RAM-boot copies the whole image into SRAM (520 KiB). The ~224 KiB CYW43 firmware
+blob must stay in FLASH and be STREAMED (never `include_bytes!`d, or it eats
+224 KiB of SRAM). Reserved in `chips/rp235x/memory-pico-2.toml`:
+
+```
+[[cyw43_fw]]  address = 0x1c20_0000  size = 0x4_0000  read = true   # 256 KiB
+```
+= physical flash offset 0x20_0000 (2 MiB), read via the no-translate XIP mirror
+(0x1c00_0000 base). Grant to the cyw43 driver with `extern-regions=["cyw43_fw"]`;
+it reads the blob there and streams it over gSPI. Flash it separately:
+`picotool load 43439A0-plus-clm.bin -t bin -o 0x1020_0000`.
+
+Flash map: image (RAM-boot storage) 0x1000_0000.. (<=256 KiB, or A/B <=512 KiB);
+blob 0x1020_0000..0x1024_0000; 4 MiB total -> trivially fits. SRAM budget without
+the blob: ~180-210 KiB code + ~60-90 KiB data/smoltcp buffers ~= 250-300 KiB of
+520 KiB -> ~200 KiB headroom.
