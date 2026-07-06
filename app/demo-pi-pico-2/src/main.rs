@@ -776,6 +776,61 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             }
             st
         };
+        // Byte-based ioctl: payload as bytes, packed little-endian into words (no
+        // manual u32 byte-order mistakes). kind 2=SET, 0=GET. cdc_len = the CDC
+        // length (payload len for SET; name+response size for GET). Leaves the
+        // matched CONTROL response frame in fr; returns the CDC status.
+        let do_ioctl_b = |kind: u32,
+                          cmd: u32,
+                          id: u32,
+                          payload: &[u8],
+                          cdc_len: usize,
+                          tx_seq: &mut u8,
+                          credit: &mut u8,
+                          fr: &mut [u32; 512]|
+         -> u32 {
+            let mut g = 0u32;
+            while *credit == *tx_seq && g < 8000 {
+                g += 1;
+                let (got, chan, _s, bdc, _i) = rx(fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(*credit as u32) & 0xFF) <= 20 {
+                        *credit = bdc as u8;
+                    }
+                } else {
+                    cortex_m::asm::delay(10_000);
+                }
+            }
+            let mut b = [0u32; 264];
+            let total = 12 + 16 + cdc_len;
+            b[0] = 0xE000_0000 | total as u32;
+            b[1] = (total as u32 & 0xFFFF) | (((!(total as u32)) & 0xFFFF) << 16);
+            b[2] = 0x0C00_0000 | *tx_seq as u32;
+            b[4] = cmd;
+            b[5] = cdc_len as u32;
+            b[6] = kind | (id << 16);
+            for (j, &byte) in payload.iter().enumerate() {
+                b[8 + j / 4] |= (byte as u32) << (8 * (j % 4));
+            }
+            xfer(&b[..8 + cdc_len.div_ceil(4)], &mut [0u32; 1]);
+            *tx_seq = tx_seq.wrapping_add(1);
+            let mut st = 0xEEEE_EEEEu32;
+            for _ in 0..3000u32 {
+                let (got, chan, status, bdc, rid) = rx(fr);
+                if got {
+                    if chan < 3 && (bdc.wrapping_sub(*credit as u32) & 0xFF) <= 20 {
+                        *credit = bdc as u8;
+                    }
+                    if chan == 0 && rid == id {
+                        st = status;
+                        break;
+                    }
+                } else {
+                    cortex_m::asm::delay(20_000);
+                }
+            }
+            st
+        };
         // The firmware init the LED (gpioout) needs: CLM -> country -> WLC_UP.
         // 1. CLM: SET_VAR "clmload" + DownloadHeader + 984-byte WCLM blob.
         let clm_src = 0x1c23_8700 as *const u32;
@@ -842,9 +897,24 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         do_ioctl(0x107, 5, &txglom, 11 + 4, &mut tx_seq, &mut credit, &mut fr);
         let apsta = [0x74737061, 0x0001_0061, 0x0000_0000]; // "apsta\0" + le32(1)
         do_ioctl(0x107, 6, &apsta, 6 + 4, &mut tx_seq, &mut credit, &mut fr);
-        // cur_etheraddr (MAC from nvram 00:A0:50:b5:59:5e) -- bus_init's last step.
-        let mac = [0x5f72_7563, 0x6568_7465, 0x6464_6172, 0xa000_0072, 0x5e59_b550];
-        do_ioctl(0x107, 7, &mac, 14 + 6, &mut tx_seq, &mut credit, &mut fr);
+        // GET the chip's MAC ("cur_etheraddr") -- validates the byte-based ioctl
+        // helper and reads a real chip value. Response = 6-byte MAC at payload 0.
+        let mac_stat = do_ioctl_b(
+            0,
+            0x106,
+            7,
+            b"cur_etheraddr\0",
+            14 + 6,
+            &mut tx_seq,
+            &mut credit,
+            &mut fr,
+        );
+        {
+            let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+            CYW43_PIO[5].store(mac_stat, SeqCst); // GET status (0 = ok)
+            CYW43_PIO[6].store(fr[hl + 4], SeqCst); // MAC bytes 0-3
+            CYW43_PIO[7].store(fr[hl + 5], SeqCst); // MAC bytes 4-5
+        }
         // Blink WL_GPIO0 forever via gpioout, honouring SDPCM flow control.
         CYW43_PIO[15].store(0x11ED_B11C, SeqCst);
         let mut i = 0u32;
