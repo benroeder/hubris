@@ -516,3 +516,22 @@ RP2350. Full chain proven: PIO gSPI -> bus cfg -> ALP -> backplane -> core reset
 -> 231 KB firmware upload -> NVRAM -> WLAN core boot. NEXT: F2 (WLAN data)
 IORDY handshake + the CDC/BDC ioctl path -> drive WL_GPIO0 (onboard LED),
 then scan/join.
+
+## 28. Firmware loads + core resets, but HT clock / F2 not up yet (WIP)
+Added the post-download bring-up: HT-clock poll (CHIP_CLOCK_CSR & 0x80), F2
+watermark (F1 0x10008 = 0x20), BUS_INTERRUPT_ENABLE (F0 0x06 = IRQ_F2_PACKET
+0x20), and the F2-ready poll (REG_BUS_STATUS F0 0x8 & STATUS_F2_RX_READY 0x20).
+Also tried the pre-download HT start (clear PULL_UP F1 0x1000F=0, request HT).
+RESULT: WLAN core is out of reset (0xC0DE600D) and firmware verifies in RAM, but
+- [8]/[11] HT clock = 0x50 (ALP_AVAIL 0x40 | HT_AVAIL_REQ 0x10) -- HT_AVAIL 0x80
+  NEVER asserts, pre OR post download.
+- [9] F2 status = 0, never F2_RX_READY. So the firmware is not fully executing.
+Hardware/crystal are fine (MicroPython runs Wi-Fi on this board). The gap is the
+exact clock/PMU init embassy does that I only partially replicated -- notably the
+full ALP dance (CHIP_CLOCK_CSR = FORCE_HW_CLKREQ_OFF|ALP_AVAIL_REQ|FORCE_ALP, poll
+ALP, then CSR=0) and the WAKEUP_CTRL / SLEEP_CSR / watermark ordering in
+runner.rs ~460-530, plus whether the CR4 boot ROM needs anything more to jump
+into the loaded firmware (blob[0]=0x00000000, so a boot ROM reads the header, not
+a raw reset vector). NEXT: reproduce embassy's clock init byte-for-byte in order,
+then re-check HT (0x80) and F2 (0x20); once F2 is ready, the CDC/BDC ioctl path
+drives WL_GPIO0 (LED).
