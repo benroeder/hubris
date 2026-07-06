@@ -125,3 +125,22 @@ priority = 5
 max-sizes = {flash = 128, ram = 256}
 stacksize = 256
 start = true
+
+# Auxiliary-flash blob store (the correct Hubris pattern for large device
+# firmware, cf. the FPGA bitstream loaders). Packs the CYW43439 Wi-Fi firmware
+# + CLM into a TLV-C, SHA3-checksummed image that the read-only rp235x auxflash
+# server serves to the cyw43 driver. 1.5 MiB = 6 x 256 KiB slots (auxflash
+# minimum); slots 2+ hold the BT firmware later. Flashed to 0x1020_0000.
+[config.auxflash]
+memory-size = 1572864   # 1.5 MiB (6 * 256 KiB)
+slot-count = 6
+
+[[auxflash.blobs]]
+file = "support/cyw43-firmware/43439A0.bin"
+compress = false
+tag = "WIFI"
+
+[[auxflash.blobs]]
+file = "support/cyw43-firmware/43439A0_clm.bin"
+compress = false
+tag = "WCLM"

@@ -134,3 +134,27 @@ Flash map: image (RAM-boot storage) 0x1000_0000.. (<=256 KiB, or A/B <=512 KiB);
 blob 0x1020_0000..0x1024_0000; 4 MiB total -> trivially fits. SRAM budget without
 the blob: ~180-210 KiB code + ~60-90 KiB data/smoltcp buffers ~= 250-300 KiB of
 520 KiB -> ~200 KiB headroom.
+
+## 10. Firmware storage: the correct way = Hubris auxflash (DONE)
+Rather than a raw extern-region + manual picotool, we use Hubris's **auxflash**
+blob mechanism (the pattern the FPGA bitstream loaders use): build-time TLV-C
+packing with SHA3 checksums + 4-byte tags, and a driver that streams by tag.
+
+- Blobs in `support/cyw43-firmware/` (43439A0.bin 231 KB WIFI, 43439A0_clm.bin
+  984 B WCLM; redistributed from embassy cyw43-firmware).
+- `app.toml`: `[config.auxflash]` memory-size=1.5 MiB, slot-count=6 (auxflash
+  minimum; 64 KiB-aligned slots; fw image ~232 KB needs a 256 KiB slot). Slots
+  2+ reserve room for the BT firmware later. `[[auxflash.blobs]]` WIFI + WCLM
+  (compress=false).
+- Build packs `dist/auxi.tlvc` (232160 B: CHCK -> AUXI -> WIFI -> WCLM), and
+  sets HUBRIS_AUXFLASH_CHECKSUM for the server.
+- Flash it to slot 0: `probe-rs download ... --base-address 0x1020_0000 auxi.tlvc`
+  (or `picotool load auxi.tlvc -t bin -o 0x1020_0000`). VERIFIED: reads back at
+  the no-translate mirror 0x1c20_0000 as CHCK/AUXI/WIFI.
+
+Next: a **read-only rp235x auxflash server** -- a faithful port of
+drv/auxflash-server but with `SlotReader::read_exact` copying from the
+memory-mapped XIP mirror (0x1c20_0000 + offset) instead of driving a QSPI chip,
+and the write/erase/redundancy ops stubbed (the blob is flashed once, externally).
+It reuses drv-auxflash-api + the tlvc crate. Built alongside the cyw43 driver
+(its only client), which calls `get_blob_by_tag(*b"WIFI")` and streams it.

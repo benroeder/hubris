@@ -56,20 +56,23 @@ address = 0x1c00_0000
 size = 0x40_0000
 read = true
 
-# Pico 2 W CYW43439 firmware blob (43439A0.bin ~219 KiB + CLM ~5 KiB). Reserved
-# at PHYSICAL flash offset 0x20_0000 (2 MiB), read here through the uncached
-# no-translate XIP mirror (0x1c00_0000 + 0x20_0000). 256 KiB reserved.
+# Auxiliary-flash region: the Hubris auxflash blob store (TLV-C, SHA3-checked,
+# see [config.auxflash] in the app.toml) that holds the CYW43439 Wi-Fi firmware
+# (WIFI) + CLM (WCLM) now, and the BT firmware later. 1.5 MiB = 6 slots x 256 KiB
+# (auxflash requires >=6, 64 KiB-page-aligned slots; the ~232 KiB fw image needs
+# a 256 KiB slot). At PHYSICAL flash offset 0x20_0000 (2 MiB), read here through
+# the uncached no-translate XIP mirror (0x1c00_0000 + 0x20_0000).
 #
 # CRITICAL: this is a FLASH resource. Because the whole Hubris image is
 # RAM-booted (copied to SRAM), the ~224 KiB blob must NEVER be `include_bytes!`d
-# into a task -- that would consume 224 KiB of the 520 KiB SRAM. Instead the
-# cyw43 driver reads it here (granted via `extern-regions = ["cyw43_fw"]`) and
-# streams it over gSPI to the chip; it only transits, never resident in SRAM.
+# into a task -- that would consume 224 KiB of the 520 KiB SRAM. The
+# (read-only, memory-mapped) auxflash server reads it here (granted via
+# `extern-regions = ["cyw43_fw"]`) and the cyw43 driver streams it over gSPI.
 #
 # Placed at 2 MiB so it is clear of the RAM-boot image (flash 0..256 KiB) and
-# any future A/B slots (<=512 KiB). Flash it separately, e.g.:
-#   picotool load 43439A0-plus-clm.bin -t bin -o 0x1020_0000
+# any A/B image slots (<=512 KiB). The packed auxflash image is flashed
+# separately: `picotool load build-...-auxflash.bin -t bin -o 0x1020_0000`.
 [[cyw43_fw]]
 address = 0x1c20_0000
-size = 0x4_0000
+size = 0x18_0000
 read = true
