@@ -324,9 +324,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     pio.input_sync_bypass()
         .write(|w| unsafe { w.bits(1 << DIO) });
     let sm = pio.sm(0);
-    // ~500 kHz SDIO for bring-up: PIO clk = 150 MHz / 150 = 1 MHz, /2 = 500 kHz.
+    // ~7.5 MHz SDIO: PIO clk = 150 MHz / 10 = 15 MHz, /2 per bit = 7.5 MHz. The
+    // very slow 500 kHz may not suit the chip's default high-speed gSPI mode.
     sm.sm_clkdiv()
-        .write(|w| unsafe { w.int().bits(150).frac().bits(0) });
+        .write(|w| unsafe { w.int().bits(10).frac().bits(0) });
     // MSB-first (shift left), autopull/autopush at 32 bits (thresh 0 == 32).
     sm.sm_shiftctrl().modify(|_, w| unsafe {
         w.out_shiftdir().clear_bit();
