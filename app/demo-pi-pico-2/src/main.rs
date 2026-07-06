@@ -680,6 +680,35 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             break r[0];
         }
     };
+    // Turn on the onboard LED (WL_GPIO0) with a SET_VAR "gpioout" ioctl over F2.
+    // Frame = SdpcmHeader(12) + CdcHeader(16) + "gpioout\0"(8) + mask(4) + val(4)
+    // = 44 bytes. wlan_write prepends the gSPI cmd (WRITE INC F2 addr0 len44).
+    if (f2 & 0x20) != 0 {
+        // Blink WL_GPIO0 ~10 times so it's visible; increment the SDPCM sequence
+        // and CDC id each frame (the chip tracks them).
+        for i in 0..20u32 {
+            let val = if i & 1 == 0 { 1u32 } else { 0u32 }; // on / off
+            let seq = i & 0xFF;
+            let id = (i + 1) & 0xFFFF;
+            let led_frame: [u32; 12] = [
+                0xE000_0000 | 44, // gSPI cmd: WRITE|INC func2 addr0 len=44
+                0xFFD3_002C, // SDPCM len=44, len_inv=0xFFD3
+                0x0C00_0000 | seq, // seq, channel=CONTROL, header_length=12
+                0x0000_0000,
+                0x0000_0107, // CDC cmd = SET_VAR (263)
+                0x0000_0010, // CDC len = 16
+                0x0000_0002 | (id << 16), // CDC flags=Set(2), id
+                0x0000_0000, // CDC status
+                0x6f69_6770, // "gpio"
+                0x0074_756f, // "out\0"
+                0x0000_0001, // mask = 1<<0
+                val, // value (LED on/off)
+            ];
+            xfer(&led_frame, &mut [0u32; 1]);
+            cortex_m::asm::delay(30_000_000); // ~200 ms
+        }
+        CYW43_PIO[15].store(0x11ED_B11C, SeqCst); // LED blink sequence done
+    }
 
     CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);
     CYW43_PIO[6].store(if magic_ok { magic } else { 0xBAD0_0001 }, SeqCst); // NVRAM magic

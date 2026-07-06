@@ -554,3 +554,14 @@ RESULT on the live Pico 2 W: firmware verify [12]=0xFFFFFFFF (all good), HT cloc
 [8]=0x800000d0 (HT_AVAIL 0x80 set), F2 status [9] & STATUS_F2_RX_READY (0x20) set
 after 169 polls. THE CYW43439 IS RUNNING ITS FIRMWARE AND F2 IS READY. NEXT: the
 CDC/BDC ioctl path (CLM upload + country + WL_GPIO0 LED), then scan/join.
+
+## 30. LED ioctl over F2 (SDPCM/CDC) -- WL_GPIO0 blink
+With F2 ready, sent a SET_VAR "gpioout" ioctl over F2 (WLAN data) to drive the
+onboard LED (WL_GPIO0). Frame (44 B): SdpcmHeader(12) + CdcHeader(16) +
+"gpioout\0"(8) + mask(4) + value(4), prepended with the gSPI cmd
+(WRITE|INC func2 addr0 len44 = 0xE000002C). SdpcmHeader: len/len_inv, seq,
+channel=CONTROL(0), header_length=12. CdcHeader: cmd=SET_VAR(263), len=16,
+flags=Set(2), id. mask=1<<0, value=1<<0 (on). Blinks by toggling value with
+seq/id incrementing each frame. [15]=0x11EDB11C when the loop finished.
+(Pending: physical confirmation the LED blinks; if not, read the F2 response and
+check the CDC status, and add CLM/country init first.)
