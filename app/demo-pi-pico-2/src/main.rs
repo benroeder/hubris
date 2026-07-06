@@ -190,7 +190,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << WL_ON) });
     cortex_m::asm::delay(150_000 * 250);
 
-    // gSPI mode latched -- now route DIO + CLK to PIO0 (funcsel 6).
+    // gSPI mode latched -- release the SIO output drivers on DIO + CLK and route
+    // them to PIO0 (funcsel 6) so only the PIO drives them.
+    sio.gpio_oe_clr()
+        .write(|w| unsafe { w.bits((1 << DIO) | (1 << CLK)) });
     for pin in [DIO, CLK] {
         p.IO_BANK0
             .gpio(pin as usize)
