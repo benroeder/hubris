@@ -2246,6 +2246,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-rp235x-auxflash-server"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "drv-auxflash-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "tlvc",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-cyw43"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "counters",
+ "drv-auxflash-api",
+ "drv-rp235x-cyw43-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-cyw43-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-rp235x-flash"
 version = "0.1.0"
 dependencies = [
@@ -2307,6 +2353,7 @@ dependencies = [
 name = "drv-rp235x-i2c"
 version = "0.1.0"
 dependencies = [
+ "build-util",
  "counters",
  "drv-rp235x-i2c-api",
  "drv-rp235x-sys-api",
@@ -7327,6 +7374,18 @@ dependencies = [
  "cortex-m-rt",
  "kern",
  "lpc55-pac",
+]
+
+[[package]]
+name = "tests-rp235x"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-startup",
 ]
 
 [[package]]

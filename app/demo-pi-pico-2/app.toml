@@ -121,10 +121,19 @@ notifications = ["timer"]
 
 [tasks.auxflash]
 name = "drv-rp235x-auxflash-server"
-priority = 3
+priority = 2
 max-sizes = {flash = 16384, ram = 8192}
 stacksize = 4096
 extern-regions = ["cyw43_fw"]
+start = true
+
+[tasks.cyw43]
+name = "drv-rp235x-cyw43"
+priority = 3
+max-sizes = {flash = 65536, ram = 16384}
+stacksize = 12288
+uses = ["pio2", "sio", "io_bank0", "pads_bank0", "resets"]
+task-slots = ["auxflash"]
 start = true
 
 [tasks.idle]

@@ -1,0 +1,29 @@
+// RP2350 (RP235x) CYW43439 Wi-Fi driver API.
+//
+// The driver owns PIO2 (gSPI PHY) + the CYW43 control pins, uploads the
+// firmware from the auxflash server, and runs the SDPCM/CDC control plane.
+
+Interface(
+    name: "Rp235xCyw43",
+    ops: {
+        "wifi_status": (
+            description: "Init status word: 0xFEEDBEAD once chip-detect + firmware boot succeed.",
+            reply: Result(ok: "u32", err: CLike("Cyw43Error")),
+            idempotent: true,
+        ),
+        "get_mac": (
+            description: "The Wi-Fi MAC address (6 bytes).",
+            reply: Result(ok: "[u8; 6]", err: CLike("Cyw43Error")),
+            idempotent: true,
+        ),
+        "led": (
+            description: "Set the CYW43 WL_GPIO0 on-board LED on or off.",
+            args: { "on": "bool" },
+            reply: Result(ok: "()", err: CLike("Cyw43Error")),
+        ),
+        "scan": (
+            description: "Run an active Wi-Fi scan; returns the number of AP result frames seen.",
+            reply: Result(ok: "u32", err: CLike("Cyw43Error")),
+        ),
+    },
+)

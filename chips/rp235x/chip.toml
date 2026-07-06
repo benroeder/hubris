@@ -47,6 +47,10 @@ size = 0x1000
 address = 0x400d_0000  # QSPI memory interface (direct mode for erase/program)
 size = 0x1000
 
+[pio2]
+address = 0x5040_0000  # PIO block 2 (gSPI PHY for the CYW43439 Wi-Fi, funcsel 8)
+size = 0x1000
+
 [psm]
 address = 0x4001_8000  # power-on state machine (WDSEL: what a watchdog reset resets)
 size = 0x1000

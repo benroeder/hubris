@@ -1182,9 +1182,10 @@ fn main() -> ! {
     // P1: prove PIO works (echo through PIO0 SM0; result in PIO_PROBE).
     pio_echo_test(&p);
 
-    // P2/P3: chip-detect the CYW43439 over PIO-driven gSPI (result in CYW43_PIO,
-    // want 0xBEADFEED). Harmless on a plain Pico 2 (GP23-29 float).
-    cyw43_pio_detect(&p);
+    // The CYW43439 Wi-Fi bring-up now lives in the drv-rp235x-cyw43 task (owns
+    // PIO2 + the control pins, streams firmware from auxflash). The pre-kernel
+    // probe below is kept for reference but no longer invoked.
+    let _ = cyw43_pio_detect;
     let _ = pio_output_test; // loopback validator (peer-captured; kept for reuse)
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }

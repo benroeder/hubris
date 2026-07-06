@@ -638,3 +638,21 @@ the fixed word-31 offset holds for most escan_result frames but a proper parser
 (BDC data_offset + event header walk) is needed for 100%. Full Wi-Fi RECEIVE
 path now proven: PIO gSPI -> fw -> ioctls -> events -> BssInfo -> SSID. This
 closes Wi-Fi bring-up on the probe; the productionization is the driver task.
+
+## 36. *** Productionised: Wi-Fi is now a proper Hubris task (drv-rp235x-cyw43) ***
+Moved the whole gSPI/SDPCM stack out of the pre-kernel probe into a real task.
+Structure: new drv/rp235x-cyw43 (owns pio2 + shares sio/io_bank0/pads_bank0/
+resets) + drv/rp235x-cyw43-api + idl/rp235x-cyw43.idol. Firmware + CLM stream
+from the auxflash server over IPC (get_blob_by_tag + read_slot_with_offset, 128 B
+chunks) -- verified byte-perfect vs the file at 3 RAM readback points. The probe's
+closures became struct methods; setup (pads/funcsel/power-on/PIO program/SM) runs
+once at task start.
+KEY LESSON -- PREEMPTION: at priority 4 (below usb/shell/hiffy) the CYW43 boot was
+flaky (HT intermittent, F2 never ready) because a task switch mid-gSPI-transaction
+holds CS low too long and corrupts sparse boot writes. Fix: cyw43 priority 3 (above
+the noisy tasks), auxflash priority 2 (cyw43 calls it, so auxflash must be higher --
+Hubris forbids priority inversion). Then HT/F2/CLM/MAC are 100% reliable across
+resets. Also use userlib::hl::sleep_for (timer, preemption-safe) for the post-boot
+settle, not busy delays. Idol verified via humility hiffy: get_mac => 2c:cf:67:e8:
+5a:18, led(on/off) works, scan => 13 APs. Hubris ALLOWS sharing a peripheral across
+tasks (map shows [sio] gpio_driver, cyw43). DIAG[16] static = bring-up telemetry.
