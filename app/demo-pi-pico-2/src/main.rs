@@ -156,7 +156,9 @@ const CLK: u32 = 29; // gSPI CLK
 // Result (raw wire response) in CYW43_PIO -- expect swap16(FEEDBEAD)=0xBEADFEED.
 #[no_mangle]
 #[used]
-static CYW43_PIO: [core::sync::atomic::AtomicU32; 2] = [
+static CYW43_PIO: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
 ];
@@ -200,17 +202,27 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             .gpio_ctrl()
             .modify(|_, w| unsafe { w.funcsel().bits(6) });
     }
+    // DIAGNOSTIC: pull DIO up. If the device never drives it, the read is all-1s
+    // (floating, pulled up); if the device drives it low, we still see its data.
+    p.PADS_BANK0
+        .gpio(DIO as usize)
+        .modify(|_, w| w.pue().set_bit().pde().clear_bit());
 
     // Load the gSPI read program into PIO0 (overwriting the P1 echo program).
-    // .side_set 1 (CLK). 0:out pins,1 side0  1:jmp x-- 0 side1  2:set pindirs,0
-    // side0  3:nop side1  4:nop side0  5:in pins,1 side1  6:jmp y-- 5 side0.
-    const GSPI: [u16; 7] =
-        [0x6001, 0x1020, 0xE080, 0xB042, 0xA042, 0x4801, 0x0045];
+    // This is embassy's LOW-SPEED variant (< 75 MHz PIO clock), which is the one
+    // that matches our ~1 MHz clock -- the turnaround (single `nop side 0`)
+    // determines exactly when the read samples relative to the response.
+    // .side_set 1 (CLK): 0:out pins,1 side0  1:jmp x-- 0 side1  2:set pindirs,0
+    // side0  3:nop side0  4(lp2):in pins,1 side1  5:jmp y-- 4 side0.
+    const GSPI: [u16; 6] = [0x6001, 0x1020, 0xE080, 0xA042, 0x4801, 0x0044];
     let pio = &p.PIO0;
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
     for (i, insn) in GSPI.iter().enumerate() {
         pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
     }
+    // Bypass the 2-flop input synchronizer on DIO (GP24), as embassy does.
+    pio.input_sync_bypass()
+        .write(|w| unsafe { w.bits(1 << DIO) });
     let sm = pio.sm(0);
     // ~1 MHz SDIO clock: PIO clk = 150 MHz / 75 = 2 MHz, /2 per bit = 1 MHz.
     sm.sm_clkdiv()
@@ -234,31 +246,67 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         w.in_base().bits(DIO as u8)
     });
     sm.sm_execctrl()
-        .modify(|_, w| unsafe { w.wrap_top().bits(6).wrap_bottom().bits(0) });
+        .modify(|_, w| unsafe { w.wrap_top().bits(5).wrap_bottom().bits(0) });
 
     // One 32-bit read of F0 0x14. cmd = swap16(cmd_word(READ,INC,0,0x14,4)).
     let cmd = ((1u32 << 30) | (0x14 << 11) | 4).rotate_left(16); // 0xA004_4000
     sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
+    // DIAGNOSTIC: actual pin levels now -- expect WL_ON(23)=1, CS(25)=0. If
+    // CS(25) reads 1 it never went low, so GP29 stays VSYS/ADC (not CLK) and the
+    // device sees no command. (bits: WL_ON 0x800000, DIO 0x1000000, CS 0x2000000)
+    let pins_lvl = sio.gpio_in().read().bits();
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
-    // Poke X=31 (32 write bits), Y=31 (32 read bits), DIO->output, PC=0 via
-    // sm_instr (executes immediately): set x,31 / set y,31 / set pindirs,1 / jmp 0.
-    for insn in [0xE03Fu32, 0xE05F, 0xE081, 0x0000] {
-        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn as u16) });
-    }
+    // Both CLK (side-set) and DIO must be OUTPUTS driven LOW at idle -- if CLK
+    // idles high the device misreads the first clock edge after CS falls (embassy
+    // does set_pin_dirs(Out) + set_pins(Low) on both). `set pindirs`/`set pins`
+    // act on the SET pins, so point them at CLK, drive it output-low, then DIO.
+    let set_pin = |pin: u32, insn: u16| {
+        sm.sm_pinctrl()
+            .modify(|_, w| unsafe { w.set_base().bits(pin as u8) });
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn) });
+    };
+    set_pin(CLK, 0xE081); // set pindirs, 1  (CLK output)
+    set_pin(CLK, 0xE000); // set pins, 0     (CLK low)
+    set_pin(DIO, 0xE081); // set pindirs, 1  (DIO output)
+    set_pin(DIO, 0xE000); // set pins, 0     (DIO low)
+    // DIAGNOSTIC: scan a WIDE 256-bit read window (8 words) for ANY response bit,
+    // in case the device answers later than the immediate turnaround. Y=255 (256
+    // bits) via the FIFO: push 255, pull to OSR, out to Y.
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0xE03F) }); // set x,31
+    pio.txf(0).write(|w| unsafe { w.bits(255) });
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x80A0) }); // pull -> OSR
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
     pio.txf(0).write(|w| unsafe { w.bits(cmd) });
 
-    let mut spins = 0u32;
-    while pio.fstat().read().rxempty().bits() & 1 != 0 {
-        spins += 1;
-        if spins > 5_000_000 {
-            CYW43_PIO[1].store(0xdead_0000, SeqCst); // no response clocked in
-            sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
-            return;
+    let mut first = 0u32;
+    let mut any = 0u32;
+    for k in 0..8 {
+        let mut spins = 0u32;
+        while pio.fstat().read().rxempty().bits() & 1 != 0 {
+            spins += 1;
+            if spins > 5_000_000 {
+                CYW43_PIO[0].store(0xdead_0000, SeqCst);
+                CYW43_PIO[1].store(any, SeqCst);
+                sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
+                return;
+            }
         }
+        let word = pio.rxf(0).read().bits();
+        if k == 0 {
+            first = word;
+        }
+        any |= word;
     }
-    CYW43_PIO[0].store(pio.rxf(0).read().bits(), SeqCst); // want 0xBEADFEED
-    CYW43_PIO[1].store(0x5010_0000 | (spins & 0xffff), SeqCst);
+    // [0] = GP25(CS) IO ctrl (funcsel = low 5 bits, s/b 5 = SIO), [1] = pins,
+    // [2] = GP25 PAD register (od bit7, ie bit6, iso bit8), [3] = SIO OUT.
+    let _ = any;
+    let _ = first;
+    CYW43_PIO[0].store(p.IO_BANK0.gpio(CS as usize).gpio_ctrl().read().bits(), SeqCst);
+    CYW43_PIO[1].store(pins_lvl, SeqCst);
+    CYW43_PIO[2].store(p.PADS_BANK0.gpio(CS as usize).read().bits(), SeqCst);
+    CYW43_PIO[3].store(sio.gpio_out().read().bits(), SeqCst);
     sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
 }
 // -----------------------------------------------------------------------------

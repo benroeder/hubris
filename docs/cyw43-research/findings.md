@@ -215,3 +215,31 @@ half-cycle offset), and the turnaround length after `set pindirs, 0`. NEXT
 diagnostic: capture a longer bitstream (2+ words) to locate the response, then
 sweep read-edge/turnaround. Hand-assembled gSPI program:
 [0x6001,0x1020,0xE080,0xB042,0xA042,0x4801,0x0045], wrap 6->0.
+
+## 14. Doc-driven PIO gSPI debug -> root cause: CS (GP25) stuck HIGH (hardware)
+Read the embassy cyw43-pio source (not guessing) and applied every difference:
+- Wrong program variant: at ~1 MHz use embassy's LOW-SPEED program (1 nop side0),
+  not the overclock one (2 nops). Fixed.
+- gSPI mode-select: DIO must be SIO-LOW while WL_ON rises, then funcsel 6. Fixed
+  (moved read 0xffffffff -> 0x00000000).
+- CLK (side-set pin) + DIO must be OUTPUT and driven LOW at idle
+  (set_pin_dirs(Out)+set_pins(Low)); input_sync_bypass(true) on DIO. Applied.
+- Verified funcsel 6 = PIO0 (PAC), dbg_padoe = 0x21000000 (DIO+CLK ARE outputs),
+  turnaround works (padoe bit24 clears after read).
+
+On-target register probes (CYW43_PIO[0..3]):
+- Pull-up on DIO + 256-bit read: still all 0 -> the device ACTIVELY drives DIO
+  low (overpowers the pull-up) => the CYW43 is ALIVE and connected.
+- Pin levels at CS-low: 0x02820032 -> WL_ON(23)=1 (powered), but **CS(25)=1**.
+- SIO OE=0x02800000 (CS output-enabled), SIO OUT bit25=0 (driven low),
+  GP25 io_ctrl=0x05 (funcsel SIO), GP25 pad=0x56 (od=0, iso=0, ie=1): everything
+  says GP25 should be LOW, yet gpio_in reads it HIGH.
+
+ROOT CAUSE: CS (GP25) is driven low push-pull by the RP2350 but reads HIGH ->
+something external holds it high. With CS high the CYW43 is deselected (GP29
+becomes VSYS/ADC, DIO becomes the IRQ line held low), so no clock/command reaches
+it and it never returns FEEDBEAD. This is a HARDWARE anomaly, not software:
+needs physical investigation -- confirm the board is a Pico 2 W, measure GP25,
+and check the probe/rig for anything tied to GP25/24/29 (though those are
+internal to the CYW43 on the W and not on the header). The PIO gSPI PHY itself
+is correct and ready; it is blocked on CS reaching the chip.
