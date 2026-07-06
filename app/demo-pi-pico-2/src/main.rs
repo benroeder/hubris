@@ -811,7 +811,7 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             b[2] = 0x0C00_0000 | tx_seq as u32;
             b[4] = 0x0000_0106; // WLC_GET_VAR
             b[5] = pb as u32;
-            b[6] = (9 << 16); // GET (kind 0), id=9
+            b[6] = 9 << 16; // GET (kind 0), id=9
             b[8] = 0x6c6d_6c63; // "clml"
             b[9] = 0x5f64_616f; // "oad_"
             b[10] = 0x7461_7473; // "stat"
