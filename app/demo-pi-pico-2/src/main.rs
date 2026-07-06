@@ -245,6 +245,36 @@ static CYW43_PIO: [core::sync::atomic::AtomicU32; 8] = [
     core::sync::atomic::AtomicU32::new(0),
 ];
 
+// Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h,
+// packed little-endian and zero-padded to a word. Written near the top of WLAN
+// RAM during firmware download; the firmware reads it to find its calibration.
+static NVRAM: [u32; 186] = [
+    0x4152564e, 0x7665524d, 0x6552243d, 0x6d002476, 0x69666e61, 0x78303d64, 0x00306432, 0x646f7270,
+    0x303d6469, 0x32373078, 0x65760037, 0x6469646e, 0x3178303d, 0x00346534, 0x69766564, 0x78303d64,
+    0x32653334, 0x616f6200, 0x79746472, 0x303d6570, 0x38383078, 0x6f620037, 0x72647261, 0x303d7665,
+    0x30313178, 0x6f620030, 0x6e647261, 0x323d6d75, 0x616d0032, 0x64646163, 0x30303d72, 0x3a30413a,
+    0x623a3035, 0x39353a35, 0x0065353a, 0x6d6f7273, 0x3d766572, 0x62003131, 0x6472616f, 0x67616c66,
+    0x78303d73, 0x30343030, 0x31303034, 0x616f6200, 0x6c666472, 0x33736761, 0x3078303d, 0x30303034,
+    0x00303030, 0x6c617478, 0x71657266, 0x3437333d, 0x6e003030, 0x6372636f, 0x6100313d, 0x323d3067,
+    0x61003535, 0x3d673261, 0x63630031, 0x3d65646f, 0x004c4c41, 0x69306170, 0x69737374, 0x78303d74,
+    0x65003032, 0x61707478, 0x6e696167, 0x303d6732, 0x32617000, 0x3d306167, 0x3836312d, 0x3631372c,
+    0x382d2c31, 0x41003032, 0x696d5676, 0x30635f64, 0x3078303d, 0x6378302c, 0x63630038, 0x7277706b,
+    0x7366666f, 0x3d307465, 0x616d0035, 0x67327078, 0x383d3061, 0x78740034, 0x62727770, 0x666f6b63,
+    0x6300363d, 0x77626b63, 0x67323032, 0x303d6f70, 0x67656c00, 0x6d64666f, 0x30327762, 0x6f706732,
+    0x3678303d, 0x31313136, 0x00313131, 0x6273636d, 0x32303277, 0x3d6f7067, 0x37377830, 0x31313137,
+    0x70003131, 0x62706f72, 0x32303277, 0x3d6f7067, 0x64647830, 0x64666f00, 0x6769646d, 0x746c6966,
+    0x65707974, 0x0038313d, 0x6d64666f, 0x66676964, 0x74746c69, 0x62657079, 0x38313d65, 0x70617000,
+    0x646f6d64, 0x00313d65, 0x64706170, 0x696c6176, 0x73657464, 0x00313d74, 0x61636170, 0x7864696c,
+    0x343d6732, 0x61700035, 0x70656470, 0x66666f73, 0x3d746573, 0x0030332d, 0x64706170, 0x69646e65,
+    0x353d7864, 0x746c0038, 0x6d786365, 0x303d7875, 0x65746c00, 0x61707863, 0x6d756e64, 0x3078303d,
+    0x00323031, 0x6365746c, 0x736e6678, 0x303d6c65, 0x00343478, 0x6365746c, 0x69636778, 0x6f697067,
+    0x3078303d, 0x6c690031, 0x63616d30, 0x72646461, 0x3a30303d, 0x343a3039, 0x35633a63, 0x3a32313a,
+    0x77003833, 0x6469306c, 0x3478303d, 0x00623133, 0x64616564, 0x5f6e616d, 0x303d6f74, 0x66666678,
+    0x66666666, 0x756d0066, 0x616e6578, 0x78303d62, 0x00303031, 0x72757073, 0x666e6f63, 0x303d6769,
+    0x67003378, 0x6374696c, 0x61625f68, 0x5f646573, 0x6d737263, 0x313d6e69, 0x63746200, 0x646f6d5f,
+    0x00313d65, 0x00000000,
+];
+
 fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     use core::sync::atomic::Ordering::SeqCst;
     let sio = &p.SIO;
@@ -543,34 +573,55 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     reset_core_up(SOCSRAM_WRAP);
     bp_write32(SOCSRAM_BASE + 0x10, 3);
     bp_write32(SOCSRAM_BASE + 0x44, 0);
-    // FIRMWARE DOWNLOAD: stream the WIFI blob from the memory-mapped auxflash
-    // region (no-translate XIP mirror; the WIFI TLV-C body is at 0x1c200048,
-    // 231077 bytes) into WLAN-core RAM (ATCM base = 0) via windowed backplane
-    // bursts, chunked to <=255 words and never crossing the 32 KiB window.
+    // Stream `words` u32s from `src` into backplane `dest`, in <=64-word bursts
+    // that never cross the 32 KiB window (matches embassy's bp_write).
+    let bp_stream = |dest: u32, src: *const u32, words: usize| {
+        let mut burst = [0u32; 65];
+        let mut i = 0usize;
+        while i < words {
+            let addr = dest + (i * 4) as u32;
+            let window_rem = (0x8000 - (addr & 0x7FFF)) as usize;
+            let n = (window_rem / 4).min(64).min(words - i);
+            bp_set_window(addr);
+            burst[0] = cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, (n * 4) as u32);
+            for k in 0..n {
+                burst[1 + k] = unsafe { core::ptr::read_volatile(src.add(i + k)) };
+            }
+            xfer(&burst[..1 + n], &mut [0u32; 1]);
+            i += n;
+        }
+    };
+    // FIRMWARE DOWNLOAD: WIFI blob (auxflash mirror body at 0x1c200048, 231077 B)
+    // into WLAN-core RAM at backplane addr 0.
     let fw_src = 0x1c20_0048 as *const u32;
     let fw_len: usize = 231077;
-    let fw_words = fw_len.div_ceil(4);
-    let mut burst = [0u32; 65];
-    let mut widx = 0usize;
-    while widx < fw_words {
-        let addr = (widx * 4) as u32;
-        let window_rem = (0x8000 - (addr & 0x7FFF)) as usize; // bytes to window end
-        let n = (window_rem / 4).min(64).min(fw_words - widx);
-        bp_set_window(addr);
-        burst[0] = cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, (n * 4) as u32);
-        for k in 0..n {
-            burst[1 + k] = unsafe { core::ptr::read_volatile(fw_src.add(widx + k)) };
-        }
-        xfer(&burst[..1 + n], &mut [0u32; 1]);
-        widx += n;
-    }
-    // Verify the download at three spread-out RAM offsets against the source.
+    bp_stream(0, fw_src, fw_len.div_ceil(4));
+    // NVRAM near the top of RAM, then the length-magic word at RAM_SIZE-4 (the
+    // firmware needs this to locate the NVRAM, or F2 IORDY never asserts).
+    const RAM_SIZE: u32 = 0x8_0000;
+    let nvram_len = (NVRAM.len() * 4) as u32;
+    let nvram_addr = RAM_SIZE - 4 - nvram_len;
+    bp_stream(nvram_addr, NVRAM.as_ptr(), NVRAM.len());
+    let nvram_words = nvram_len / 4;
+    let magic = ((!nvram_words & 0xFFFF) << 16) | (nvram_words & 0xFFFF);
+    bp_write32(RAM_SIZE - 4, magic);
+    // Verify: firmware at 3 offsets + NVRAM magic readback.
     let ok0 = bp_read32(0) == unsafe { core::ptr::read_volatile(fw_src) };
     let ok1 = bp_read32(0x8000) == unsafe { core::ptr::read_volatile(fw_src.add(0x8000 / 4)) };
     let ok2 = bp_read32(0x3_8000) == unsafe { core::ptr::read_volatile(fw_src.add(0x3_8000 / 4)) };
+    let magic_ok = bp_read32(RAM_SIZE - 4) == magic;
+    // Bring the WLAN core out of reset -- the firmware starts executing.
+    reset_core_up(WLAN_WRAP);
+    cortex_m::asm::delay(1_500_000); // ~10 ms for the core to spin up
+    // Check the core is up (embassy check_device_core_is_up): IOCTRL has CLOCK_EN
+    // and not FGC; RESETCTRL RESET clear.
+    let io = bp_read8(WLAN_WRAP + IOCTRL) & 0xff;
+    let rc = bp_read8(WLAN_WRAP + RESETCTRL) & 0xff;
+    let core_up = (io & 0x3) == 0x1 && (rc & 0x1) == 0;
+
     CYW43_PIO[5].store(if ok0 && ok1 && ok2 { 0x600D_600D } else { 0xBAD0_0000 }, SeqCst);
-    CYW43_PIO[6].store(bp_read32(0x8000), SeqCst); // want blob[0x8000]=0xab1e8818
-    CYW43_PIO[7].store(bp_read32(0x3_8000), SeqCst); // want blob[0x38000]=0x13e00161
+    CYW43_PIO[6].store(if magic_ok { magic } else { 0xBAD0_0001 }, SeqCst); // NVRAM magic
+    CYW43_PIO[7].store(if core_up { 0xC0DE_600D } else { (io << 8) | rc }, SeqCst); // WLAN up
 
     CYW43_PIO[0].store(chip, SeqCst); // want 0xFEEDBEAD (chip-detect)
     CYW43_PIO[1].store(rw, SeqCst); // want 0x12345678 (write path verified)

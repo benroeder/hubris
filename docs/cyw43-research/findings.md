@@ -501,3 +501,18 @@ cores, reset SOCSRAM up, 43439 socsram_init (bp_write32 socsram+0x10=3, +0x44=0)
 Backplane windowing works for LOW/MID/HIGH SBADDR alike (0x8000/0x10000/0x18000
 all verified). NEXT: write NVRAM + magic at top of RAM, reset_core_up(WLAN),
 check core is up, then drive the LED (WL_GPIO0) once firmware runs.
+
+## 27. *** WLAN CORE UP -- CYW43439 IS RUNNING FIRMWARE ***
+After the firmware download: wrote the Pico-W NVRAM (744 B, from cyw43-driver
+wifi_nvram_43439.h) near the top of RAM at RAM_SIZE-4-nvram_len (0x7FD14), then
+the length-magic word ((~words&0xFFFF)<<16 | words = 0xFF4500BA) at RAM_SIZE-4
+(0x7FFFC) so the firmware can locate the NVRAM. Then reset_core_up(WLAN wrapper
+0x18103000): IOCTRL = FGC|CLOCK_EN, RESETCTRL = 0, IOCTRL = CLOCK_EN. Result:
+- [5] firmware verify = 0x600D600D
+- [6] NVRAM magic readback = 0xFF4500BA
+- [7] WLAN core-up check (IOCTRL&3==CLOCK_EN, RESETCTRL&1==0) = 0xC0DE600D
+THE CHIP IS EXECUTING ITS WI-FI FIRMWARE, driven end-to-end from Hubris on the
+RP2350. Full chain proven: PIO gSPI -> bus cfg -> ALP -> backplane -> core reset
+-> 231 KB firmware upload -> NVRAM -> WLAN core boot. NEXT: F2 (WLAN data)
+IORDY handshake + the CDC/BDC ioctl path -> drive WL_GPIO0 (onboard LED),
+then scan/join.
