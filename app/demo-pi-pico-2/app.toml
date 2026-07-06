@@ -132,7 +132,7 @@ name = "drv-rp235x-cyw43"
 priority = 3
 max-sizes = {flash = 65536, ram = 16384}
 stacksize = 12288
-uses = ["pio2", "sio", "io_bank0", "pads_bank0", "resets"]
+uses = ["pio2", "sio", "io_bank0", "pads_bank0", "resets", "watchdog"]
 task-slots = ["auxflash"]
 start = true
 

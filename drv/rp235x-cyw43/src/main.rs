@@ -92,6 +92,8 @@ struct Cyw43 {
     credit: u8,
     mac: [u8; 6],
     status: u32,
+    ssid: [u8; 32],
+    ssid_len: u8,
 }
 
 impl Cyw43 {
@@ -361,6 +363,10 @@ impl Cyw43 {
     /// Full bring-up. Assumes the pins + PIO SM have been configured by `setup`.
     fn new(aux: &AuxFlash, fr: &mut [u32; 512]) -> Result<Self, Cyw43Error> {
         let p = unsafe { rp235x_pac::Peripherals::steal() };
+        // Board id from watchdog scratch1/2 (stashed by the pre-kernel main, same
+        // source as the USB serial) -> SoftAP SSID "hubris-<16 hex>".
+        let id: u64 = (p.WATCHDOG.scratch1().read().bits() as u64) << 32
+            | p.WATCHDOG.scratch2().read().bits() as u64;
         setup(&p);
         let mut me = Cyw43 {
             pio: p.PIO2,
@@ -369,7 +375,15 @@ impl Cyw43 {
             credit: 1,
             mac: [0; 6],
             status: 0,
+            ssid: [0; 32],
+            ssid_len: 0,
         };
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        me.ssid[..7].copy_from_slice(b"hubris-");
+        for i in 0..16 {
+            me.ssid[7 + i] = HEX[((id >> (60 - 4 * i)) & 0xf) as usize];
+        }
+        me.ssid_len = 23;
         // cyw43_spi_init: CLK + DIO output-low.
         me.set_pin(CLK, 0xE081);
         me.set_pin(CLK, 0xE000);
@@ -633,8 +647,12 @@ impl Cyw43 {
     /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
     /// Mirrors cyw43_ll_wifi_ap_init/set_up for the open case. AP-interface
     /// (iface 1) ioctls: mfp, gmode, 2g_mrate, dtim. Returns the bss-up status.
-    fn ap_start(&mut self, ssid: &[u8], fr: &mut [u32; 512]) -> u32 {
-        let n = ssid.len().min(32);
+    fn ap_start(&mut self, fr: &mut [u32; 512]) -> u32 {
+        // Copy the board SSID to a local so it doesn't alias the &mut self below.
+        let mut ssid_buf = [0u8; 32];
+        let n = self.ssid_len as usize;
+        ssid_buf[..n].copy_from_slice(&self.ssid[..n]);
+        let ssid = &ssid_buf[..n];
         // Radio on: country + WLC_UP (as cyw43_wifi_on before ap_init).
         let country = [0x6e75_6f63, 0x0079_7274, 0x0000_5858, 0xFFFF_FFFF, 0x0000_5858];
         self.do_ioctl(0x107, 40, 0, &country, 8 + 12, fr);
@@ -796,7 +814,7 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
         &mut self,
         _: &RecvMessage,
     ) -> Result<u32, RequestError<Cyw43Error>> {
-        Ok(self.wifi.ap_start(b"Pico2W-Setup", &mut self.fr))
+        Ok(self.wifi.ap_start(&mut self.fr))
     }
 }
 
