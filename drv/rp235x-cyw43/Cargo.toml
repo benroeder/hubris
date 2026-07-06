@@ -10,6 +10,7 @@ num-traits = { workspace = true }
 zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 rp235x-pac = { workspace = true }
+smoltcp = { workspace = true, features = ["proto-ipv4", "socket-tcp"] }
 
 drv-rp235x-cyw43-api = { path = "../rp235x-cyw43-api" }
 drv-auxflash-api = { path = "../auxflash-api" }

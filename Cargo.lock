@@ -2272,6 +2272,7 @@ dependencies = [
  "idol-runtime",
  "num-traits",
  "rp235x-pac",
+ "smoltcp",
  "userlib",
  "zerocopy 0.8.27",
  "zerocopy-derive 0.8.27",
