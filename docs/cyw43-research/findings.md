@@ -330,3 +330,27 @@ cheap USB logic analyzer (~$10-15 Saleae clone, sigrok/PulseView) on GP24/25/29:
 it will show in minutes whether CS is low, CLK toggles at the chip, the command
 bits are right, and if the chip drives a response. Every software avenue against
 three reference implementations has been exhausted.
+
+## 19. BREAKTHROUGH: MicroPython WiFi WORKS -- hardware 100% good, bug is ours
+User's idea: flash a known-good stack. Flashed MicroPython v1.28.0 for
+RPI_PICO2_W (picotool). `network.WLAN(STA_IF).active(True)` + `.scan()` returned
+**6 APs** (darkworks, darkworksiot, ...). So the CYW43 chip, wiring, and
+firmware-upload are ALL functional. My "maybe hardware / need a logic analyzer"
+was WRONG -- the bug is in our Hubris gSPI code.
+
+Introspected the WORKING config via the MicroPython REPL (machine.mem32):
+- CYW43 gSPI runs on **PIO2 SM0** (funcsel 8 on GP24/29); GP23/25 = SIO (5).
+- SM0: clkdiv=0x00020000 (div 2 -> ~37.5 MHz), shift=0x00030000
+  (autopull+autopush, thresh 32, shift LEFT both), pinctrl=0x241c7718
+  (sideset_base=29, out/set/in_base=24). exec wrap 26..31 (program at offset 26).
+- GPIOBASE = 0 for PIO0 AND PIO2.
+- Pads: GP23(WL_ON)=0x5a (pull-UP+schmitt), GP24(DIO)=0x56 (pull-DOWN+schmitt),
+  GP25(CS)=0x56 (pull-DOWN+schmitt), GP29(CLK)=0x77 (pull-DOWN+schmitt+FAST
+  slew+12mA).
+
+Our SM config MATCHES (shift, pinctrl, GPIOBASE). Remaining differences to try:
+(1) clock -- ours ~500 kHz vs 37.5 MHz; (2) pads -- add schmitt to DIO/CS + fast
+slew to CLK; (3) PIO0 vs PIO2 (shouldn't matter -- pico-sdk uses PIO2 only
+because MicroPython claimed 0/1). Also revisit the reset/power timing and the
+boot-vs-runtime context. Note: MicroPython can be re-flashed anytime from
+scratchpad/mp_pico2w.uf2 to re-introspect; Hubris re-flash via probe-rs/picotool.
