@@ -38,6 +38,13 @@ const CLK: u32 = 29; // gSPI CLK
 #[used]
 static DIAG: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 
+/// Capture of the first channel-2 (DATA) frame seen -- e.g. a client's DHCP
+/// DISCOVER after it joins the SoftAP. Proves the F2 DATA path (smoltcp's phy).
+#[no_mangle]
+#[used]
+static DATA_FRAME: [AtomicU32; 128] =
+    [const { AtomicU32::new(0) }; 128];
+
 // Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h.
 static NVRAM: [u32; 186] = [
     0x4152564e, 0x7665524d, 0x6552243d, 0x6d002476, 0x69666e61, 0x78303d64,
@@ -384,6 +391,15 @@ impl Cyw43 {
             me.ssid[7 + i] = HEX[((id >> (60 - 4 * i)) & 0xf) as usize];
         }
         me.ssid_len = 23;
+        // Mirror the computed SSID into DATA_FRAME[0..8] so it can be read back
+        // over the probe (verifies the board-id SSID; overwritten by data_poll).
+        for k in 0..8usize {
+            let w = (me.ssid[k * 4] as u32)
+                | (me.ssid[k * 4 + 1] as u32) << 8
+                | (me.ssid[k * 4 + 2] as u32) << 16
+                | (me.ssid[k * 4 + 3] as u32) << 24;
+            DATA_FRAME[k].store(w, SeqCst);
+        }
         // cyw43_spi_init: CLK + DIO output-low.
         me.set_pin(CLK, 0xE081);
         me.set_pin(CLK, 0xE000);
@@ -644,6 +660,30 @@ impl Cyw43 {
         events
     }
 
+    /// Read F2 frames for a few seconds and count channel-2 (DATA) frames --
+    /// e.g. a joined client's DHCP/ARP broadcasts. Captures the first into
+    /// DATA_FRAME. This is the RX half of the smoltcp phy (Phase 2 proof).
+    fn data_poll(&mut self, fr: &mut [u32; 512]) -> u32 {
+        let mut data_frames = 0u32;
+        for _ in 0..40_000u32 {
+            let (got, chan, _s, bdc, _i) = self.rx(fr);
+            if got {
+                self.take_credit(chan, bdc);
+                if chan == 2 {
+                    if data_frames == 0 {
+                        for (k, slot) in DATA_FRAME.iter().enumerate() {
+                            slot.store(fr[k], SeqCst);
+                        }
+                    }
+                    data_frames += 1;
+                }
+            } else {
+                cortex_m::asm::delay(8_000);
+            }
+        }
+        data_frames
+    }
+
     /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
     /// Mirrors cyw43_ll_wifi_ap_init/set_up for the open case. AP-interface
     /// (iface 1) ioctls: mfp, gmode, 2g_mrate, dtim. Returns the bss-up status.
@@ -745,8 +785,8 @@ fn setup(p: &rp235x_pac::Peripherals) {
         .gpio(WL_ON as usize)
         .modify(|_, w| w.pde().clear_bit().pue().set_bit());
 
-    p.RESETS.reset().modify(|_, w| w.pio2().clear_bit());
-    while p.RESETS.reset_done().read().pio2().bit_is_clear() {}
+    // PIO2 is brought out of reset by the privileged pre-kernel main (so this
+    // task doesn't need the RESETS peripheral -- it's at the MPU region limit).
     let pio = &p.PIO2;
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
     for (i, insn) in GSPI.iter().enumerate() {
@@ -815,6 +855,12 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
         _: &RecvMessage,
     ) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.ap_start(&mut self.fr))
+    }
+    fn data_poll(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Cyw43Error>> {
+        Ok(self.wifi.data_poll(&mut self.fr))
     }
 }
 

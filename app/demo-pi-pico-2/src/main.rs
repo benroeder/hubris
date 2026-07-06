@@ -1188,5 +1188,11 @@ fn main() -> ! {
     let _ = cyw43_pio_detect;
     let _ = pio_output_test; // loopback validator (peer-captured; kept for reuse)
 
+    // Bring PIO2 out of reset here (privileged) for the drv-rp235x-cyw43 task,
+    // so that task doesn't need the RESETS peripheral (it is at the RP2350 MPU
+    // per-task region limit already).
+    p.RESETS.reset().modify(|_, w| w.pio2().clear_bit());
+    while p.RESETS.reset_done().read().pio2().bit_is_clear() {}
+
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
