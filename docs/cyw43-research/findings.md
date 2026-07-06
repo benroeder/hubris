@@ -614,3 +614,16 @@ firmware upload -> boot -> SDPCM/CDC ioctls with proper flow control (tx_seq +
 bus_data_credit, response demux by CDC id) -> CLM -> bus:txglom -> apsta ->
 gpioout. WIFI BRING-UP COMPLETE (LED milestone). NEXT: scan/join reuse this exact
 ioctl path; then move the whole stack into the drv/rp235x-cyw43 task.
+
+## 34. *** Wi-Fi SCAN works -- 13 APs, real SSID "darkworks" ***
+Full active escan over the byte-based ioctl path. Sequence: CLM -> bus:txglom ->
+apsta -> GET cur_etheraddr (MAC 2c:cf:67:e8:5a:18, RPi OUI) -> bsscfg:event_msgs
+(bitmask byte8 bit5 = ESCAN_RESULT event 69) -> WLC_UP -> escan (ScanParams 74 B
+after "escan\0"; version=1, action=1, bssid=ff*6, bss_type=2, nprobes/times=-1).
+Chip streamed 13 channel-1 ESCAN_RESULT event frames. Decoded the first frame's
+BssInfo: ssid_len=9 "darkworks", BSSID 6c:63:f8:85:a9:aa. Key lesson repeated:
+built ALL new payloads as byte arrays packed LE into words (do_ioctl_b) to avoid
+the "gpio"-style byte-order bug. The count loop is slow (each iter does a gSPI
+status read) -- 15k iters ~10 s covers the scan; 90k iters overran the probe
+wait. NEXT: proper SDPCM/BDC/event parser to list all SSIDs+RSSI (belongs in the
+drv/rp235x-cyw43 task, not the pre-kernel probe).

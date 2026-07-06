@@ -253,6 +253,12 @@ static CYW43_PIO: [core::sync::atomic::AtomicU32; 16] = [
     core::sync::atomic::AtomicU32::new(0),
 ];
 
+/// Debug capture of the first raw scan-result event frame (for offline decode).
+#[no_mangle]
+#[used]
+static SCAN_FRAME: [core::sync::atomic::AtomicU32; 128] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 128];
+
 // Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h,
 // packed little-endian and zero-padded to a word. Written near the top of WLAN
 // RAM during firmware download; the firmware reads it to find its calibration.
@@ -915,6 +921,64 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
             CYW43_PIO[6].store(fr[hl + 4], SeqCst); // MAC bytes 0-3
             CYW43_PIO[7].store(fr[hl + 5], SeqCst); // MAC bytes 4-5
         }
+        // --- Wi-Fi SCAN ---
+        // Enable scan-result events (bsscfg:event_msgs bitmask; bit 69 = ESCAN_RESULT).
+        let mut evt = [0u8; 40];
+        evt[..18].copy_from_slice(b"bsscfg:event_msgs\0");
+        evt[22] = 0x49; // events 0,3,6
+        evt[23] = 0x10; // event 12
+        evt[24] = 0x01; // event 16
+        evt[27] = 0x40; // event 46
+        evt[30] = 0x20; // event 69 (ESCAN_RESULT)
+        evt[32] = 0x01; // event 80
+        do_ioctl_b(2, 0x107, 8, &evt, 40, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[4].store(0x0000_1111, SeqCst); // stage: event_msgs done
+        // Bring the interface up (required to scan).
+        let up_stat = do_ioctl_b(2, 2, 9, &[], 0, &mut tx_seq, &mut credit, &mut fr); // WLC_UP
+        CYW43_PIO[13].store(up_stat, SeqCst); // WLC_UP status (0 = ok)
+        CYW43_PIO[4].store(0x0000_2222, SeqCst); // stage: WLC_UP done
+        // Start an active escan of all channels (ScanParams, 74 B, after "escan\0").
+        let mut esc = [0u8; 80];
+        esc[..6].copy_from_slice(b"escan\0");
+        esc[6] = 1; // version = 1
+        esc[10] = 1; // action = WL_SCAN_ACTION_START
+        esc[12] = 0x34;
+        esc[13] = 0x12; // sync_id
+        esc[50..56].iter_mut().for_each(|x| *x = 0xff); // bssid = broadcast
+        esc[56] = 2; // bss_type = ANY
+        esc[58..74].iter_mut().for_each(|x| *x = 0xff); // nprobes/active/passive/home = -1
+        let escan_stat = do_ioctl_b(2, 0x107, 10, &esc, 80, &mut tx_seq, &mut credit, &mut fr);
+        CYW43_PIO[8].store(escan_stat, SeqCst); // escan CDC status (0 = scan started)
+        CYW43_PIO[4].store(0x0000_3333, SeqCst); // stage: escan sent
+        // Read frames during the scan; track total, events (chan 1), last channel.
+        let mut total = 0u32;
+        let mut events = 0u32;
+        let mut last_chan = 0xFFu32;
+        for _ in 0..15_000u32 {
+            let (got, chan, _s, bdc, _i) = rx(&mut fr);
+            if got {
+                total += 1;
+                last_chan = chan;
+                if total == 1 {
+                    CYW43_PIO[3].store(0xF185_0000 | chan, SeqCst); // first frame's chan
+                    for (k, slot) in SCAN_FRAME.iter().enumerate() {
+                        slot.store(fr[k], SeqCst); // raw event frame for offline decode
+                    }
+                }
+                if chan < 3 && (bdc.wrapping_sub(credit as u32) & 0xFF) <= 20 {
+                    credit = bdc as u8;
+                }
+                if chan == 1 {
+                    events += 1;
+                }
+            } else {
+                cortex_m::asm::delay(8_000);
+            }
+        }
+        CYW43_PIO[9].store(total, SeqCst); // total frames seen during scan
+        CYW43_PIO[10].store(events, SeqCst); // # channel-1 (event) frames
+        CYW43_PIO[11].store(last_chan, SeqCst); // channel of last frame
+        CYW43_PIO[4].store(0x0000_4444, SeqCst); // stage: scan loop done
         // Blink WL_GPIO0 forever via gpioout, honouring SDPCM flow control.
         CYW43_PIO[15].store(0x11ED_B11C, SeqCst);
         let mut i = 0u32;
