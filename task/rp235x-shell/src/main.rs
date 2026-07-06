@@ -17,6 +17,7 @@
 #![no_main]
 
 use drv_rp235x_adc_api::{Rp235xAdc, TEMP_CHANNEL};
+use drv_rp235x_cyw43_api::Rp235xCyw43;
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
@@ -34,6 +35,7 @@ task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
+task_slot!(CYW43, cyw43);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -83,6 +85,7 @@ struct Shell {
     flash: Rp235xFlash,
     adc: Rp235xAdc,
     pwm: Rp235xPwm,
+    cyw43: Rp235xCyw43,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -172,6 +175,7 @@ impl Shell {
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
             "adc" => self.cmd_adc(words.next(), words.next()),
+            "wifi" => self.cmd_wifi(words.next()),
             "slot" => self.cmd_slot(),
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
@@ -886,6 +890,54 @@ impl Shell {
         }
     }
 
+    /// CYW43439 Wi-Fi over the drv-rp235x-cyw43 Idol server: MAC, on-board LED,
+    /// and an active scan (returns the number of AP result frames).
+    fn cmd_wifi(&mut self, verb: Option<&str>) {
+        match verb {
+            Some("mac") => match self.cyw43.get_mac() {
+                Ok(mac) => {
+                    self.out.put(b"mac = ");
+                    for (i, &b) in mac.iter().enumerate() {
+                        if i != 0 {
+                            self.out.put(b":");
+                        }
+                        self.out.put_hex_byte(b);
+                    }
+                    self.out.put(b"\r\n");
+                }
+                Err(_) => self.out.put(b"wifi not ready\r\n"),
+            },
+            Some("status") => match self.cyw43.wifi_status() {
+                Ok(s) => {
+                    self.out.put(b"status = 0x");
+                    self.out.put_hex32(s);
+                    self.out.put(b" (feedbead = up)\r\n");
+                }
+                Err(_) => self.out.put(b"wifi not ready\r\n"),
+            },
+            Some("on") => {
+                let _ = self.cyw43.led(true);
+                self.out.put(b"led on\r\n");
+            }
+            Some("off") => {
+                let _ = self.cyw43.led(false);
+                self.out.put(b"led off\r\n");
+            }
+            Some("scan") => {
+                self.out.put(b"scanning...\r\n");
+                match self.cyw43.scan() {
+                    Ok(n) => {
+                        self.out.put(b"found ");
+                        self.out.put_u32(n);
+                        self.out.put(b" AP result frames\r\n");
+                    }
+                    Err(_) => self.out.put(b"scan failed\r\n"),
+                }
+            }
+            _ => self.out.put(b"usage: wifi mac|status|on|off|scan\r\n"),
+        }
+    }
+
     /// Receive `size` raw bytes over the console and program them into the
     /// boot region of flash, 256-byte page at a time, ACKing each page with
     /// a `.` so the host self-paces (the USB RX ring is finite). Safe while
@@ -1343,6 +1395,7 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],

@@ -105,10 +105,10 @@ extern-regions = ["rom", "xip"]
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 24576, ram = 4096}
+max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43"]
 
 [tasks.hiffy]
 name = "task-hiffy"

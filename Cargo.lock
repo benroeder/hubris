@@ -6869,6 +6869,7 @@ name = "task-rp235x-shell"
 version = "0.1.0"
 dependencies = [
  "drv-rp235x-adc-api",
+ "drv-rp235x-cyw43-api",
  "drv-rp235x-flash-api",
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",
