@@ -234,7 +234,11 @@ fn pio_output_test(p: &rp235x_pac::Peripherals) {
 // Result (raw wire response) in CYW43_PIO -- expect swap16(FEEDBEAD)=0xBEADFEED.
 #[no_mangle]
 #[used]
-static CYW43_PIO: [core::sync::atomic::AtomicU32; 12] = [
+static CYW43_PIO: [core::sync::atomic::AtomicU32; 16] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
@@ -432,11 +436,10 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
         for &word in out_words {
-            // Wait for TX-FIFO space so multi-word bursts don't overflow (TXOVER).
-            let mut s = 0u32;
-            while pio.fstat().read().txfull().bits() & 1 != 0 && s < 200_000 {
-                s += 1;
-            }
+            // Pace to the SM via the TX-FIFO level (FLEVEL bits [3:0] = SM0 TX
+            // count): push only when the 4-deep FIFO has room. Without this a
+            // burst overruns the FIFO and words are silently dropped.
+            while (pio.flevel().read().bits() & 0xF) >= 4 {}
             pio.txf(0).write(|w| unsafe { w.bits(word) });
         }
         for slot in in_words.iter_mut() {
@@ -489,35 +492,23 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // 4. Set the F1 (backplane) read response delay to 4 bytes = 1 padding word,
     //    so backplane reads return [padding, data] and we take the 2nd word.
     xfer(&[cmd_word(true, 0, 0x1d, 1), 4], &mut [0u32; 1]); // write8 F0 SPI_RESP_DELAY_F1
-    // 5. Request the ALP clock on the backplane: write8 F1 CHIP_CLOCK_CSR (0x1000E)
-    //    = ALP_AVAIL_REQ (0x08), then poll read8 until ALP_AVAIL (0x40) is set.
-    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x08], &mut [0u32; 1]);
+    // 5. ALP clock init (embassy init(), SPI path): request ALP, set the F2
+    //    watermark to 0x10, wait for ALP_AVAIL (0x40), then CLEAR CHIP_CLOCK_CSR
+    //    back to 0 -- releasing the request so the firmware can manage the clock
+    //    and bring up HT itself. Leaving the request held blocks the HT clock.
+    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x08], &mut [0u32; 1]); // ALP_AVAIL_REQ
+    xfer(&[cmd_word(true, 1, 0x1_0008, 1), 0x10], &mut [0u32; 1]); // FUNCTION2_WATERMARK = 0x10
     let mut aspin = 0u32;
     let alp = loop {
         let mut r = [0u32; 2]; // F1 read returns [padding, data]
         xfer(&[cmd_word(false, 1, 0x1000E, 1)], &mut r);
         aspin += 1;
-        // ALP_AVAIL (0x40) may land in any byte lane of the response word.
-        if (r[1] & 0x4040_4040) != 0 || aspin >= 2000 {
+        if (r[1] & 0x40) != 0 || aspin >= 2000 {
             break r[1];
         }
     };
-    // 5b. Clear the backplane pull-ups and start the HT clock from the crystal
-    //     (embassy bus.init does this before the download). HT is a hardware
-    //     clock, up before the firmware runs.
-    xfer(&[cmd_word(true, 1, 0x1000F, 1), 0], &mut [0u32; 1]); // PULL_UP = 0
-    let _ = { let mut r = [0u32; 2]; xfer(&[cmd_word(false, 1, 0x1000F, 1)], &mut r); r[1] };
-    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x10], &mut [0u32; 1]); // HT_AVAIL_REQ
-    let mut htprespin = 0u32;
-    let htpre = loop {
-        let mut r = [0u32; 2];
-        xfer(&[cmd_word(false, 1, 0x1000E, 1)], &mut r);
-        htprespin += 1;
-        if (r[1] & 0x80) != 0 || htprespin >= 8000 {
-            break r[1];
-        }
-    };
-    CYW43_PIO[11].store(htpre, SeqCst); // pre-download HT clock (want 0x80 lane)
+    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0], &mut [0u32; 1]); // CHIP_CLOCK_CSR = 0 (release)
+    CYW43_PIO[11].store(alp, SeqCst); // ALP_AVAIL before release
 
     // 6. Windowed backplane read: point the 32 KiB window at CHIPCOMMON_BASE
     //    (0x18000000) via the SBADDR registers, then read the chip-ID register
@@ -575,13 +566,15 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
         let _ = bp_read8(base + RESETCTRL);
     };
     let reset_core_up = |base: u32| {
+        // Core is already disabled (in reset) by the caller. Bring it up like
+        // embassy's reset_device_core, with 1 ms settle delays (~150k cycles).
         bp_write8(base + IOCTRL, 0x2 | 0x1); // FGC | CLOCK_EN
         let _ = bp_read8(base + IOCTRL);
-        bp_write8(base + RESETCTRL, 0);
-        cortex_m::asm::delay(15_000);
-        bp_write8(base + IOCTRL, 0x1); // CLOCK_EN
+        bp_write8(base + RESETCTRL, 0); // out of reset -> CPU starts fetching
+        cortex_m::asm::delay(200_000); // ~1.3 ms
+        bp_write8(base + IOCTRL, 0x1); // CLOCK_EN (drop FGC)
         let _ = bp_read8(base + IOCTRL);
-        cortex_m::asm::delay(15_000);
+        cortex_m::asm::delay(200_000); // ~1.3 ms
     };
     const WLAN_WRAP: u32 = 0x1810_3000;
     const SOCSRAM_WRAP: u32 = 0x1810_4000;
@@ -596,12 +589,13 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // Stream `words` u32s from `src` into backplane `dest`, in <=64-word bursts
     // that never cross the 32 KiB window (matches embassy's bp_write).
     let bp_stream = |dest: u32, src: *const u32, words: usize| {
-        let mut burst = [0u32; 65];
+        let mut burst = [0u32; 17];
         let mut i = 0usize;
         while i < words {
             let addr = dest + (i * 4) as u32;
             let window_rem = (0x8000 - (addr & 0x7FFF)) as usize;
-            let n = (window_rem / 4).min(64).min(words - i);
+            // CYW43_BUS_MAX_BLOCK_SIZE for SPI is 64 bytes = 16 words per write.
+            let n = (window_rem / 4).min(16).min(words - i);
             bp_set_window(addr);
             burst[0] = cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, (n * 4) as u32);
             for k in 0..n {
@@ -615,7 +609,26 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     // into WLAN-core RAM at backplane addr 0.
     let fw_src = 0x1c20_0048 as *const u32;
     let fw_len: usize = 231077;
-    bp_stream(0, fw_src, fw_len.div_ceil(4));
+    let fw_words = fw_len.div_ceil(4);
+    bp_stream(0, fw_src, fw_words);
+    // Verify the first 64 firmware words with SINGLE reads only (proven reliable
+    // via chip-id/3-point) -- no burst read, to isolate write vs burst-read bugs.
+    let mut first_bad = 0xFFFF_FFFFu32;
+    let mut bad_ram = 0u32;
+    let mut bad_src = 0u32;
+    for i in 0..64usize {
+        let v = bp_read32((i * 4) as u32);
+        let s = unsafe { core::ptr::read_volatile(fw_src.add(i)) };
+        if v != s {
+            first_bad = i as u32;
+            bad_ram = v;
+            bad_src = s;
+            break;
+        }
+    }
+    CYW43_PIO[12].store(first_bad, SeqCst); // first bad word (single-read), 0xFFFFFFFF=ok
+    CYW43_PIO[13].store(bad_ram, SeqCst);
+    CYW43_PIO[14].store(bad_src, SeqCst);
     // NVRAM near the top of RAM, then the length-magic word at RAM_SIZE-4 (the
     // firmware needs this to locate the NVRAM, or F2 IORDY never asserts).
     const RAM_SIZE: u32 = 0x8_0000;
@@ -639,9 +652,12 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     let rc = bp_read8(WLAN_WRAP + RESETCTRL) & 0xff;
     let core_up = (io & 0x3) == 0x1 && (rc & 0x1) == 0;
 
-    // Wait for the firmware to bring up the HT clock (CHIP_CLOCK_CSR & 0x80) --
-    // this is the firmware signalling it has started. We just poll (the running
-    // firmware manages the clock; requesting HT ourselves interferes).
+    // init_cyw43439 (post-download): clear the backplane pull-ups, request the HT
+    // clock, and wait for HT_AVAIL (CHIP_CLOCK_CSR & 0x80). The now-running
+    // firmware locks the PLL in response.
+    cortex_m::asm::delay(3_000_000); // ~20 ms for the firmware to spin up
+    xfer(&[cmd_word(true, 1, 0x1000F, 1), 0], &mut [0u32; 1]); // PULL_UP = 0
+    xfer(&[cmd_word(true, 1, 0x1000E, 1), 0x10], &mut [0u32; 1]); // HT_AVAIL_REQ
     let mut htspin = 0u32;
     let ht = loop {
         let mut r = [0u32; 2];

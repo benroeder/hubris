@@ -535,3 +535,22 @@ into the loaded firmware (blob[0]=0x00000000, so a boot ROM reads the header, no
 a raw reset vector). NEXT: reproduce embassy's clock init byte-for-byte in order,
 then re-check HT (0x80) and F2 (0x20); once F2 is ready, the CDC/BDC ioctl path
 drives WL_GPIO0 (LED).
+
+## 29. *** FIRMWARE BOOTED -- HT clock + F2 ready ***
+Root cause of the firmware not running: TWO backplane bugs found by reading the
+georgerobotics/pico-sdk C driver (cyw43_ll.c / cyw43_bus_pio_spi.c):
+1. CYW43_BUS_MAX_BLOCK_SIZE = 64 BYTES for SPI. My 256-byte (64-word) backplane
+   write bursts silently truncated at 64 bytes -- only the first 16 words of each
+   burst landed, the rest was dropped. The 3-point verify only checked the FIRST
+   word of a burst, so it passed while the firmware was full of holes. Fix: cap
+   write bursts at 16 words (64 bytes).
+2. CYW43_BACKPLANE_READ_PAD_LEN_BYTES = 16 for SPI (not 4) -- burst reads carry 4
+   padding words, not 1 (only matters for multi-word reads; single reads with
+   SPI_RESP_DELAY_F1=4 are self-consistent and fine).
+Also replaced the TX-FIFO pacing hack (fixed per-word delay) with a proper
+FLEVEL poll (push only when the 4-deep TX FIFO has room) -- the C driver paces
+via DMA/DREQ; FLEVEL is the register-poll equivalent.
+RESULT on the live Pico 2 W: firmware verify [12]=0xFFFFFFFF (all good), HT clock
+[8]=0x800000d0 (HT_AVAIL 0x80 set), F2 status [9] & STATUS_F2_RX_READY (0x20) set
+after 169 polls. THE CYW43439 IS RUNNING ITS FIRMWARE AND F2 IS READY. NEXT: the
+CDC/BDC ioctl path (CLM upload + country + WL_GPIO0 LED), then scan/join.
