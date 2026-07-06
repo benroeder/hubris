@@ -282,3 +282,25 @@ ANALYZER on GP24 (DIO) / GP25 (CS) / GP29 (CLK): confirm on the WIRE that CS is
 low, CLK toggles cleanly, the 32-bit command (0xA004_4000 MSB-first) is correct,
 and whether the device drives a response. Without wire visibility this is the
 limit of no-guess debugging. The PIO gSPI PHY code is correct and ready.
+
+## 17. Board + rig VALIDATED via benchmarks; chip confirmed alive (live gpio)
+Per the user: the board-to-board rig is the same as the plain-Pico tests, so the
+benchmarks validate it. Ran them across the Pico 2 W (1301) + the plain Pico
+(1201):
+- SPI board-to-board: exchange works both ways (W controller a5 5a 3c c3 <->
+  peripheral de ad be ef), `spi bench 8192` = 56496 B/s (30% of theoretical).
+- UART loopback: status shows rx=32 (works).
+- SPI self-loopback OK on both.
+=> The Pico 2 W's RP2350, GPIO, drivers, and the rig wiring are all HEALTHY. The
+CYW43 problem is isolated to the CYW43 interface, NOT the board.
+
+Live gpio probe (shell `gpio` cmd) with WL_ON(23) high: DIO(24) reads 0 under
+BOTH pull-up and pull-down => the CYW43 actively drives DIO low (alive + powered),
+independently confirming sec 16. (CS/CLK read post-boot reflect the LED task
+owning GP25, not gSPI state.)
+
+Conclusion: board good, chip alive, RP2350-side gSPI verified vs embassy at the
+register level, yet the chip returns no FEEDBEAD. Remaining work needs wire-level
+visibility (logic analyzer on GP24/25/29) or a faithful re-port; the `gpio` shell
+cmd + a future `wifi` shell cmd give a live debug loop (suspend the LED with
+`led off` first, since GP25 = LED = CS).
