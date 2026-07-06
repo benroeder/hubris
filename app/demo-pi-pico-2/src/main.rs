@@ -358,46 +358,41 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     sm.sm_execctrl()
         .modify(|_, w| unsafe { w.wrap_top().bits(5).wrap_bottom().bits(0) });
 
-    // cmd = swap16(cmd_word(READ,INC,0,0x14,4)) = read F0 0x14, 4 B.
-    let cmd = ((1u32 << 30) | (0x14 << 11) | 4).rotate_left(16); // 0xA004_4000
+    let _ = (cs_pre, cs_post); // (earlier CS-control diagnostic; unused now)
+    // gSPI command word [wr|incr|func:2|addr:17|len:11]; the chip powers up in a
+    // 16-bit-swapped mode, so pre-config accesses are swap16'd (rotate 16).
+    let cmd_word = |wr: bool, addr: u32| -> u32 {
+        ((wr as u32) << 31) | (1 << 30) | (addr << 11) | 4
+    };
+    let swap16 = |x: u32| x.rotate_left(16);
     let set_pin = |pin: u32, insn: u16| {
         sm.sm_pinctrl()
             .modify(|_, w| unsafe { w.set_base().bits(pin as u8) });
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(insn) });
     };
-    // Set CLK + DIO output-low once (cyw43_spi_init on the live chip).
-    set_pin(CLK, 0xE081);
-    set_pin(CLK, 0xE000);
-    set_pin(DIO, 0xE081);
-    set_pin(DIO, 0xE000);
-    // PRIMING LOOP (byte-for-byte the sequence PROVEN to read 0xBEADFEED on the
-    // live chip via MicroPython): the CYW43 gSPI returns garbage on the first
-    // transaction after power-up and locks on from the 2nd, so loop until
-    // 0xBEADFEED. Per pass, pico-sdk's pio-read order: pulse CS, disable, clear
-    // FIFOs, DIO pindir out, restart SM + clkdiv (this empties the OSR so the
-    // following autopulls work), load X=31 and Y=63 via the FIFO (put + `out
-    // x/y,32`), jmp to the program start, enable, push the command, read.
-    let mut result = 0u32;
-    let mut pass = 0u32;
-    loop {
-        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
+    // One gSPI transaction: clean the SM (clear FIFOs, restart, empty the OSR so
+    // the X/Y autopulls work), clock out `words` (x_bits+1 bits total), turn DIO
+    // around, clock in y_bits+1 bits, return the first response word.
+    let xfer = |x_bits: u32, y_bits: u32, words: &[u32]| -> u32 {
+        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high (pulse)
         cortex_m::asm::delay(1500);
         sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) }); // CS low
         cortex_m::asm::delay(30_000); // ~200 us settle
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
-        set_pin(DIO, 0xE081); // DIO pindir out (turnaround left it input)
-        pio.ctrl().modify(|_, w| unsafe {
-            w.sm_restart().bits(1).clkdiv_restart().bits(1)
-        });
-        pio.txf(0).write(|w| unsafe { w.bits(31) });
+        set_pin(DIO, 0xE081); // DIO pindir out (the turnaround left it input)
+        pio.ctrl()
+            .modify(|_, w| unsafe { w.sm_restart().bits(1).clkdiv_restart().bits(1) });
+        pio.txf(0).write(|w| unsafe { w.bits(x_bits) });
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
-        pio.txf(0).write(|w| unsafe { w.bits(63) });
+        pio.txf(0).write(|w| unsafe { w.bits(y_bits) });
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
         sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
-        pio.txf(0).write(|w| unsafe { w.bits(cmd) });
+        for &word in words {
+            pio.txf(0).write(|w| unsafe { w.bits(word) });
+        }
         let mut spins = 0u32;
         while pio.fstat().read().rxempty().bits() & 1 != 0 {
             spins += 1;
@@ -405,23 +400,44 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
                 break;
             }
         }
-        result = pio.rxf(0).read().bits();
+        let r = pio.rxf(0).read().bits();
+        sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
+        r
+    };
+    // CLK + DIO output-low once (cyw43_spi_init).
+    set_pin(CLK, 0xE081);
+    set_pin(CLK, 0xE000);
+    set_pin(DIO, 0xE081);
+    set_pin(DIO, 0xE000);
+
+    // 1. Prime + chip-detect: read F0 TEST_RO (0x14) swap16'd until FEEDBEAD -- the
+    //    first transaction after power-up is garbage, the chip locks on from 2nd.
+    let read_ro = swap16(cmd_word(false, 0x14));
+    let mut chip = 0u32;
+    let mut pass = 0u32;
+    loop {
+        chip = swap16(xfer(31, 63, &[read_ro]));
         pass += 1;
-        if result == 0xBEAD_FEED || pass >= 32 {
+        if chip == 0xFEED_BEAD || pass >= 32 {
             break;
         }
     }
-    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
-    let first = result;
-    let any = pass;
-    // [0] = first word (want 0xBEADFEED = swap16(FEEDBEAD)), [1] = OR of the 256
-    // bits (non-zero => the device responded somewhere), [2..3] the pre-power /
-    // post-power CS-control check.
-    CYW43_PIO[0].store(first, SeqCst);
-    CYW43_PIO[1].store(any, SeqCst);
-    CYW43_PIO[2].store(cs_pre, SeqCst);
-    CYW43_PIO[3].store(cs_post, SeqCst);
-    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) }); // CS high
+    // 2. Prove the WRITE path: write F0 TEST_RW (0x18) = 0x12345678, read it back.
+    xfer(63, 31, &[swap16(cmd_word(true, 0x18)), swap16(0x1234_5678)]);
+    let rw = swap16(xfer(31, 63, &[swap16(cmd_word(false, 0x18))]));
+    // 3. Configure REG_BUS_CTRL (0x00): 32-bit words | high-speed | int-pol-high |
+    //    wake | resp-delay 0x4 | status-enable | intr-with-status. After this the
+    //    gSPI is 32-bit little-endian -- subsequent access is NON-swapped.
+    let bus_ctrl: u32 = 0x1 | 0x10 | 0x20 | 0x80 | (0x4 << 8) | ((0x1 | 0x2) << 16);
+    xfer(63, 31, &[swap16(cmd_word(true, 0x00)), swap16(bus_ctrl)]);
+    // 4. Read TEST_RO again, now NON-swapped -> should be FEEDBEAD directly.
+    let ns = xfer(31, 63, &[cmd_word(false, 0x14)]);
+
+    CYW43_PIO[0].store(chip, SeqCst); // want 0xFEEDBEAD (chip-detect)
+    CYW43_PIO[1].store(rw, SeqCst); // want 0x12345678 (write path verified)
+    CYW43_PIO[2].store(ns, SeqCst); // want 0xFEEDBEAD (bus configured, non-swapped)
+    CYW43_PIO[3].store(pass, SeqCst); // detect pass count
+    sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
 }
 // -----------------------------------------------------------------------------
 

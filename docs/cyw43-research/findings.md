@@ -460,3 +460,16 @@ The complete working recipe (all verified on hardware):
   jmp 0, enable, push cmd 0xA004_4000, read.
 - LOOP the read until 0xBEADFEED (the chip's FIRST read after power-up is
   garbage; it locks on from the 2nd). Milestone 1 (chip-detect) COMPLETE.
+
+## 24. gSPI read + write + REG_BUS_CTRL init all verified
+Refactored the boot probe into a reusable `xfer(x_bits, y_bits, words)` gSPI
+transaction and ran the embassy init prologue on the live Pico 2 W:
+- [0] chip-detect (read TEST_RO swapped, primed) = 0xFEEDBEAD
+- [1] WRITE path: write TEST_RW (0x18) = 0x12345678, read back = 0x12345678
+- [2] write REG_BUS_CTRL = 0x304B1 (WORD_LENGTH_32|HIGH_SPEED|INT_POL_HIGH|WAKE_UP
+      |0x4<<8|(STATUS_ENABLE|INTR_WITH_STATUS)<<16); then read TEST_RO NON-swapped
+      = 0xFEEDBEAD -> the bus is now 32-bit little-endian, write path confirmed.
+- [3] detect pass count = 2 (priming).
+So the full gSPI byte layer (read8/16/32, write, mode switch) is proven. NEXT:
+ALP/HT clock request + backplane (F1) window access, then stream the WIFI blob
+from the auxflash server into the WLAN core (firmware upload), then LED.
