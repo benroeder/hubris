@@ -476,6 +476,76 @@ fn cyw43_pio_detect(p: &rp235x_pac::Peripherals) {
     xfer(&[cmd_word(false, 1, 0x8000, 4)], &mut cid);
     let chip_id = cid[1];
 
+    // Windowed backplane byte/word access: set the 32 KiB window via SBADDR, then
+    // access the in-window offset (32-bit access sets flag 0x8000). Used for the
+    // AI-wrapper core-reset registers and the WLAN-core RAM (firmware upload).
+    let bp_set_window = |addr: u32| {
+        let base = addr & !0x7FFF;
+        xfer(&[cmd_word(true, 1, 0x1000C, 1), (base >> 24) & 0xff], &mut [0u32; 1]);
+        xfer(&[cmd_word(true, 1, 0x1000B, 1), (base >> 16) & 0xff], &mut [0u32; 1]);
+        xfer(&[cmd_word(true, 1, 0x1000A, 1), (base >> 8) & 0xff], &mut [0u32; 1]);
+    };
+    let bp_read8 = |addr: u32| -> u32 {
+        bp_set_window(addr);
+        let mut r = [0u32; 2];
+        xfer(&[cmd_word(false, 1, addr & 0x7FFF, 1)], &mut r);
+        r[1]
+    };
+    let bp_write8 = |addr: u32, val: u32| {
+        bp_set_window(addr);
+        xfer(&[cmd_word(true, 1, addr & 0x7FFF, 1), val], &mut [0u32; 1]);
+    };
+    let bp_read32 = |addr: u32| -> u32 {
+        bp_set_window(addr);
+        let mut r = [0u32; 2];
+        xfer(&[cmd_word(false, 1, (addr & 0x7FFF) | 0x8000, 4)], &mut r);
+        r[1]
+    };
+    let bp_write32 = |addr: u32, val: u32| {
+        bp_set_window(addr);
+        xfer(&[cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, 4), val], &mut [0u32; 1]);
+    };
+    // AI-wrapper core reset (embassy chip.rs). WLAN wrapper 0x18103000, SOCSRAM
+    // wrapper 0x18104000; IOCTRL 0x408 (FGC 0x2, CLOCK_EN 0x1), RESETCTRL 0x800
+    // (RESET 0x1).
+    const IOCTRL: u32 = 0x408;
+    const RESETCTRL: u32 = 0x800;
+    let disable_core = |base: u32| {
+        if bp_read8(base + RESETCTRL) & 0x1 != 0 {
+            return;
+        }
+        bp_write8(base + IOCTRL, 0);
+        let _ = bp_read8(base + IOCTRL);
+        bp_write8(base + RESETCTRL, 0x1);
+        let _ = bp_read8(base + RESETCTRL);
+    };
+    let reset_core_up = |base: u32| {
+        bp_write8(base + IOCTRL, 0x2 | 0x1); // FGC | CLOCK_EN
+        let _ = bp_read8(base + IOCTRL);
+        bp_write8(base + RESETCTRL, 0);
+        cortex_m::asm::delay(15_000);
+        bp_write8(base + IOCTRL, 0x1); // CLOCK_EN
+        let _ = bp_read8(base + IOCTRL);
+        cortex_m::asm::delay(15_000);
+    };
+    const WLAN_WRAP: u32 = 0x1810_3000;
+    const SOCSRAM_WRAP: u32 = 0x1810_4000;
+    const SOCSRAM_BASE: u32 = 0x1800_4000;
+    // Prep for firmware download: park WLAN + SOCSRAM cores, bring SOCSRAM back up,
+    // run the 43439 SOCSRAM init, then prove we can read/write the WLAN core RAM.
+    disable_core(WLAN_WRAP);
+    disable_core(SOCSRAM_WRAP);
+    reset_core_up(SOCSRAM_WRAP);
+    bp_write32(SOCSRAM_BASE + 0x10, 3);
+    bp_write32(SOCSRAM_BASE + 0x44, 0);
+    bp_write32(0, 0xDEAD_BEEF); // WLAN RAM (ATCM base = 0)
+    let ram_rb = bp_read32(0);
+    let core_up = bp_read8(WLAN_WRAP + RESETCTRL); // WLAN still in reset here (0x1)
+
+    CYW43_PIO[5].store(ram_rb, SeqCst); // want 0xDEADBEEF (WLAN RAM read/write)
+    CYW43_PIO[6].store(chip_id, SeqCst); // duplicate of [4] for alignment
+    CYW43_PIO[7].store(core_up, SeqCst); // WLAN RESETCTRL (0x1 = in reset, expected)
+
     CYW43_PIO[0].store(chip, SeqCst); // want 0xFEEDBEAD (chip-detect)
     CYW43_PIO[1].store(rw, SeqCst); // want 0x12345678 (write path verified)
     CYW43_PIO[2].store(alp, SeqCst); // CHIP_CLOCK_CSR (want ALP_AVAIL 0x40 in a lane)
