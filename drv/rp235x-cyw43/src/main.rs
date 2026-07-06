@@ -651,6 +651,84 @@ impl Cyw43 {
         events
     }
 
+    /// Send one Ethernet frame over the F2 DATA channel (SDPCM ch2 + 2B pad +
+    /// BDC, data_offset 0 so the frame starts at byte 18). Honors SDPCM flow
+    /// control. Returns false if no credit was available. This is smoltcp's TX.
+    fn send_frame(&mut self, eth: &[u8], fr: &mut [u32; 512]) -> bool {
+        let mut g = 0u32;
+        while self.credit == self.tx_seq && g < 8000 {
+            g += 1;
+            let (got, chan, _s, bdc, _i) = self.rx(fr);
+            if got {
+                self.take_credit(chan, bdc);
+            } else {
+                cortex_m::asm::delay(10_000);
+            }
+        }
+        if self.credit == self.tx_seq {
+            return false;
+        }
+        let total = 18 + eth.len(); // SDPCM(12) + pad(2) + BDC(4) + eth
+        let total_pad = (total + 3) & !3;
+        let mut b = [0u32; 400];
+        b[0] = 0xE000_0000 | total as u32; // gSPI F2 write
+        b[1] = (total as u32 & 0xFFFF) | (((!(total as u32)) & 0xFFFF) << 16);
+        b[2] = (self.tx_seq as u32) | (2 << 8) | (14 << 24); // seq, chan=2, hdr_len=14
+        b[3] = 0;
+        b[4] = 0x20u32 << 16; // pad,pad,BDC.flags=0x20,BDC.priority=0
+        for (j, &byte) in eth.iter().enumerate() {
+            let pos = 18 + j;
+            b[1 + pos / 4] |= (byte as u32) << (8 * (pos % 4));
+        }
+        self.xfer(&b[..1 + total_pad / 4], &mut [0u32; 1]);
+        self.tx_seq = self.tx_seq.wrapping_add(1);
+        true
+    }
+
+    /// Try to receive one Ethernet frame (SDPCM channel 2). Returns the number
+    /// of bytes copied into `out` (0 if no DATA frame). This is smoltcp's RX.
+    #[allow(dead_code)] // used by the smoltcp phy (next phase)
+    fn recv_frame(&mut self, out: &mut [u8], fr: &mut [u32; 512]) -> usize {
+        let (got, chan, _s, bdc, _i) = self.rx(fr);
+        if !got {
+            return 0;
+        }
+        self.take_credit(chan, bdc);
+        if chan != 2 {
+            return 0;
+        }
+        let data_offset = ((fr[4] >> 8) & 0xFF) as usize; // BDC.data_offset (byte 17)
+        let eth_start = 18 + data_offset * 4;
+        let total = (fr[0] & 0xFFFF) as usize; // SDPCM len
+        if total <= eth_start {
+            return 0;
+        }
+        let n = (total - eth_start).min(out.len());
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            let pos = eth_start + i;
+            *o = (fr[pos / 4] >> (8 * (pos % 4))) as u8;
+        }
+        n
+    }
+
+    /// TX self-test: send a gratuitous ARP for 192.168.4.1 (our AP gateway).
+    /// Returns 1 if the frame was accepted (credit consumed). Proves send_frame.
+    fn data_test(&mut self, fr: &mut [u32; 512]) -> u32 {
+        let mut arp = [0u8; 42];
+        arp[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
+        arp[6..12].copy_from_slice(&self.mac); // src = our MAC
+        arp[12..14].copy_from_slice(&[0x08, 0x06]); // ethertype ARP
+        arp[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 2]); // htype/ptype/hlen/plen/oper=reply
+        arp[22..28].copy_from_slice(&self.mac); // sender MAC
+        arp[28..32].copy_from_slice(&[192, 168, 4, 1]); // sender IP = gateway
+        arp[38..42].copy_from_slice(&[192, 168, 4, 1]); // target IP (gratuitous)
+        if self.send_frame(&arp, fr) {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Read F2 frames for a few seconds and count channel-2 (DATA) frames --
     /// e.g. a joined client's DHCP/ARP broadcasts. Captures the first into
     /// DATA_FRAME. This is the RX half of the smoltcp phy (Phase 2 proof).
@@ -852,6 +930,12 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
         _: &RecvMessage,
     ) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.data_poll(&mut self.fr))
+    }
+    fn data_test(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Cyw43Error>> {
+        Ok(self.wifi.data_test(&mut self.fr))
     }
 }
 

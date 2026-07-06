@@ -33,5 +33,9 @@ Interface(
             description: "Read F2 frames for a few seconds; returns the count of channel-2 (DATA) frames (e.g. a joined client's DHCP).",
             reply: Result(ok: "u32", err: CLike("Cyw43Error")),
         ),
+        "data_test": (
+            description: "TX self-test: send a gratuitous ARP over the DATA channel; returns 1 if accepted.",
+            reply: Result(ok: "u32", err: CLike("Cyw43Error")),
+        ),
     },
 )
