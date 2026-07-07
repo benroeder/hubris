@@ -26,6 +26,8 @@ use userlib::{task_slot, RecvMessage};
 
 task_slot!(AUXFLASH, auxflash);
 
+mod net;
+
 const WL_ON: u32 = 23; // WL_REG_ON (power/reset)
 const DIO: u32 = 24; // gSPI DIO (half-duplex data)
 const CS: u32 = 25; // gSPI CS
@@ -101,6 +103,12 @@ struct Cyw43 {
     status: u32,
     ssid: [u8; 32],
     ssid_len: u8,
+    /// gSPI CS-low settle delay (cycles). Large + safe during bring-up, then
+    /// dropped for the runtime loop so it keeps up with client packet bursts.
+    settle: u32,
+    /// DHCP lease table: client MAC per pool slot; IP = 192.168.4.(2 + slot).
+    leases: [[u8; 6]; 8],
+    lease_count: u8,
 }
 
 impl Cyw43 {
@@ -130,7 +138,7 @@ impl Cyw43 {
         sio.gpio_out_set().write(|w| unsafe { w.bits(1 << CS) });
         cortex_m::asm::delay(1500);
         sio.gpio_out_clr().write(|w| unsafe { w.bits(1 << CS) });
-        cortex_m::asm::delay(30_000);
+        cortex_m::asm::delay(self.settle);
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
@@ -384,6 +392,9 @@ impl Cyw43 {
             status: 0,
             ssid: [0; 32],
             ssid_len: 0,
+            settle: 30_000, // conservative during bring-up (firmware upload)
+            leases: [[0; 6]; 8],
+            lease_count: 0,
         };
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         me.ssid[..7].copy_from_slice(b"hubris-");
@@ -520,6 +531,9 @@ impl Cyw43 {
         }
 
         me.status = chip;
+        // Keep the full CS-settle at runtime: DHCP TX must be reliable (a
+        // corrupted OFFER/ACK -> the client never finalizes its lease). The
+        // provisioning traffic is paced, so the slower loop is fine.
         DIAG[15].store(0x600D_F00D, SeqCst);
         Ok(me)
     }
@@ -655,6 +669,7 @@ impl Cyw43 {
     /// BDC, data_offset 0 so the frame starts at byte 18). Honors SDPCM flow
     /// control. Returns false if no credit was available. This is smoltcp's TX.
     fn send_frame(&mut self, eth: &[u8], fr: &mut [u32; 512]) -> bool {
+        self.settle = 30_000; // TX must be reliable (corrupt OFFER/ACK -> no lease)
         let mut g = 0u32;
         while self.credit == self.tx_seq && g < 8000 {
             g += 1;
@@ -689,6 +704,7 @@ impl Cyw43 {
     /// Try to receive one Ethernet frame (SDPCM channel 2). Returns the number
     /// of bytes copied into `out` (0 if no DATA frame). This is smoltcp's RX.
     fn recv_frame(&mut self, out: &mut [u8], fr: &mut [u32; 512]) -> usize {
+        self.settle = 3_000; // RX can be fast; must keep up with client bursts (ARP/REQUEST)
         let (got, chan, _s, bdc, _i) = self.rx(fr);
         if !got {
             return 0;
@@ -743,6 +759,174 @@ impl Cyw43 {
         !(sum as u16)
     }
 
+    /// Answer an ARP request for our gateway IP (192.168.4.1) with our MAC.
+    fn arp_reply(&mut self, rx: &[u8], fr: &mut [u32; 512]) {
+        let mut tx = [0u8; 42];
+        tx[0..6].copy_from_slice(&rx[6..12]); // dst = requester
+        tx[6..12].copy_from_slice(&self.mac); // src = us
+        tx[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+        tx[14..16].copy_from_slice(&[0x00, 0x01]); // htype ethernet
+        tx[16..18].copy_from_slice(&[0x08, 0x00]); // ptype IPv4
+        tx[18] = 6; // hlen
+        tx[19] = 4; // plen
+        tx[20..22].copy_from_slice(&[0x00, 0x02]); // oper = reply
+        tx[22..28].copy_from_slice(&self.mac); // sender MAC = us
+        tx[28..32].copy_from_slice(&[192, 168, 4, 1]); // sender IP = gateway
+        tx[32..38].copy_from_slice(&rx[22..28]); // target MAC = requester
+        tx[38..42].copy_from_slice(&rx[28..32]); // target IP = requester
+        self.send_frame(&tx, fr);
+        DIAG[8].store(DIAG[8].load(SeqCst).wrapping_add(1), SeqCst); // ARP replies
+    }
+
+    /// TCP checksum over the pseudo-header (src, dst, proto=6, len) + segment.
+    fn tcp_checksum(src: &[u8], dst: &[u8], seg: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        sum += ((src[0] as u32) << 8) | src[1] as u32;
+        sum += ((src[2] as u32) << 8) | src[3] as u32;
+        sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+        sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+        sum += 6; // protocol
+        sum += seg.len() as u32; // TCP length
+        let mut i = 0;
+        while i + 1 < seg.len() {
+            sum += ((seg[i] as u32) << 8) | seg[i + 1] as u32;
+            i += 2;
+        }
+        if i < seg.len() {
+            sum += (seg[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Transparent captive-portal HTTP intercept on TCP :80. A minimal one-shot
+    /// server that spoofs the destination IP the client dialed, so it answers the
+    /// iOS probe (GET /hotspot-detect.html) regardless of DNS caching. SYN ->
+    /// SYN/ACK; the GET -> portal HTML (NOT "Success") + FIN -> CNA popup.
+    fn tcp80(&mut self, rx: &[u8], n: usize, ihl: usize, fr: &mut [u32; 512]) {
+        let tcp = 14 + ihl;
+        let flags = rx[tcp + 13];
+        let doff = ((rx[tcp + 12] >> 4) as usize) * 4;
+        let cseq = u32::from_be_bytes([rx[tcp + 4], rx[tcp + 5], rx[tcp + 6], rx[tcp + 7]]);
+        let payload_len = n.saturating_sub(tcp + doff);
+        DIAG[9].store(DIAG[9].load(SeqCst).wrapping_add(1), SeqCst); // TCP :80 hits
+
+        let mut tx = [0u8; 700];
+        tx[0..6].copy_from_slice(&rx[6..12]); // dst mac = client
+        tx[6..12].copy_from_slice(&self.mac);
+        tx[12..14].copy_from_slice(&[0x08, 0x00]);
+        tx[14] = 0x45;
+        tx[22] = 64;
+        tx[23] = 6; // TCP
+        tx[26..30].copy_from_slice(&rx[30..34]); // src ip = the IP the client dialed
+        tx[30..34].copy_from_slice(&rx[26..30]); // dst ip = client
+        let t = 34;
+        tx[t..t + 2].copy_from_slice(&rx[tcp + 2..tcp + 4]); // src port 80
+        tx[t + 2..t + 4].copy_from_slice(&rx[tcp..tcp + 2]); // dst port = client
+        tx[t + 12] = 0x50; // data offset 5 words
+        tx[t + 14..t + 16].copy_from_slice(&[0xff, 0xff]); // window
+
+        let ack;
+        let mut oseq = 0x0000_1000u32;
+        let mut body_len = 0usize;
+        if (flags & 0x02) != 0 {
+            tx[t + 13] = 0x12; // SYN|ACK
+            ack = cseq.wrapping_add(1);
+        } else if payload_len > 0 {
+            oseq = 0x0000_1001;
+            ack = cseq.wrapping_add(payload_len as u32);
+            let ps = tcp + doff;
+            let is_api = payload_len >= 9 && &rx[ps..ps + 9] == b"GET /api ";
+            let (hdr, body): (&[u8], &[u8]) = if is_api {
+                // RFC 8908 captive-portal API -> iOS opens the user-portal-url.
+                (
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n",
+                    b"{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}",
+                )
+            } else {
+                (
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+                    b"<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif\"><h1>Pico 2 W Wi-Fi Setup</h1><p>Captive portal is up. Wi-Fi scan + password form next.</p></body></html>",
+                )
+            };
+            let p = t + 20;
+            tx[p..p + hdr.len()].copy_from_slice(hdr);
+            tx[p + hdr.len()..p + hdr.len() + body.len()].copy_from_slice(body);
+            body_len = hdr.len() + body.len();
+            tx[t + 13] = 0x19; // PSH|ACK|FIN
+        } else {
+            return; // bare ACK / FIN -- nothing to send
+        }
+        tx[t + 4..t + 8].copy_from_slice(&oseq.to_be_bytes());
+        tx[t + 8..t + 12].copy_from_slice(&ack.to_be_bytes());
+        let flen = t + 20 + body_len;
+        tx[16..18].copy_from_slice(&((flen - 14) as u16).to_be_bytes());
+        let ipck = Self::ip_checksum(&tx[14..34]);
+        tx[24..26].copy_from_slice(&ipck.to_be_bytes());
+        let src = [tx[26], tx[27], tx[28], tx[29]];
+        let dst = [tx[30], tx[31], tx[32], tx[33]];
+        let tcpck = Self::tcp_checksum(&src, &dst, &tx[t..flen]);
+        tx[t + 16..t + 18].copy_from_slice(&tcpck.to_be_bytes());
+        self.send_frame(&tx[..flen], fr);
+    }
+
+    /// Captive-portal DNS hijack: answer every A query with 192.168.4.1 so the
+    /// client's captive-portal probe (e.g. captive.apple.com) resolves to us.
+    /// AAAA/other queries get an empty (no-answer) response so it falls back to A.
+    fn dns_reply(&mut self, rx: &[u8], n: usize, udp: usize, fr: &mut [u32; 512]) {
+        let dns = udp + 8;
+        if n < dns + 12 + 5 {
+            return;
+        }
+        let q = dns + 12; // question (name) start
+        let mut nend = q;
+        while nend < n && rx[nend] != 0 {
+            nend += 1 + rx[nend] as usize;
+        }
+        if nend + 5 > n {
+            return;
+        }
+        let qtype = ((rx[nend + 1] as u16) << 8) | rx[nend + 2] as u16;
+        let qlen = (nend + 5) - q; // name + null + qtype(2) + qclass(2)
+        let is_a = qtype == 1;
+        let mut tx = [0u8; 512];
+        tx[0..6].copy_from_slice(&rx[6..12]); // dst = client MAC
+        tx[6..12].copy_from_slice(&self.mac); // src = us
+        tx[12..14].copy_from_slice(&[0x08, 0x00]);
+        tx[14] = 0x45;
+        tx[22] = 64;
+        tx[23] = 17;
+        tx[26..30].copy_from_slice(&[192, 168, 4, 1]); // src IP
+        tx[30..34].copy_from_slice(&rx[26..30]); // dst = client IP
+        tx[34..36].copy_from_slice(&[0, 53]); // UDP src 53
+        tx[36..38].copy_from_slice(&rx[udp..udp + 2]); // UDP dst = client sport
+        let d = 42;
+        tx[d..d + 2].copy_from_slice(&rx[dns..dns + 2]); // DNS id echo
+        tx[d + 2..d + 4].copy_from_slice(&[0x81, 0x80]); // response, RA, no error
+        tx[d + 4..d + 6].copy_from_slice(&[0, 1]); // qdcount 1
+        tx[d + 6..d + 8].copy_from_slice(&[0, if is_a { 1 } else { 0 }]); // ancount
+        tx[d + 12..d + 12 + qlen].copy_from_slice(&rx[q..q + qlen]); // echo question
+        let mut flen = d + 12 + qlen;
+        if is_a {
+            let a = flen;
+            tx[a..a + 2].copy_from_slice(&[0xc0, 0x0c]); // name ptr -> offset 12
+            tx[a + 2..a + 4].copy_from_slice(&[0, 1]); // type A
+            tx[a + 4..a + 6].copy_from_slice(&[0, 1]); // class IN
+            tx[a + 6..a + 10].copy_from_slice(&[0, 0, 0, 60]); // TTL 60
+            tx[a + 10..a + 12].copy_from_slice(&[0, 4]); // rdlength
+            tx[a + 12..a + 16].copy_from_slice(&[192, 168, 4, 1]); // A = us
+            flen = a + 16;
+        }
+        tx[16..18].copy_from_slice(&((flen - 14) as u16).to_be_bytes()); // IP total
+        tx[38..40].copy_from_slice(&((flen - 34) as u16).to_be_bytes()); // UDP len
+        let ck = Self::ip_checksum(&tx[14..34]);
+        tx[24..26].copy_from_slice(&ck.to_be_bytes());
+        self.send_frame(&tx[..flen], fr);
+        DIAG[13].store(DIAG[13].load(SeqCst).wrapping_add(1), SeqCst); // DNS replies
+    }
+
     /// Minimal DHCP server for the provisioning AP: leases the joining client
     /// 192.168.4.2, with gateway + DNS = us (192.168.4.1). Hand-rolled on the F2
     /// DATA path because DHCP is broadcast (awkward for smoltcp, which has no
@@ -759,23 +943,74 @@ impl Cyw43 {
             }
             frames += 1;
             DIAG[10].store(frames, SeqCst); // any DATA frame seen
-            // Ethernet(14) + IPv4 + UDP(8) + DHCP(240 fixed+magic).
-            if n < 282 || rx[12] != 0x08 || rx[13] != 0x00 {
+            if n < 42 {
+                continue;
+            }
+            // ARP: answer "who has 192.168.4.1?" so the client can reach us as its
+            // gateway (without this the phone shows no router and never runs its
+            // captive-portal check).
+            if rx[12] == 0x08 && rx[13] == 0x06 {
+                if rx[20] == 0
+                    && rx[21] == 1
+                    && rx[38] == 192
+                    && rx[39] == 168
+                    && rx[40] == 4
+                    && rx[41] == 1
+                {
+                    self.arp_reply(&rx, fr);
+                }
+                continue;
+            }
+            // Ethernet(14) + IPv4 + UDP -- dispatch on the UDP destination port.
+            if rx[12] != 0x08 || rx[13] != 0x00 {
                 continue;
             }
             let ihl = (rx[14] & 0x0f) as usize * 4;
-            if rx[14 + 9] != 17 {
-                continue; // not UDP
+            let proto = rx[14 + 9];
+            if proto == 6 {
+                // TCP: transparent captive-portal intercept of ANY :80 (the phone
+                // routes its HTTP probe through us, the gateway, cached DNS or not).
+                let tcp = 14 + ihl;
+                if n >= tcp + 20
+                    && (((rx[tcp + 2] as u16) << 8) | rx[tcp + 3] as u16) == 80
+                {
+                    self.tcp80(&rx, n, ihl, fr);
+                }
+                continue;
+            }
+            if proto != 17 {
+                continue; // only UDP below
             }
             let udp = 14 + ihl;
             let dport = ((rx[udp + 2] as u16) << 8) | rx[udp + 3] as u16;
-            if dport != 67 || rx[udp + 8] != 1 {
+            DIAG[14].store(0x0DF0_0000 | dport as u32, SeqCst); // last UDP dst port
+            if dport == 53 {
+                self.dns_reply(&rx, n, udp, fr); // captive-portal DNS hijack
+                continue;
+            }
+            if dport != 67 || n < 282 || rx[udp + 8] != 1 {
                 continue; // not a DHCP BOOTREQUEST
             }
             let dh = udp + 8;
             let mut cmac = [0u8; 6];
             cmac.copy_from_slice(&rx[dh + 28..dh + 34]);
             let xid = [rx[dh + 4], rx[dh + 5], rx[dh + 6], rx[dh + 7]];
+            // Assign (or reuse) this client's lease from the .2-.9 pool by MAC.
+            let mut slot = usize::MAX;
+            for i in 0..self.lease_count as usize {
+                if self.leases[i] == cmac {
+                    slot = i;
+                    break;
+                }
+            }
+            if slot == usize::MAX {
+                slot = (self.lease_count as usize).min(7);
+                self.leases[slot] = cmac;
+                if (self.lease_count as usize) < 8 {
+                    self.lease_count += 1;
+                }
+            }
+            let yiaddr = [192, 168, 4, 2 + slot as u8];
             // DHCP message-type option (53): 1=DISCOVER, 3=REQUEST.
             let mut msgtype = 0u8;
             let mut o = dh + 240;
@@ -800,7 +1035,7 @@ impl Cyw43 {
                 _ => continue,
             };
             // Build Ethernet + IPv4 + UDP + DHCP reply.
-            let mut tx = [0u8; 342];
+            let mut tx = [0u8; 400];
             tx[0..6].copy_from_slice(&[0xff; 6]); // L2 broadcast: client has no IP yet
             tx[6..12].copy_from_slice(&self.mac); // src = us
             tx[12..14].copy_from_slice(&[0x08, 0x00]);
@@ -816,18 +1051,20 @@ impl Cyw43 {
             tx[d + 1] = 1; // htype ethernet
             tx[d + 2] = 6; // hlen
             tx[d + 4..d + 8].copy_from_slice(&xid);
-            tx[d + 16..d + 20].copy_from_slice(&[192, 168, 4, 2]); // yiaddr
+            tx[d + 16..d + 20].copy_from_slice(&yiaddr); // yiaddr (per-client lease)
             tx[d + 20..d + 24].copy_from_slice(&[192, 168, 4, 1]); // siaddr
             tx[d + 28..d + 34].copy_from_slice(&cmac); // chaddr
             tx[d + 236..d + 240].copy_from_slice(&[99, 130, 83, 99]); // magic
             let mut p = d + 240;
-            let opts: [&[u8]; 6] = [
+            let opts: [&[u8]; 7] = [
                 &[53, 1, reply_type],
                 &[54, 4, 192, 168, 4, 1],       // server id
                 &[51, 4, 0, 1, 0x51, 0x80],     // lease 86400 s
                 &[1, 4, 255, 255, 255, 0],      // subnet mask
                 &[3, 4, 192, 168, 4, 1],        // router
                 &[6, 4, 192, 168, 4, 1],        // DNS
+                // option 114 (RFC 8910): captive-portal API URL (len 22).
+                b"\x72\x16http://192.168.4.1/api",
             ];
             for opt in opts {
                 tx[p..p + opt.len()].copy_from_slice(opt);
@@ -929,12 +1166,39 @@ impl Cyw43 {
         mr[9] = 22;
         self.do_ioctl_b(2, 0x107, 48, 1, &mr, 13, fr);
         self.do_ioctl(78, 49, 1, &[1], 4, fr);
+        // arpoe = 0: disable ARP offload so the firmware hands ARP frames to the
+        // host (smoltcp answers ARP for our gateway .1). Firmware default is
+        // arpoe=1, which makes it intercept ARP -- in AP mode its offload table
+        // has no entry for .1, so clients can never resolve the gateway.
+        let mut ao = [0u8; 12];
+        ao[..6].copy_from_slice(b"arpoe\0");
+        self.do_ioctl_b(2, 0x107, 51, 0, &ao, 10, fr);
         // Bring the AP up: bss = [AP=1, up=1].
         let mut bss = [0u8; 12];
         bss[..4].copy_from_slice(b"bss\0");
         bss[4] = 1;
         bss[8] = 1;
-        self.do_ioctl_b(2, 0x107, 50, 0, &bss, 12, fr)
+        let status = self.do_ioctl_b(2, 0x107, 50, 0, &bss, 12, fr);
+        // In apsta mode the AP interface (iface 1) has its OWN MAC; clients send
+        // gateway traffic to THAT, not the STA MAC we read at init. Adopt the AP
+        // MAC so our gratuitous ARP + smoltcp identity match what the AP receives
+        // on (otherwise unicast to .1 is addressed to a MAC the AP ignores).
+        let ms = self.do_ioctl_b(0, 0x106, 52, 1, b"cur_etheraddr\0", 14 + 6, fr);
+        if ms == 0 {
+            let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+            let w0 = fr[hl + 4];
+            let w1 = fr[hl + 5];
+            self.mac = [
+                w0 as u8,
+                (w0 >> 8) as u8,
+                (w0 >> 16) as u8,
+                (w0 >> 24) as u8,
+                w1 as u8,
+                (w1 >> 8) as u8,
+            ];
+            DIAG[8].store(w0, SeqCst); // AP MAC low word (vs STA MAC for compare)
+        }
+        status
     }
 }
 
@@ -1106,9 +1370,9 @@ fn main() -> ! {
     // free for live DIAG reads.)
     server.wifi.ap_start(&mut server.fr);
     let _ = &idl::INCOMING_SIZE;
-    loop {
-        server.wifi.dhcp_serve(&mut server.fr);
-    }
+    // Transport is smoltcp (net::run_portal): it owns ARP/IP/UDP/TCP; we run the
+    // DHCP/DNS/HTTP servers on its sockets. Never returns.
+    net::run_portal(&mut server.wifi, &mut server.fr)
 }
 
 mod idl {

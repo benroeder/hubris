@@ -49,14 +49,18 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
     0x0100_0406,
     0xffff_fe90, // entry 0: storage start, relative to the load-map item
     0x2000_0000, // entry 0: runtime start (SRAM, absolute)
-    // Copy size (128 KiB). MUST be strictly less than the enclosing
+    // Copy size (192 KiB). MUST be strictly less than the enclosing
     // partition/window size: the bootrom rejects the block if
     // from_storage + size >= window_end (varm_blocks.c). Our A/B partitions
     // are 256 KiB, so copying the full 256 KiB fails the check -- it only
     // worked as a single image because the window was the whole 4 MB flash.
-    // 128 KiB comfortably covers the ~60 KiB image with room to grow while
-    // staying under the 256 KiB partition.
-    0x0002_0000, // entry 0: size in bytes (128 KiB)
+    // CRITICAL: this size is the exact flash->SRAM copy length. If the image
+    // exceeds it, the tail is silently NOT copied -- a task's .rodata/.text
+    // near the top of SRAM reads garbage (e.g. a patched task-slot -> boot
+    // fault "used bogus task index"). The smoltcp build is ~136 KiB, so 128 KiB
+    // truncated it. 192 KiB covers it with room, still under the 256 KiB
+    // partition.
+    0x0003_0000, // entry 0: size in bytes (192 KiB)
     // VERSION item (type 0x48, 2 words, no rollback rows): the boot ROM uses
     // this to choose between A/B partitions -- the higher version boots. The
     // second word ((major << 16) | minor) is stamped by build.rs from

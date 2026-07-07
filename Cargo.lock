@@ -2270,6 +2270,7 @@ dependencies = [
  "drv-rp235x-cyw43-api",
  "idol",
  "idol-runtime",
+ "mutable-statics",
  "num-traits",
  "rp235x-pac",
  "smoltcp",

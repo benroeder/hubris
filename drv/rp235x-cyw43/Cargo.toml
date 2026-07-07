@@ -15,6 +15,7 @@ smoltcp = { workspace = true, features = ["proto-ipv4", "socket-tcp"] }
 drv-rp235x-cyw43-api = { path = "../rp235x-cyw43-api" }
 drv-auxflash-api = { path = "../auxflash-api" }
 counters = { path = "../../lib/counters" }
+mutable-statics = { path = "../../lib/mutable-statics" }
 userlib = { path = "../../sys/userlib" }
 
 [build-dependencies]
