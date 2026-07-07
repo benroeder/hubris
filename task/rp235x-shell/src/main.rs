@@ -67,7 +67,6 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   bench all [addr]      throughput of every bus in one table\r\n\
-  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -97,15 +96,26 @@ const HELP: &[u8] = b"commands:\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
   push <size> <crc>     stream own flash image to a peer over UART\r\n\
-  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
-  slink listen [ms]     wait for an S-Link frame; print the bytes\r\n\
-  rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n\
-  rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
-  rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]   set the DS1302 clock\r\n\
-  sd init               run the SD SPI-mode init handshake (GP10-13)\r\n\
-  sd read <block>       read a 512-byte block; hexdump it\r\n\
-  sd find <start> <n>   scan n blocks; print any printable-ASCII runs (>=4)\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
+
+// Per-driver help lines, printed only when that driver's feature is enabled so
+// `help` never advertises a command the build doesn't have.
+#[cfg(feature = "mailbox")]
+const HELP_MAILBOX: &[u8] =
+    b"  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n";
+#[cfg(feature = "slink")]
+const HELP_SLINK: &[u8] = b"  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
+  slink listen [ms]     wait for an S-Link frame; print the bytes\r\n";
+#[cfg(feature = "ws2812")]
+const HELP_WS2812: &[u8] =
+    b"  rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n";
+#[cfg(feature = "ds1302")]
+const HELP_DS1302: &[u8] = b"  rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
+  rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]   set the DS1302 clock\r\n";
+#[cfg(feature = "sdcard")]
+const HELP_SDCARD: &[u8] = b"  sd init               run the SD SPI-mode init handshake (GP10-13)\r\n\
+  sd read <block>       read a 512-byte block; hexdump it\r\n\
+  sd find <start> <n>   scan n blocks; print any printable-ASCII runs (>=4)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -206,7 +216,19 @@ impl Shell {
         let mut words = line.split_whitespace();
         let Some(cmd) = words.next() else { return };
         match cmd {
-            "help" => self.out.put(HELP),
+            "help" => {
+                self.out.put(HELP);
+                #[cfg(feature = "mailbox")]
+                self.out.put(HELP_MAILBOX);
+                #[cfg(feature = "slink")]
+                self.out.put(HELP_SLINK);
+                #[cfg(feature = "ws2812")]
+                self.out.put(HELP_WS2812);
+                #[cfg(feature = "ds1302")]
+                self.out.put(HELP_DS1302);
+                #[cfg(feature = "sdcard")]
+                self.out.put(HELP_SDCARD);
+            }
             "status" => self.cmd_status(),
             "ticks" => {
                 self.out.put(b"uptime ");

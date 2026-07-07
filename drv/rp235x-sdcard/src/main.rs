@@ -68,9 +68,10 @@ const SPIN_LIMIT: u32 = 1_000_000;
 const R1_POLLS: u32 = 8;
 /// CMD0-into-idle retries.
 const CMD0_RETRIES: u32 = 16;
-/// ACMD41 ready-poll budget. One iteration is CMD55+CMD41 plus a ~1 ms delay,
-/// so ~1000 iterations is ~1 s -- the SD spec's power-up ceiling.
-const ACMD41_RETRIES: u32 = 1000;
+/// ACMD41 ready-poll budget. One iteration is CMD55+CMD41 plus a ~1 ms delay.
+/// The SD spec's power-up ceiling is 1 s, but some cards take longer, so allow
+/// ~2 s of headroom.
+const ACMD41_RETRIES: u32 = 2000;
 /// clk_sys cycles for a ~1 ms inter-poll delay in the ACMD41 loop.
 const MS_CYCLES: u32 = 150_000;
 /// Data-start-token poll budget for `read_block` (each iteration is one byte
@@ -220,8 +221,10 @@ impl ServerImpl {
                 self.cs_high();
                 return Err(SdError::Init);
             }
-        } else if r & 0x04 != 0 {
-            // Illegal command: an SD v1 (or MMC) card. Proceed as v1.
+        } else if r != 0xFF && r & 0x04 != 0 {
+            // Illegal command: an SD v1 (or MMC) card. Proceed as v1. (0xFF is
+            // the no-response value, which also has bit2 set -- exclude it so an
+            // absent/misread card errors here instead of misreading it as v1.)
             false
         } else {
             self.cs_high();
@@ -350,7 +353,11 @@ impl idl::InOrderRp235xSdcardImpl for ServerImpl {
         self.cs_high();
         self.xfer(FILLER);
 
-        dest.write_range(0..BLOCK_LEN, &buf)
+        // Copy out only as much as the caller's lease holds (LenLimit bounds it
+        // to <=512), mirroring the flash driver -- a short lease should get its
+        // bytes, not a spurious lease error.
+        let n = dest.len().min(BLOCK_LEN);
+        dest.write_range(0..n, &buf[..n])
             .map_err(|_| RequestError::went_away())?;
         Ok(())
     }

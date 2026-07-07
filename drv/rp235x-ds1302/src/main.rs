@@ -204,7 +204,7 @@ impl idl::InOrderRp235xDs1302Impl for ServerImpl {
             || hour > 23
             || !(1..=31).contains(&date)
             || !(1..=12).contains(&month)
-            || weekday > 7
+            || !(1..=7).contains(&weekday)
             || year > 99
         {
             return Err(Ds1302Error::BadArg.into());
