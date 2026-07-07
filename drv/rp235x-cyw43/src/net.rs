@@ -149,16 +149,18 @@ struct Leases {
 
 impl Leases {
     fn ip_for(&mut self, mac: &[u8; 6]) -> u8 {
-        for i in 0..self.count as usize {
-            if &self.macs[i] == mac {
+        // Known MAC -> its existing slot (idempotent across DISCOVER/REQUEST).
+        for (i, m) in self.macs.iter().enumerate() {
+            if m == mac {
                 return 2 + i as u8;
             }
         }
-        let slot = (self.count as usize).min(7);
+        // New MAC -> next slot round-robin, evicting the oldest when full. Keeps
+        // all 8 pool IPs distinct; only >8 simultaneous clients recycle a slot
+        // (fine for a provisioning AP), instead of collapsing onto .9.
+        let slot = (self.count as usize) % self.macs.len();
         self.macs[slot] = *mac;
-        if (self.count as usize) < 8 {
-            self.count += 1;
-        }
+        self.count = self.count.wrapping_add(1);
         2 + slot as u8
     }
 }

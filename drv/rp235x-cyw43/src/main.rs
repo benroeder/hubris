@@ -862,20 +862,57 @@ impl Cyw43 {
         }
         self.do_ioctl(26, 67, 0, &js, 36, fr); // WLC_SET_SSID (join)
 
-        // Poll WLC_GET_BSSID: success once associated + stable through the 4-way
-        // handshake window (a wrong password associates then deauths -> resets).
-        // Mode-switch + scan + assoc can be slow, so allow ~20s.
-        let mut ok = 0u32;
-        for t in 0..40u32 {
-            userlib::hl::sleep_for(500);
-            let st = self.do_ioctl_b(0, 23, 68, 0, &[], 6, fr); // WLC_GET_BSSID
-            ok = if st == 0 { ok + 1 } else { 0 };
-            DIAG[7].store(0x5A00_0000 | (t << 8) | ok, SeqCst);
-            if ok >= 4 {
-                return 0; // stable association -> connected
+        // Watch the async join events (enabled by scan's event_msgs) for an
+        // authoritative result instead of racing the deauth with a BSSID poll:
+        // WLC_E_PSK_SUP (46) status tells 4-way-handshake success (0) vs
+        // wrong-key (non-zero) directly. event_type/status are big-endian in the
+        // wl_event_msg at header_length+36/+40 (same framing as the escan event).
+        // Capture the (type,status) sequence to DATA_FRAME[32..] to verify the
+        // offsets on-target. Returns 0 = connected, 1 = wrong key, 2 = timeout.
+        for slot in DATA_FRAME[32..80].iter() {
+            slot.store(0, SeqCst); // clear the capture for this attempt
+        }
+        let start = userlib::sys_get_timer().now;
+        let mut captured = 0usize;
+        loop {
+            let (got, chan, _s, bdc, _) = self.rx(fr);
+            if got {
+                self.take_credit(chan, bdc);
+                if chan == 1 {
+                    let hl = ((fr[1] >> 24) & 0xFF) as usize;
+                    let byte = |p: usize| (fr[p / 4] >> (8 * (p % 4))) & 0xFF;
+                    let be32 = |o: usize| {
+                        (byte(o) << 24)
+                            | (byte(o + 1) << 16)
+                            | (byte(o + 2) << 8)
+                            | byte(o + 3)
+                    };
+                    let et = be32(hl + 36); // event_type (big-endian)
+                    let est = be32(hl + 40); // WLC_E_PSK_SUP supplicant state
+                    if captured < 24 {
+                        DATA_FRAME[32 + captured * 2].store(et, SeqCst);
+                        DATA_FRAME[33 + captured * 2].store(est, SeqCst);
+                        captured += 1;
+                    }
+                    if et == 46 {
+                        // Supplicant state: 6 = WLC_SUP_KEYED (4-way handshake
+                        // complete -> connected); 7+ = timeout/failure (wrong
+                        // key); 0-5 = still in progress, keep waiting.
+                        if est == 6 {
+                            return 0;
+                        }
+                        if est >= 7 {
+                            return 1;
+                        }
+                    }
+                }
+            } else {
+                cortex_m::asm::delay(20_000);
+            }
+            if userlib::sys_get_timer().now.wrapping_sub(start) > 20_000 {
+                return 2; // no handshake in 20s -> network absent / unreachable
             }
         }
-        1 // timeout / failed
     }
 
     /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
