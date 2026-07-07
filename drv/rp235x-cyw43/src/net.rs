@@ -432,6 +432,10 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                 iface.update_ip_addrs(|addrs| {
                     addrs.clear();
                 });
+                // The STA data path isn't immediately usable after the 4-way
+                // handshake completes; let it settle before the first DISCOVER so
+                // it isn't dropped into a not-yet-ready link.
+                userlib::hl::sleep_for(1000);
                 let dhcp_handle = sockets.add(dhcpv4::Socket::new());
                 let start = userlib::sys_get_timer().now;
                 let mut leased = false;
@@ -482,7 +486,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                         }
                     }
                     leased |= just_leased;
-                    if !leased && t.wrapping_sub(start) > 30_000 {
+                    if !leased && t.wrapping_sub(start) > 45_000 {
                         break; // no initial lease -> give up, re-provision
                     }
                 }
