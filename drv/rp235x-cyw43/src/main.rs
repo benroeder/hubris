@@ -513,6 +513,21 @@ impl Cyw43 {
         me.do_ioctl(0x107, 5, 0, &txglom, 11 + 4, fr);
         let apsta = [0x7473_7061, 0x0001_0061, 0x0000_0000];
         me.do_ioctl(0x107, 6, 0, &apsta, 6 + 4, fr);
+        // AMPDU config from cyw43_ll_wifi_on. ampdu_rx_factor/ampdu_mpdu set up
+        // RX de-aggregation; without them the firmware cannot reassemble
+        // AMPDU-aggregated UNICAST data frames and drops unicast-to-host (while
+        // non-aggregated broadcast/multicast, e.g. DHCP, still arrive).
+        let mut abw = [0u8; 20];
+        abw[..15].copy_from_slice(b"ampdu_ba_wsize\0");
+        abw[15] = 8;
+        me.do_ioctl_b(2, 0x107, 8, 0, &abw, 19, fr);
+        let mut amp = [0u8; 16];
+        amp[..11].copy_from_slice(b"ampdu_mpdu\0");
+        amp[11] = 4;
+        me.do_ioctl_b(2, 0x107, 9, 0, &amp, 15, fr);
+        let mut arf = [0u8; 20];
+        arf[..16].copy_from_slice(b"ampdu_rx_factor\0"); // value 0
+        me.do_ioctl_b(2, 0x107, 10, 0, &arf, 20, fr);
         let mac_stat = me.do_ioctl_b(0, 0x106, 7, 0, b"cur_etheraddr\0", 14 + 6, fr);
         if mac_stat == 0 {
             let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
@@ -709,16 +724,32 @@ impl Cyw43 {
         if !got {
             return 0;
         }
+        // Diagnostic: per-SDPCM-channel histogram in DATA_FRAME[96..112].
+        if (chan as usize) < 16 {
+            let i = 96 + chan as usize;
+            DATA_FRAME[i].store(DATA_FRAME[i].load(SeqCst).wrapping_add(1), SeqCst);
+        }
         self.take_credit(chan, bdc);
         if chan != 2 {
             return 0;
         }
-        let data_offset = ((fr[4] >> 8) & 0xFF) as usize; // BDC.data_offset (byte 17)
-        let eth_start = 18 + data_offset * 4;
+        // SDPCM header_length is PER-FRAME (SDPCM byte 7), not always 14. The old
+        // hardcode (eth_start = 18 + data_offset*4 == 14+4+...) only worked for
+        // frames with header_length==14 (broadcast DHCP/mDNS). Unicast/ARP data
+        // frames can use a different header_length, so the Ethernet frame was
+        // extracted from the wrong offset -> L2 dst never matched our MAC and they
+        // looked dropped. Match the reference: eth_start = hdr_len + 4 + off*4.
+        let hdr_len = ((fr[1] >> 24) & 0xFF) as usize; // SDPCM header_length
+        let do_byte = hdr_len + 3; // BDC.data_offset byte
+        let data_offset =
+            ((fr[do_byte / 4] >> (8 * (do_byte % 4))) & 0xFF) as usize;
+        let eth_start = hdr_len + 4 + data_offset * 4;
         let total = (fr[0] & 0xFFFF) as usize; // SDPCM len
         if total <= eth_start {
+            DATA_FRAME[116].store(DATA_FRAME[116].load(SeqCst).wrapping_add(1), SeqCst); // chan-2 length drops
             return 0;
         }
+        DATA_FRAME[122].store(hdr_len as u32, SeqCst); // last RX header_length (diag)
         let n = (total - eth_start).min(out.len());
         for (i, o) in out[..n].iter_mut().enumerate() {
             let pos = eth_start + i;
@@ -1166,13 +1197,6 @@ impl Cyw43 {
         mr[9] = 22;
         self.do_ioctl_b(2, 0x107, 48, 1, &mr, 13, fr);
         self.do_ioctl(78, 49, 1, &[1], 4, fr);
-        // arpoe = 0: disable ARP offload so the firmware hands ARP frames to the
-        // host (smoltcp answers ARP for our gateway .1). Firmware default is
-        // arpoe=1, which makes it intercept ARP -- in AP mode its offload table
-        // has no entry for .1, so clients can never resolve the gateway.
-        let mut ao = [0u8; 12];
-        ao[..6].copy_from_slice(b"arpoe\0");
-        self.do_ioctl_b(2, 0x107, 51, 0, &ao, 10, fr);
         // Bring the AP up: bss = [AP=1, up=1].
         let mut bss = [0u8; 12];
         bss[..4].copy_from_slice(b"bss\0");
@@ -1197,6 +1221,14 @@ impl Cyw43 {
                 (w1 >> 8) as u8,
             ];
             DIAG[8].store(w0, SeqCst); // AP MAC low word (vs STA MAC for compare)
+        }
+        // Also read the AP's actual BSSID (WLC_GET_BSSID, cmd 23) on iface 1 --
+        // this is the MAC clients associate with + address unicast to. If it
+        // differs from cur_etheraddr, that's why unicast-to-host is dropped.
+        let bs = self.do_ioctl_b(0, 23, 53, 1, &[], 6, fr);
+        if bs == 0 {
+            let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
+            DIAG[3].store(fr[hl + 4], SeqCst); // BSSID low word
         }
         status
     }

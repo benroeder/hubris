@@ -96,6 +96,19 @@ impl Device for Cyw43Device<'_> {
             if buf[12] == 0x08 && buf[13] == 0x06 {
                 DIAG[6].store(DIAG[6].load(SeqCst).wrapping_add(1), SeqCst); // ARP in
             }
+            // L2 unicast addressed to our MAC (definitive unicast-to-host test).
+            if buf[0..6] == self.wifi.mac {
+                DIAG[2].store(DIAG[2].load(SeqCst).wrapping_add(1), SeqCst);
+                // Capture the first 64 bytes for offline decode (eth + IP hdr).
+                for i in 0..16 {
+                    let p = i * 4;
+                    let w = (buf[p] as u32)
+                        | ((buf[p + 1] as u32) << 8)
+                        | ((buf[p + 2] as u32) << 16)
+                        | ((buf[p + 3] as u32) << 24);
+                    crate::DATA_FRAME[i].store(w, SeqCst);
+                }
+            }
             // Count IPv4 frames addressed TO us (.1) -- does unicast-to-host work?
             if buf[12] == 0x08
                 && buf[13] == 0x00
@@ -330,6 +343,10 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     let mut socket_storage: [SocketStorage<'_>; 4] = [SocketStorage::EMPTY; 4];
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
 
+    for i in 96..122 {
+        crate::DATA_FRAME[i].store(0, SeqCst); // channel + chan-2-drop + RX-iface histograms
+    }
+    DIAG[2].store(0, SeqCst); // L2 unicast-to-us frames (was polluted by ALP init)
     DIAG[5].store(0, SeqCst); // IPv4 frames addressed to us (.1)
     DIAG[6].store(0, SeqCst); // ARP frames in
     DIAG[7].store(0, SeqCst); // smoltcp TX out (ARP replies etc.)
