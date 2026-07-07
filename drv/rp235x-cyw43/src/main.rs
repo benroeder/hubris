@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use drv_auxflash_api::AuxFlash;
 use drv_rp235x_cyw43_api::Cyw43Error;
 use idol_runtime::RequestError;
-use userlib::{task_slot, RecvMessage};
+use userlib::{RecvMessage, task_slot};
 
 task_slot!(AUXFLASH, auxflash);
 
@@ -147,13 +147,17 @@ impl Cyw43 {
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().set_bit());
         sm.sm_shiftctrl().modify(|_, w| w.fjoin_rx().clear_bit());
         self.set_pin(DIO, 0xE081); // DIO pindir out
-        pio.ctrl()
-            .modify(|_, w| unsafe { w.sm_restart().bits(1).clkdiv_restart().bits(1) });
+        pio.ctrl().modify(|_, w| unsafe {
+            w.sm_restart().bits(1).clkdiv_restart().bits(1)
+        });
         pio.txf(0).write(|w| unsafe { w.bits(x_bits) });
-        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
+        sm.sm_instr()
+            .write(|w| unsafe { w.sm0_instr().bits(0x6020) }); // out x,32
         pio.txf(0).write(|w| unsafe { w.bits(y_bits) });
-        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
-        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
+        sm.sm_instr()
+            .write(|w| unsafe { w.sm0_instr().bits(0x6040) }); // out y,32
+        sm.sm_instr()
+            .write(|w| unsafe { w.sm0_instr().bits(0x0000) }); // jmp 0
         pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
         for &word in out_words {
             let mut s = 0u32;
@@ -177,9 +181,18 @@ impl Cyw43 {
 
     fn bp_set_window(&self, addr: u32) {
         let base = addr & !0x7FFF;
-        self.xfer(&[Self::cmd_word(true, 1, 0x1000C, 1), (base >> 24) & 0xff], &mut [0u32; 1]);
-        self.xfer(&[Self::cmd_word(true, 1, 0x1000B, 1), (base >> 16) & 0xff], &mut [0u32; 1]);
-        self.xfer(&[Self::cmd_word(true, 1, 0x1000A, 1), (base >> 8) & 0xff], &mut [0u32; 1]);
+        self.xfer(
+            &[Self::cmd_word(true, 1, 0x1000C, 1), (base >> 24) & 0xff],
+            &mut [0u32; 1],
+        );
+        self.xfer(
+            &[Self::cmd_word(true, 1, 0x1000B, 1), (base >> 16) & 0xff],
+            &mut [0u32; 1],
+        );
+        self.xfer(
+            &[Self::cmd_word(true, 1, 0x1000A, 1), (base >> 8) & 0xff],
+            &mut [0u32; 1],
+        );
     }
     fn bp_read8(&self, addr: u32) -> u32 {
         self.bp_set_window(addr);
@@ -189,17 +202,26 @@ impl Cyw43 {
     }
     fn bp_write8(&self, addr: u32, val: u32) {
         self.bp_set_window(addr);
-        self.xfer(&[Self::cmd_word(true, 1, addr & 0x7FFF, 1), val], &mut [0u32; 1]);
+        self.xfer(
+            &[Self::cmd_word(true, 1, addr & 0x7FFF, 1), val],
+            &mut [0u32; 1],
+        );
     }
     fn bp_read32(&self, addr: u32) -> u32 {
         self.bp_set_window(addr);
         let mut r = [0u32; 2];
-        self.xfer(&[Self::cmd_word(false, 1, (addr & 0x7FFF) | 0x8000, 4)], &mut r);
+        self.xfer(
+            &[Self::cmd_word(false, 1, (addr & 0x7FFF) | 0x8000, 4)],
+            &mut r,
+        );
         r[1]
     }
     fn bp_write32(&self, addr: u32, val: u32) {
         self.bp_set_window(addr);
-        self.xfer(&[Self::cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, 4), val], &mut [0u32; 1]);
+        self.xfer(
+            &[Self::cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, 4), val],
+            &mut [0u32; 1],
+        );
     }
 
     /// Stream `src` bytes into WLAN-core RAM at backplane `dest`, in <=64-byte
@@ -214,7 +236,12 @@ impl Cyw43 {
             let window_rem = (0x8000 - (addr & 0x7FFF)) as usize;
             let n = (window_rem / 4).min(16).min(words - i);
             self.bp_set_window(addr);
-            burst[0] = Self::cmd_word(true, 1, (addr & 0x7FFF) | 0x8000, (n * 4) as u32);
+            burst[0] = Self::cmd_word(
+                true,
+                1,
+                (addr & 0x7FFF) | 0x8000,
+                (n * 4) as u32,
+            );
             for k in 0..n {
                 let b = (i + k) * 4;
                 burst[1 + k] = u32::from_le_bytes([
@@ -397,7 +424,7 @@ impl Cyw43 {
             ssid: [0; 32],
             ssid_len: 0,
             settle: 30_000, // conservative during bring-up (firmware upload)
-            tx_iface: 1, // AP interface until the STA join switches it to 0
+            tx_iface: 1,    // AP interface until the STA join switches it to 0
         };
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         me.ssid[..7].copy_from_slice(b"hubris-");
@@ -427,12 +454,22 @@ impl Cyw43 {
 
         // REG_BUS_CTRL: 32-bit words | high-speed | int-pol-high | wake |
         // resp-delay 0x4 | status-enable | intr-with-status.
-        let bus_ctrl: u32 = 0x1 | 0x10 | 0x20 | 0x80 | (0x4 << 8) | ((0x1 | 0x2) << 16);
-        me.xfer(&[Self::swap16(Self::cmd_word(true, 0, 0x00, 4)), Self::swap16(bus_ctrl)], &mut [0u32; 1]);
+        let bus_ctrl: u32 =
+            0x1 | 0x10 | 0x20 | 0x80 | (0x4 << 8) | ((0x1 | 0x2) << 16);
+        me.xfer(
+            &[
+                Self::swap16(Self::cmd_word(true, 0, 0x00, 4)),
+                Self::swap16(bus_ctrl),
+            ],
+            &mut [0u32; 1],
+        );
         me.xfer(&[Self::cmd_word(true, 0, 0x1d, 1), 4], &mut [0u32; 1]); // SPI_RESP_DELAY_F1
         // ALP clock.
         me.xfer(&[Self::cmd_word(true, 1, 0x1000E, 1), 0x08], &mut [0u32; 1]);
-        me.xfer(&[Self::cmd_word(true, 1, 0x1_0008, 1), 0x10], &mut [0u32; 1]);
+        me.xfer(
+            &[Self::cmd_word(true, 1, 0x1_0008, 1), 0x10],
+            &mut [0u32; 1],
+        );
         let mut aspin = 0u32;
         let alp = loop {
             let mut r = [0u32; 2];
@@ -467,7 +504,10 @@ impl Cyw43 {
         let nvram_len = (NVRAM.len() * 4) as u32;
         let nvram_addr = RAM_SIZE - 4 - nvram_len;
         let nvram_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(NVRAM.as_ptr() as *const u8, NVRAM.len() * 4)
+            core::slice::from_raw_parts(
+                NVRAM.as_ptr() as *const u8,
+                NVRAM.len() * 4,
+            )
         };
         me.bp_stream_bytes(nvram_addr, nvram_bytes);
         let nvram_words = nvram_len / 4;
@@ -480,7 +520,8 @@ impl Cyw43 {
         let io = me.bp_read8(WLAN_WRAP + IOCTRL) & 0xff;
         let rc = me.bp_read8(WLAN_WRAP + RESETCTRL) & 0xff;
         let core_up = (io & 0x3) == 0x1 && (rc & 0x1) == 0;
-        DIAG[3].store(if core_up { 0xC0DE_600D } else { (io << 8) | rc }, SeqCst);
+        DIAG[3]
+            .store(if core_up { 0xC0DE_600D } else { (io << 8) | rc }, SeqCst);
 
         // HT clock + F2 ready.
         userlib::hl::sleep_for(40); // let the firmware spin up before requesting HT
@@ -496,7 +537,10 @@ impl Cyw43 {
             }
         };
         DIAG[4].store(ht, SeqCst);
-        me.xfer(&[Self::cmd_word(true, 1, 0x1_0008, 1), 0x20], &mut [0u32; 1]);
+        me.xfer(
+            &[Self::cmd_word(true, 1, 0x1_0008, 1), 0x20],
+            &mut [0u32; 1],
+        );
         me.xfer(&[Self::cmd_word(true, 0, 0x06, 2), 0x0020], &mut [0u32; 1]);
         userlib::hl::sleep_for(50); // let the firmware bring up the F2 data path
         let mut f2spin = 0u32;
@@ -531,7 +575,8 @@ impl Cyw43 {
         let mut arf = [0u8; 20];
         arf[..16].copy_from_slice(b"ampdu_rx_factor\0"); // value 0
         me.do_ioctl_b(2, 0x107, 10, 0, &arf, 20, fr);
-        let mac_stat = me.do_ioctl_b(0, 0x106, 7, 0, b"cur_etheraddr\0", 14 + 6, fr);
+        let mac_stat =
+            me.do_ioctl_b(0, 0x106, 7, 0, b"cur_etheraddr\0", 14 + 6, fr);
         if mac_stat == 0 {
             let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
             let w0 = fr[hl + 4];
@@ -564,14 +609,19 @@ impl Cyw43 {
         tag: [u8; 4],
         dest: u32,
     ) -> Result<u32, Cyw43Error> {
-        let blob = aux.get_blob_by_tag(tag).map_err(|_| Cyw43Error::NotReady)?;
+        let blob =
+            aux.get_blob_by_tag(tag).map_err(|_| Cyw43Error::NotReady)?;
         let mut buf = [0u8; 128];
         let mut pos = blob.start;
         let mut off = 0u32;
         while pos < blob.end {
             let amount = (blob.end - pos).min(buf.len() as u32);
-            aux.read_slot_with_offset(blob.slot, pos, &mut buf[..amount as usize])
-                .map_err(|_| Cyw43Error::NotReady)?;
+            aux.read_slot_with_offset(
+                blob.slot,
+                pos,
+                &mut buf[..amount as usize],
+            )
+            .map_err(|_| Cyw43Error::NotReady)?;
             self.bp_stream_bytes(dest + off, &buf[..amount as usize]);
             off += amount;
             pos += amount;
@@ -580,20 +630,30 @@ impl Cyw43 {
     }
 
     /// Stream the CLM blob into a SET_VAR "clmload" ioctl.
-    fn load_clm(&mut self, aux: &AuxFlash, fr: &mut [u32; 512]) -> Result<(), Cyw43Error> {
+    fn load_clm(
+        &mut self,
+        aux: &AuxFlash,
+        fr: &mut [u32; 512],
+    ) -> Result<(), Cyw43Error> {
         let mut clm_pl = [0u32; 251];
         clm_pl[0] = 0x6c6d_6c63; // "clml"
         clm_pl[1] = 0x0064_616f; // "oad\0"
         clm_pl[2] = 0x0002_1006; // flag=BEGIN|END|HANDLER_VER, dload_type=CLM
         clm_pl[3] = 984; // len
-        let blob = aux.get_blob_by_tag(*b"WCLM").map_err(|_| Cyw43Error::NotReady)?;
+        let blob = aux
+            .get_blob_by_tag(*b"WCLM")
+            .map_err(|_| Cyw43Error::NotReady)?;
         let mut buf = [0u8; 128];
         let mut pos = blob.start;
         let mut coff = 0usize;
         while pos < blob.end {
             let amount = (blob.end - pos).min(buf.len() as u32);
-            aux.read_slot_with_offset(blob.slot, pos, &mut buf[..amount as usize])
-                .map_err(|_| Cyw43Error::NotReady)?;
+            aux.read_slot_with_offset(
+                blob.slot,
+                pos,
+                &mut buf[..amount as usize],
+            )
+            .map_err(|_| Cyw43Error::NotReady)?;
             for &byte in &buf[..amount as usize] {
                 clm_pl[5 + coff / 4] |= (byte as u32) << (8 * (coff % 4));
                 coff += 1;
@@ -693,8 +753,9 @@ impl Cyw43 {
                             }
                             *s = c;
                         }
-                        let seen =
-                            ssids[..slen].split(|&b| b == b'\n').any(|e| e == &ssid[..sl]);
+                        let seen = ssids[..slen]
+                            .split(|&b| b == b'\n')
+                            .any(|e| e == &ssid[..sl]);
                         if ok && !seen && slen + sl < ssids.len() {
                             ssids[slen..slen + sl].copy_from_slice(&ssid[..sl]);
                             slen += sl;
@@ -901,7 +962,13 @@ impl Cyw43 {
         ssid_buf[..n].copy_from_slice(&self.ssid[..n]);
         let ssid = &ssid_buf[..n];
         // Radio on: country + WLC_UP (as cyw43_wifi_on before ap_init).
-        let country = [0x6e75_6f63, 0x0079_7274, 0x0000_5858, 0xFFFF_FFFF, 0x0000_5858];
+        let country = [
+            0x6e75_6f63,
+            0x0079_7274,
+            0x0000_5858,
+            0xFFFF_FFFF,
+            0x0000_5858,
+        ];
         self.do_ioctl(0x107, 40, 0, &country, 8 + 12, fr);
         self.do_ioctl_b(2, 2, 41, 0, &[], 0, fr); // WLC_UP
         // ampdu_ba_wsize = 2 (STA).
@@ -943,7 +1010,8 @@ impl Cyw43 {
         // gateway traffic to THAT, not the STA MAC we read at init. Adopt the AP
         // MAC so our gratuitous ARP + smoltcp identity match what the AP receives
         // on (otherwise unicast to .1 is addressed to a MAC the AP ignores).
-        let ms = self.do_ioctl_b(0, 0x106, 52, 1, b"cur_etheraddr\0", 14 + 6, fr);
+        let ms =
+            self.do_ioctl_b(0, 0x106, 52, 1, b"cur_etheraddr\0", 14 + 6, fr);
         if ms == 0 {
             let hl = (((fr[1] >> 24) & 0xFF) / 4) as usize;
             let w0 = fr[hl + 4];
@@ -1085,10 +1153,7 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
     ) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.scan(&mut self.fr))
     }
-    fn ap(
-        &mut self,
-        _: &RecvMessage,
-    ) -> Result<u32, RequestError<Cyw43Error>> {
+    fn ap(&mut self, _: &RecvMessage) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.ap_start(&mut self.fr))
     }
 }

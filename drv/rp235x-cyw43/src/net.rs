@@ -139,7 +139,11 @@ impl Leases {
 /// Build a DHCP reply *payload* (BOOTP + magic + options) into `out`.
 /// smoltcp wraps it in UDP/IP/Ethernet, so no headers/checksums here.
 /// Returns the payload length, or None if the request is not a BOOTREQUEST.
-fn build_dhcp_reply(req: &[u8], out: &mut [u8], leases: &mut Leases) -> Option<usize> {
+fn build_dhcp_reply(
+    req: &[u8],
+    out: &mut [u8],
+    leases: &mut Leases,
+) -> Option<usize> {
     // Fixed BOOTP section is 236 bytes, then 4-byte magic, then options.
     if req.len() < 240 || req[0] != 1 {
         return None; // not a BOOTREQUEST
@@ -183,11 +187,11 @@ fn build_dhcp_reply(req: &[u8], out: &mut [u8], leases: &mut Leases) -> Option<u
 
     let opts: [&[u8]; 7] = [
         &[53, 1, reply_type],
-        &[54, 4, 192, 168, 4, 1],   // server id
-        &[51, 4, 0, 1, 0x51, 0x80], // lease 86400 s
-        &[1, 4, 255, 255, 255, 0],  // subnet mask
-        &[3, 4, 192, 168, 4, 1],    // router
-        &[6, 4, 192, 168, 4, 1],    // DNS
+        &[54, 4, 192, 168, 4, 1],          // server id
+        &[51, 4, 0, 1, 0x51, 0x80],        // lease 86400 s
+        &[1, 4, 255, 255, 255, 0],         // subnet mask
+        &[3, 4, 192, 168, 4, 1],           // router
+        &[6, 4, 192, 168, 4, 1],           // DNS
         b"\x72\x16http://192.168.4.1/api", // option 114 (RFC 8910)
     ];
     let mut p = 240;
@@ -229,7 +233,12 @@ fn ip_checksum(hdr: &[u8]) -> u16 {
 /// Serve a DHCP BOOTREQUEST: build the full OFFER/ACK frame (Ethernet + IP + UDP
 /// + DHCP payload) and L2/L3-broadcast it (the client has no IP yet). This is the
 /// frame-level DHCP server smoltcp cannot provide.
-fn handle_dhcp(wifi: &mut Cyw43, fr: &mut [u32; 512], rx: &[u8], leases: &mut Leases) {
+fn handle_dhcp(
+    wifi: &mut Cyw43,
+    fr: &mut [u32; 512],
+    rx: &[u8],
+    leases: &mut Leases,
+) {
     let ihl = (rx[14] & 0x0f) as usize * 4;
     let dh = 14 + ihl + 8; // DHCP payload start
     if rx.len() < dh + 240 {
@@ -604,8 +613,10 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
         static mut SOCKET_STORAGE: [SocketStorage<'static>; 6] = [store; _];
     };
     let mut form_len = build_form(form_buf);
-    let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
-    let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
+    let dns_rx =
+        udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
+    let dns_tx =
+        udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
     let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
     dns_sock.bind(53).ok();
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
@@ -660,11 +671,18 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
         if crate::CREDS[0].load(SeqCst) == 1 {
             for _ in 0..400u32 {
                 let t = userlib::sys_get_timer().now;
-                iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
+                iface.poll(
+                    Instant::from_millis(t as i64),
+                    &mut device,
+                    &mut sockets,
+                );
                 cortex_m::asm::delay(30_000);
             }
             let mut res = device.wifi.sta_join(device.fr);
-            DIAG[15].store(if res == 0 { 0x00C0_FFEE } else { 0x0BAD_0BAD }, SeqCst);
+            DIAG[15].store(
+                if res == 0 { 0x00C0_FFEE } else { 0x0BAD_0BAD },
+                SeqCst,
+            );
             if res == 0 {
                 // Associated -- become a station: TX on the STA interface, stop
                 // acting as a DHCP server (we would answer real-LAN requests),
@@ -681,10 +699,16 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                 let mut leased = false;
                 loop {
                     let t = userlib::sys_get_timer().now;
-                    iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
+                    iface.poll(
+                        Instant::from_millis(t as i64),
+                        &mut device,
+                        &mut sockets,
+                    );
                     // Bind the event first so the dhcpv4 socket borrow ends before
                     // we re-borrow `sockets` to abort the portal listeners.
-                    let ev = sockets.get_mut::<dhcpv4::Socket<'_>>(dhcp_handle).poll();
+                    let ev = sockets
+                        .get_mut::<dhcpv4::Socket<'_>>(dhcp_handle)
+                        .poll();
                     let mut just_leased = false;
                     match ev {
                         Some(dhcpv4::Event::Configured(cfg)) => {
@@ -692,7 +716,10 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                                 addrs.push(IpCidr::Ipv4(cfg.address)).ok();
                             });
                             if let Some(gw) = cfg.router {
-                                iface.routes_mut().add_default_ipv4_route(gw).ok();
+                                iface
+                                    .routes_mut()
+                                    .add_default_ipv4_route(gw)
+                                    .ok();
                             }
                             DIAG[3].store(
                                 u32::from_be_bytes(cfg.address.address().0),
