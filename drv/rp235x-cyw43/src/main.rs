@@ -883,11 +883,14 @@ impl Cyw43 {
                 .copy_from_slice(&CREDS[11 + i].load(SeqCst).to_le_bytes());
         }
 
-        // Bring the AP (bsscfg 1) down.
+        // Bring the AP (bsscfg 1) down, then let the firmware settle out of AP
+        // mode before we reconfigure the STA -- joining too soon after the switch
+        // is a big source of the intermittent "only AUTH, no handshake" failures.
         let mut bss = [0u8; 12];
         bss[..4].copy_from_slice(b"bss\0");
         bss[4] = 1; // AP index; value (down) stays 0
         self.do_ioctl_b(2, 0x107, 60, 0, &bss, 12, fr);
+        userlib::hl::sleep_for(400);
 
         // Enable the WPA supplicant on the STA (bsscfg 0).
         let mut sw = [0u8; 24];
@@ -909,55 +912,58 @@ impl Cyw43 {
         }
         self.do_ioctl(WLC_SET_WSEC_PMK, 66, 0, &pmk, 68, fr);
 
-        // Join: wl_ssid_t = ssid_len(u32) + ssid[32].
+        // Join params: wl_ssid_t = ssid_len(u32) + ssid[32].
         let mut js = [0u32; 9];
         js[0] = sl as u32;
         for i in 0..sl.min(32) {
             js[1 + i / 4] |= (ssid[i] as u32) << (8 * (i % 4));
         }
-        self.do_ioctl(WLC_SET_SSID, 67, 0, &js, 36, fr); // join
 
-        // Watch the async join events (enabled by scan's event_msgs) for an
-        // authoritative result instead of racing the deauth with a BSSID poll:
-        // WLC_E_PSK_SUP (46) status tells 4-way-handshake success (0) vs
-        // wrong-key (non-zero) directly. event_type/status are big-endian in the
-        // wl_event_msg at header_length+36/+40 (same framing as the escan event).
-        // Returns 0 = connected, 1 = wrong key, 2 = timeout.
-        let start = userlib::sys_get_timer().now;
-        loop {
-            let (got, chan, _s, bdc, _) = self.rx(fr);
-            if got {
-                self.take_credit(chan, bdc);
-                if chan == 1 {
-                    let hl = ((fr[1] >> 24) & 0xFF) as usize;
-                    let byte = |p: usize| (fr[p / 4] >> (8 * (p % 4))) & 0xFF;
-                    let be32 = |o: usize| {
-                        (byte(o) << 24)
-                            | (byte(o + 1) << 16)
-                            | (byte(o + 2) << 8)
-                            | byte(o + 3)
-                    };
-                    let et = be32(hl + 36); // event_type (big-endian)
-                    let est = be32(hl + 40); // WLC_E_PSK_SUP supplicant state
-                    if et == 46 {
-                        // Supplicant state: 6 = WLC_SUP_KEYED (4-way handshake
-                        // complete -> connected); 7+ = timeout/failure (wrong
-                        // key); 0-5 = still in progress, keep waiting.
-                        if est == 6 {
-                            return 0;
-                        }
-                        if est >= 7 {
-                            return 1;
+        // Association at the AP->STA switch is intermittent (sometimes only AUTH
+        // arrives, never the handshake). Re-issue the join and watch the async
+        // events each attempt: WLC_E_PSK_SUP (46) supplicant state is
+        // authoritative -- 6 = WLC_SUP_KEYED (handshake done -> connected), 7+ =
+        // failure (wrong key, don't retry), 0-5 = in progress. event_type/status
+        // are big-endian in the wl_event_msg at header_length+36/+40 (same framing
+        // as the escan event). A timed-out attempt retries the join a few times
+        // before giving up. Returns 0 = connected, 1 = wrong key, 2 = timeout.
+        for attempt in 0..4u32 {
+            DIAG[7].store(attempt + 1, SeqCst); // join attempts used (diagnostic)
+            self.do_ioctl(WLC_SET_SSID, 67, 0, &js, 36, fr); // (re)issue the join
+            let start = userlib::sys_get_timer().now;
+            loop {
+                let (got, chan, _s, bdc, _) = self.rx(fr);
+                if got {
+                    self.take_credit(chan, bdc);
+                    if chan == 1 {
+                        let hl = ((fr[1] >> 24) & 0xFF) as usize;
+                        let byte = |p: usize| (fr[p / 4] >> (8 * (p % 4))) & 0xFF;
+                        let be32 = |o: usize| {
+                            (byte(o) << 24)
+                                | (byte(o + 1) << 16)
+                                | (byte(o + 2) << 8)
+                                | byte(o + 3)
+                        };
+                        let et = be32(hl + 36); // event_type
+                        let est = be32(hl + 40); // WLC_E_PSK_SUP supplicant state
+                        if et == 46 {
+                            if est == 6 {
+                                return 0; // WLC_SUP_KEYED -> connected
+                            }
+                            if est >= 7 {
+                                return 1; // wrong key -> don't retry
+                            }
                         }
                     }
+                } else {
+                    cortex_m::asm::delay(20_000);
                 }
-            } else {
-                cortex_m::asm::delay(20_000);
-            }
-            if userlib::sys_get_timer().now.wrapping_sub(start) > 20_000 {
-                return 2; // no handshake in 20s -> network absent / unreachable
+                if userlib::sys_get_timer().now.wrapping_sub(start) > 7_000 {
+                    break; // this attempt stalled -> re-issue the join
+                }
             }
         }
+        2 // no handshake after retries -> network absent / unreachable
     }
 
     /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
