@@ -31,6 +31,9 @@ pub struct Cyw43Device<'a> {
     /// VLAN), NOT via a smoltcp socket: smoltcp discards the DISCOVER before any
     /// socket because its source is 0.0.0.0 (non-unicast, dropped in process_ipv4).
     leases: Leases,
+    /// True once we join a network as a station: stop serving the AP DHCP so we
+    /// don't answer DHCP requests on the real LAN.
+    sta_mode: bool,
 }
 
 pub struct Cyw43RxToken {
@@ -90,7 +93,7 @@ impl Device for Cyw43Device<'_> {
                 return None;
             }
             DIAG[9].store(DIAG[9].load(SeqCst).wrapping_add(1), SeqCst); // raw frames
-            if is_dhcp_request(&buf[..n]) {
+            if !self.sta_mode && is_dhcp_request(&buf[..n]) {
                 handle_dhcp(self.wifi, self.fr, &buf[..n], &mut self.leases);
                 continue;
             }
@@ -311,6 +314,14 @@ fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
     let qlen = (p + 5) - qstart; // name + null + qtype(2) + qclass(2)
     let is_a = qtype == 1;
 
+    // Bound the whole reply against the output buffer BEFORE writing. A crafted
+    // query whose name fills the packet would otherwise push the 16-byte A-record
+    // past `out` and fault the task -- remotely triggerable on :53.
+    let reply_len = 12 + qlen + if is_a { 16 } else { 0 };
+    if reply_len > out.len() {
+        return None;
+    }
+
     out[0..2].copy_from_slice(&q[0..2]); // id echo
     out[2..4].copy_from_slice(&[0x81, 0x80]); // response, RA, no error
     out[4..6].copy_from_slice(&[0, 1]); // qdcount 1
@@ -468,6 +479,99 @@ fn handle_post(req: &[u8]) -> bool {
     got
 }
 
+/// Case-insensitively find `Content-Length:` in the header block and parse it.
+fn content_length(hdrs: &[u8]) -> usize {
+    let needle = b"content-length:";
+    let last = hdrs.len().saturating_sub(needle.len());
+    'scan: for i in 0..=last {
+        for (j, &nc) in needle.iter().enumerate() {
+            let c = hdrs[i + j];
+            let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
+            if lc != nc {
+                continue 'scan;
+            }
+        }
+        let mut k = i + needle.len();
+        while k < hdrs.len() && hdrs[k] == b' ' {
+            k += 1;
+        }
+        let mut n = 0usize;
+        while k < hdrs.len() && hdrs[k].is_ascii_digit() {
+            n = n * 10 + (hdrs[k] - b'0') as usize;
+            k += 1;
+        }
+        return n;
+    }
+    0
+}
+
+/// If `data` holds a COMPLETE HTTP request, return its total byte length; else
+/// None so the caller waits for more (avoids parsing a truncated header/body --
+/// e.g. a POST whose credential body lands in a later TCP segment).
+fn http_request_len(data: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let hdr_end = loop {
+        if i + 4 > data.len() {
+            return None; // headers not yet terminated
+        }
+        if &data[i..i + 4] == b"\r\n\r\n" {
+            break i + 4;
+        }
+        i += 1;
+    };
+    if data.starts_with(b"POST ") {
+        let total = hdr_end + content_length(&data[..hdr_end]);
+        (data.len() >= total).then_some(total)
+    } else {
+        Some(hdr_end)
+    }
+}
+
+/// Serve one pooled HTTP connection: (re-)listen when closed; respond only once
+/// the whole request is buffered, then close. A POST stores creds (checked by
+/// the caller via CREDS) and shows Connecting; a POST that parses no creds
+/// re-serves the form instead of dead-ending. GET /api -> RFC 8908 JSON.
+fn serve_http(sock: &mut tcp::Socket<'_>, form: &[u8]) {
+    if !sock.is_open() {
+        sock.listen(80).ok();
+        return;
+    }
+    if !sock.can_recv() {
+        return;
+    }
+    let mut req = [0u8; 1024];
+    let mut reqlen = 0usize;
+    let ready = sock
+        .recv(|data| match http_request_len(data) {
+            Some(total) => {
+                let n = total.min(req.len());
+                req[..n].copy_from_slice(&data[..n]);
+                reqlen = n;
+                (total, true)
+            }
+            None => (0, false), // incomplete -> leave buffered, wait
+        })
+        .unwrap_or(false);
+    if !ready {
+        return;
+    }
+    let r = &req[..reqlen];
+    if r.starts_with(b"POST ") {
+        if handle_post(r) {
+            let _ = sock.send_slice(HTTP_OK_HTML);
+            let _ = sock.send_slice(CONNECTING_BODY);
+        } else {
+            let _ = sock.send_slice(form); // no creds parsed -> re-show form
+        }
+    } else if r.len() >= 9 && &r[0..9] == b"GET /api " {
+        let _ = sock.send_slice(API_JSON); // captive detect -> open portal
+    } else {
+        let _ = sock.send_slice(form);
+    }
+    sock.close();
+    DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
+}
+
 /// Provisioning loop: smoltcp Interface at 192.168.4.1/24. smoltcp owns
 /// ARP/IP/UDP/TCP (and auto-answers ARP for the gateway); DHCP is served in the
 /// Device at the frame level. Later phases add DNS/TCP sockets to the SocketSet.
@@ -480,6 +584,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
             macs: [[0; 6]; 8],
             count: 0,
         },
+        sta_mode: false,
     };
 
     let mut config = Config::new();
@@ -506,29 +611,57 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     fn store() -> SocketStorage<'static> {
         SocketStorage::EMPTY
     }
-    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, http_rx, http_tx, form_buf, socket_storage) = mutable_statics::mutable_statics! {
+    let (
+        dns_rx_meta,
+        dns_rx_pl,
+        dns_tx_meta,
+        dns_tx_pl,
+        hrx0,
+        htx0,
+        hrx1,
+        htx1,
+        hrx2,
+        htx2,
+        form_buf,
+        socket_storage,
+    ) = mutable_statics::mutable_statics! {
         static mut DNS_RX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_RX_PL: [u8; 768] = [zero; _];
         static mut DNS_TX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_TX_PL: [u8; 768] = [zero; _];
-        static mut HTTP_RX: [u8; 1024] = [zero; _];
-        static mut HTTP_TX: [u8; 2048] = [zero; _];
+        static mut HTTP_RX0: [u8; 1024] = [zero; _];
+        static mut HTTP_TX0: [u8; 2048] = [zero; _];
+        static mut HTTP_RX1: [u8; 1024] = [zero; _];
+        static mut HTTP_TX1: [u8; 2048] = [zero; _];
+        static mut HTTP_RX2: [u8; 1024] = [zero; _];
+        static mut HTTP_TX2: [u8; 2048] = [zero; _];
         static mut FORM_BUF: [u8; 2048] = [zero; _];
-        static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
+        static mut SOCKET_STORAGE: [SocketStorage<'static>; 6] = [store; _];
     };
     let mut form_len = build_form(form_buf);
     let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
     let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
     let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
     dns_sock.bind(53).ok();
-    // HTTP captive portal on TCP :80.
-    let http_sock = tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut http_rx[..]),
-        tcp::SocketBuffer::new(&mut http_tx[..]),
-    );
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
     let dns_handle = sockets.add(dns_sock);
-    let http_handle = sockets.add(http_sock);
+    // HTTP captive portal on :80 -- a small pool so the CNA's concurrent
+    // connections (portal + /api probe + retries) aren't RST-ed by a single
+    // listener (the "web page couldn't be loaded" symptom).
+    let http_handles = [
+        sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut hrx0[..]),
+            tcp::SocketBuffer::new(&mut htx0[..]),
+        )),
+        sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut hrx1[..]),
+            tcp::SocketBuffer::new(&mut htx1[..]),
+        )),
+        sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut hrx2[..]),
+            tcp::SocketBuffer::new(&mut htx2[..]),
+        )),
+    ];
 
     for i in 96..122 {
         crate::DATA_FRAME[i].store(0, SeqCst); // channel + chan-2-drop + RX-iface histograms
@@ -562,32 +695,13 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
             }
         }
 
-        // HTTP captive portal on :80. iOS (given option 114 -> http://192.168.4.1
-        // /api) fetches /api expecting RFC 8908 JSON; return captive=true with a
-        // user-portal-url so the CNA opens the portal page (served elsewhere).
-        // One connection at a time: serve, close, re-listen.
-        let http = sockets.get_mut::<tcp::Socket<'_>>(http_handle);
-        if !http.is_open() {
-            http.listen(80).ok();
-        }
-        if http.can_recv() {
-            let mut req = [0u8; 1024];
-            let n = http.recv_slice(&mut req).unwrap_or(0);
-            if n > 0 {
-                let r = &req[..n];
-                if r.starts_with(b"POST ") {
-                    // Credentials submitted -> store them, show "Connecting...".
-                    handle_post(r);
-                    let _ = http.send_slice(HTTP_OK_HTML);
-                    let _ = http.send_slice(CONNECTING_BODY);
-                } else if n >= 9 && &r[0..9] == b"GET /api " {
-                    let _ = http.send_slice(API_JSON); // RFC 8908 -> open portal
-                } else {
-                    let _ = http.send_slice(&form_buf[..form_len]); // portal form
-                }
-                http.close();
-                DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
-            }
+        // HTTP captive portal on :80: serve every pooled socket. serve_http waits
+        // for the full request (headers + Content-Length body) before responding,
+        // so a segmented POST does not drop credentials, and iOS's option-114
+        // /api probe + the portal page can be served on separate connections.
+        for &h in &http_handles {
+            let sock = sockets.get_mut::<tcp::Socket<'_>>(h);
+            serve_http(sock, &form_buf[..form_len]);
         }
 
         // Credentials submitted -> flush the "Connecting..." page to the client,
@@ -598,21 +712,30 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                 iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
                 cortex_m::asm::delay(30_000);
             }
-            let res = device.wifi.sta_join(device.fr);
+            let mut res = device.wifi.sta_join(device.fr);
             DIAG[15].store(if res == 0 { 0x00C0_FFEE } else { 0x0BAD_0BAD }, SeqCst);
             if res == 0 {
-                // Associated -- become a station: TX on the STA interface, drop
-                // the AP's static IP, and run a DHCP client to get an address on
-                // the joined network.
+                // Associated -- become a station: TX on the STA interface, stop
+                // acting as a DHCP server (we would answer real-LAN requests),
+                // drop the AP static IP, and run a DHCP client. Bail after ~30s if
+                // no initial lease arrives, so a dead/filtering DHCP server can't
+                // wedge us with the AP down; once leased, stay connected.
                 device.wifi.tx_iface = 0;
+                device.sta_mode = true;
                 iface.update_ip_addrs(|addrs| {
                     addrs.clear();
                 });
                 let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+                let start = userlib::sys_get_timer().now;
+                let mut leased = false;
                 loop {
                     let t = userlib::sys_get_timer().now;
                     iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
-                    match sockets.get_mut::<dhcpv4::Socket<'_>>(dhcp_handle).poll() {
+                    // Bind the event first so the dhcpv4 socket borrow ends before
+                    // we re-borrow `sockets` to abort the portal listeners.
+                    let ev = sockets.get_mut::<dhcpv4::Socket<'_>>(dhcp_handle).poll();
+                    let mut just_leased = false;
+                    match ev {
                         Some(dhcpv4::Event::Configured(cfg)) => {
                             iface.update_ip_addrs(|addrs| {
                                 addrs.push(IpCidr::Ipv4(cfg.address)).ok();
@@ -620,12 +743,12 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                             if let Some(gw) = cfg.router {
                                 iface.routes_mut().add_default_ipv4_route(gw).ok();
                             }
-                            // Leased IP -- read via the probe, then ping it.
                             DIAG[3].store(
                                 u32::from_be_bytes(cfg.address.address().0),
                                 SeqCst,
-                            );
+                            ); // leased IP -- read via probe, then ping it
                             DIAG[15].store(0x001E_A5ED, SeqCst); // got a lease
+                            just_leased = true;
                         }
                         Some(dhcpv4::Event::Deconfigured) => {
                             iface.update_ip_addrs(|addrs| {
@@ -634,15 +757,43 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                         }
                         None => {}
                     }
+                    // The dhcpv4 event borrow of `sockets` has ended: on the first
+                    // lease, abort the portal listeners so we don't linger as a
+                    // rogue :80 on the real LAN.
+                    if just_leased && !leased {
+                        for &h in &http_handles {
+                            sockets.get_mut::<tcp::Socket<'_>>(h).abort();
+                        }
+                    }
+                    leased |= just_leased;
+                    if !leased && t.wrapping_sub(start) > 30_000 {
+                        break; // no initial lease -> give up, re-provision
+                    }
                 }
+                // Only reached on the no-lease timeout: restore AP mode + retry.
+                sockets.remove(dhcp_handle);
+                device.wifi.tx_iface = 1;
+                device.sta_mode = false;
+                iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    addrs
+                        .push(IpCidr::Ipv4(Ipv4Cidr::new(
+                            Ipv4Address::new(192, 168, 4, 1),
+                            24,
+                        )))
+                        .ok();
+                });
+                res = 3; // DHCP-timeout failure
             }
-            // Failed: record the error, clear the flag, re-open the AP, rebuild
-            // the form (now with an error banner), and re-provision.
+            // Failed (bad password / no network / no lease): show the error and
+            // re-provision. Abort every pool socket so they re-listen cleanly.
             crate::CREDS[26].store(res, SeqCst);
             crate::CREDS[0].store(0, SeqCst);
             device.wifi.ap_start(device.fr);
             form_len = build_form(form_buf);
-            sockets.get_mut::<tcp::Socket<'_>>(http_handle).abort();
+            for &h in &http_handles {
+                sockets.get_mut::<tcp::Socket<'_>>(h).abort();
+            }
         }
     }
 }

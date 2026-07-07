@@ -793,12 +793,16 @@ impl Cyw43 {
             ((fr[do_byte / 4] >> (8 * (do_byte % 4))) & 0xFF) as usize;
         let eth_start = hdr_len + 4 + data_offset * 4;
         let total = (fr[0] & 0xFFFF) as usize; // SDPCM len
-        if total <= eth_start {
+        // hdr_len/data_offset/total are attacker-influenced header bytes; clamp
+        // against the 2048 bytes actually read into fr[512] so a malformed header
+        // can't index past the buffer (OOB read -> task fault).
+        let fr_bytes = fr.len() * 4;
+        if eth_start >= fr_bytes || total <= eth_start {
             DATA_FRAME[116].store(DATA_FRAME[116].load(SeqCst).wrapping_add(1), SeqCst); // chan-2 length drops
             return 0;
         }
         DATA_FRAME[122].store(hdr_len as u32, SeqCst); // last RX header_length (diag)
-        let n = (total - eth_start).min(out.len());
+        let n = (total - eth_start).min(out.len()).min(fr_bytes - eth_start);
         for (i, o) in out[..n].iter_mut().enumerate() {
             let pos = eth_start + i;
             *o = (fr[pos / 4] >> (8 * (pos % 4))) as u8;

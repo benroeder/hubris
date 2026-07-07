@@ -130,7 +130,7 @@ start = true
 [tasks.cyw43]
 name = "drv-rp235x-cyw43"
 priority = 3
-max-sizes = {flash = 131072, ram = 32768}
+max-sizes = {flash = 131072, ram = 49152}
 stacksize = 16384
 uses = ["pio2", "sio", "io_bank0", "pads_bank0", "watchdog"]
 task-slots = ["auxflash"]
