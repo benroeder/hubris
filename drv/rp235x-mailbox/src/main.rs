@@ -1,0 +1,226 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Inter-core mailbox driver for the RP2350 (RP235x) -- core 0 side.
+//!
+//! Owns the SIO inter-core FIFO (shared with the GPIO driver, which uses a
+//! different sub-region of the same SIO block) and bridges it to Hubris IPC:
+//! `exchange(req)` pushes a 32-bit word to the core-1 payload and returns its
+//! reply. This is the AMP "tasks post between cores" path (branch rp2350-amp)
+//! -- an explicit request/reply channel, not transparent cross-core IPC.
+//!
+//! The core-1 payload (a bare compute loop launched by the app's pre-kernel
+//! main) reads each request and replies with a computed word.
+
+#![no_std]
+#![no_main]
+
+use core::convert::Infallible;
+use idol_runtime::RequestError;
+use userlib::RecvMessage;
+
+extern "C" {
+    /// Shared 8 KiB SRAM window (granted via extern-regions). Layout: beat
+    /// mailbox at +0; bulk buffer 0 at +0x800 (SRAM8); buffer 1 at +0x1000
+    /// (SRAM9) -- two different banks so a producer write and consumer read
+    /// don't contend, which is what makes the pipelined transfer scale.
+    static mut __REGION_SHARED_BASE: [u8; 0];
+}
+
+/// 2 KiB per bulk buffer (512 words); buffers at these offsets from the base.
+const BUF_WORDS: usize = 512;
+const BUF0_OFF: usize = 0x800 / 4;
+const BUF1_OFF: usize = 0x1000 / 4;
+
+/// Bounded busy-spin for a core-1 reply. Core 1 answers in microseconds; this
+/// large bound only trips if core 1 is wedged or absent (~tens of ms).
+const REPLY_SPINS: u32 = 5_000_000;
+
+/// Base of the shared window as a `*mut u32`.
+fn shared_words() -> *mut u32 {
+    &raw mut __REGION_SHARED_BASE as *mut u32
+}
+
+struct ServerImpl {
+    sio: rp235x_pac::SIO,
+}
+
+impl idl::InOrderRp235xMailboxImpl for ServerImpl {
+    fn exchange(
+        &mut self,
+        _: &RecvMessage,
+        req: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // Drop any stale words core 1 may have left in our read FIFO.
+        while self.sio.fifo_st().read().vld().bit_is_set() {
+            let _ = self.sio.fifo_rd().read().bits();
+        }
+        // Push the request (wait for TX-FIFO space). Core 1 busy-polls the
+        // FIFO, so no SEV is needed to wake it.
+        while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+        self.sio.fifo_wr().write(|w| unsafe { w.bits(req) });
+        // Spin-wait for the reply. Core 1's fifo task answers in microseconds,
+        // so a busy spin is far faster than yielding a 1 ms tick; the bound
+        // only guards a wedged/absent core.
+        let mut spins = 0u32;
+        while self.sio.fifo_st().read().vld().bit_is_clear() {
+            spins += 1;
+            if spins > REPLY_SPINS {
+                return Ok(0xffff_ffff);
+            }
+        }
+        Ok(self.sio.fifo_rd().read().bits())
+    }
+
+    fn bench(
+        &mut self,
+        _: &RecvMessage,
+        n: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // Time `n` round-trip exchanges in a tight loop -- the cross-core
+        // transfer rate of the SIO-FIFO mailbox, free of per-call IPC overhead.
+        let start = userlib::sys_get_timer().now;
+        let mut i = 0u32;
+        while i < n {
+            while self.sio.fifo_st().read().vld().bit_is_set() {
+                let _ = self.sio.fifo_rd().read().bits();
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio.fifo_wr().write(|w| unsafe { w.bits(i) });
+            let mut spins = 0u32;
+            while self.sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = self.sio.fifo_rd().read().bits();
+            i += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
+
+    fn bulk_bench(
+        &mut self,
+        _: &RecvMessage,
+        len: u32,
+        iters: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // Non-pipelined one-way bulk: each round, fill `len` bytes of buffer 0
+        // (core 0 produces), doorbell core 1 (bit31, bit30=0 = single), wait for
+        // its checksum ack. Core-0 write and core-1 read are SEQUENTIAL.
+        let len = len.min((BUF_WORDS * 4) as u32);
+        let words = (len / 4) as usize;
+        let buf = unsafe { shared_words().add(BUF0_OFF) };
+        let start = userlib::sys_get_timer().now;
+        let mut it = 0u32;
+        while it < iters {
+            let mut i = 0usize;
+            while i < words {
+                unsafe {
+                    buf.add(i).write_volatile(it.wrapping_add(i as u32));
+                }
+                i += 1;
+            }
+            while self.sio.fifo_st().read().vld().bit_is_set() {
+                let _ = self.sio.fifo_rd().read().bits();
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio
+                .fifo_wr()
+                .write(|w| unsafe { w.bits(0x8000_0000 | len) });
+            let mut spins = 0u32;
+            while self.sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = self.sio.fifo_rd().read().bits();
+            it += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
+
+    fn bulk_pipe(
+        &mut self,
+        _: &RecvMessage,
+        iters: u32,
+    ) -> Result<u32, RequestError<Infallible>> {
+        // PIPELINED one-way bulk: double-buffered producer/consumer. Core 0
+        // fills buffer (block&1) and rings a "ready" doorbell (bit31|bit30|b);
+        // core 1 reads+sums that buffer and acks. With 2 buffers in different
+        // SRAM banks, core 0 fills one while core 1 drains the other IN
+        // PARALLEL -- the point of two cores. A 2-credit window keeps core 0 at
+        // most one buffer ahead; acks arrive in order so a generic credit count
+        // frees the right buffer.
+        let base = shared_words();
+        // Drop any stale acks.
+        while self.sio.fifo_st().read().vld().bit_is_set() {
+            let _ = self.sio.fifo_rd().read().bits();
+        }
+        let start = userlib::sys_get_timer().now;
+        let mut credits = 2u32;
+        let mut block = 0u32;
+        let wait_ack = |sio: &rp235x_pac::SIO| {
+            let mut spins = 0u32;
+            while sio.fifo_st().read().vld().bit_is_clear() {
+                spins += 1;
+                if spins > REPLY_SPINS {
+                    break;
+                }
+            }
+            let _ = sio.fifo_rd().read().bits();
+        };
+        while block < iters {
+            if credits == 0 {
+                wait_ack(&self.sio);
+                credits += 1;
+            }
+            credits -= 1;
+            let b = (block & 1) as usize;
+            let off = BUF0_OFF + b * (BUF1_OFF - BUF0_OFF);
+            let buf = unsafe { base.add(off) };
+            let mut i = 0usize;
+            while i < BUF_WORDS {
+                unsafe {
+                    buf.add(i).write_volatile(block.wrapping_add(i as u32));
+                }
+                i += 1;
+            }
+            while self.sio.fifo_st().read().rdy().bit_is_clear() {}
+            self.sio
+                .fifo_wr()
+                .write(|w| unsafe { w.bits(0xc000_0000 | b as u32) });
+            block += 1;
+        }
+        // Drain the in-flight buffers' acks.
+        while credits < 2 {
+            wait_ack(&self.sio);
+            credits += 1;
+        }
+        Ok((userlib::sys_get_timer().now - start) as u32)
+    }
+}
+
+impl idol_runtime::NotificationHandler for ServerImpl {
+    fn current_notification_mask(&self) -> u32 {
+        0
+    }
+    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {}
+}
+
+#[export_name = "main"]
+fn main() -> ! {
+    let p = unsafe { rp235x_pac::Peripherals::steal() };
+    let mut server = ServerImpl { sio: p.SIO };
+    let mut incoming = [0u8; idl::INCOMING_SIZE];
+    loop {
+        idol_runtime::dispatch(&mut incoming, &mut server);
+    }
+}
+
+mod idl {
+    include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
+}

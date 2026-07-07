@@ -21,6 +21,7 @@ use drv_rp235x_cyw43_api::Rp235xCyw43;
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
+use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
@@ -36,6 +37,7 @@ task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
 task_slot!(CYW43, cyw43);
+task_slot!(MAILBOX, mailbox_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -45,6 +47,7 @@ const HELP: &[u8] = b"commands:\r\n\
   help                  this text\r\n\
   status                run self-tests (uart loopback, spi loopback, i2c scan)\r\n\
   bench all [addr]      throughput of every bus in one table\r\n\
+  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n\
   ticks                 ms since boot\r\n\
   led on|off|toggle|blink   onboard LED (on/off/toggle suspend the\r\n\
                             idle heartbeat; blink restores it)\r\n\
@@ -86,6 +89,7 @@ struct Shell {
     adc: Rp235xAdc,
     pwm: Rp235xPwm,
     cyw43: Rp235xCyw43,
+    mailbox: Rp235xMailbox,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -166,6 +170,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "bench" => self.cmd_bench(words.next(), words.next()),
+            "core1" => self.cmd_core1(words.next(), words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -181,10 +186,10 @@ impl Shell {
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
             "crash" => {
-                // Fault this task on purpose (read an unmapped address) to test
-                // that jefe restarts the shell and it re-attaches to the USB
-                // console.
-                self.out.put(b"crashing shell (jefe should restart me)...\r\n");
+                // Fault this task on purpose to test that jefe restarts the
+                // shell (and, on AMP, that core 1's kernel is unaffected).
+                self.out
+                    .put(b"crashing shell (jefe should restart me)...\r\n");
                 self.out.flush();
                 // Precisely-attributed task fault (undefined instruction).
                 unsafe {
@@ -413,6 +418,145 @@ impl Shell {
     /// `bench all [n]` -- run every bus back-to-back and print one comparison
     /// table. UART (TX) and SPI (loopback/controller) bench standalone; I2C
     /// needs a target on the bus, so `bench all 42` benches address 0x42 too.
+    /// AMP: `core1 <n>` sends a number to core 1 over the inter-core mailbox and
+    /// prints its reply (`n*2 + 1`); `core1 stress <count>` hammers the path.
+    /// The mailbox driver bridges core 0's IPC to the SIO FIFO, answered by a
+    /// task on core 1's own kernel.
+    fn cmd_core1(&mut self, a: Option<&str>, b: Option<&str>, c: Option<&str>) {
+        if a == Some("stress") {
+            return self.core1_stress(b);
+        }
+        if a == Some("speed") {
+            return self.core1_speed(b);
+        }
+        if a == Some("bulk") {
+            return self.core1_bulk(b, c);
+        }
+        if a == Some("pipe") {
+            return self.core1_pipe(b);
+        }
+        let Some(n) = a.and_then(|s| s.parse::<u32>().ok()) else {
+            self.out.put(b"usage: core1 <n> | core1 stress <count>\r\n");
+            return;
+        };
+        let reply = self.mailbox.exchange(n);
+        if reply == 0xffff_ffff {
+            self.out.put(b"core 1 did not answer (timeout)\r\n");
+            return;
+        }
+        self.out.put(b"core 1: ");
+        self.out.put_u32(n);
+        self.out.put(b" -> ");
+        self.out.put_u32(reply);
+        self.out.put(if reply == n.wrapping_mul(2).wrapping_add(1) {
+            b" (n*2+1, correct)\r\n" as &[u8]
+        } else {
+            b" (unexpected)\r\n"
+        });
+    }
+
+    /// Stress the cross-core mailbox: `count` exchanges with distinct values,
+    /// verifying every reply. Reports rate and any wrong/timed-out answers --
+    /// proof the two-kernel FIFO path is correct under sustained load.
+    fn core1_stress(&mut self, arg: Option<&str>) {
+        let count = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(2000);
+        let t0 = sys_get_timer().now;
+        let mut bad = 0u32;
+        let mut timeouts = 0u32;
+        let mut i = 0u32;
+        while i < count {
+            let r = self.mailbox.exchange(i);
+            if r == 0xffff_ffff {
+                timeouts += 1;
+            } else if r != i.wrapping_mul(2).wrapping_add(1) {
+                bad += 1;
+            }
+            i += 1;
+        }
+        let ms = (sys_get_timer().now - t0) as u32;
+        self.out.put(b"stress: ");
+        self.out.put_u32(count);
+        self.out.put(b" exchanges in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms (");
+        self.out
+            .put_u32(count.wrapping_mul(1000).checked_div(ms).unwrap_or(0));
+        self.out.put(b" exch/s), bad=");
+        self.out.put_u32(bad);
+        self.out.put(b" timeouts=");
+        self.out.put_u32(timeouts);
+        self.out.put(if bad == 0 && timeouts == 0 {
+            b" -- PASS\r\n" as &[u8]
+        } else {
+            b" -- FAIL\r\n"
+        });
+    }
+
+    /// Cross-core transfer speed: `n` round-trip exchanges timed inside the
+    /// mailbox driver (one IPC), so the number reflects the raw SIO-FIFO +
+    /// core-1 rate, not the per-command shell IPC (which caps `core1 stress`).
+    /// Each exchange moves a 32-bit word each way = 8 bytes over the FIFO.
+    fn core1_speed(&mut self, arg: Option<&str>) {
+        let n = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1_000_000);
+        let ms = self.mailbox.bench(n);
+        let exch_per_s = (n as u64)
+            .wrapping_mul(1000)
+            .checked_div(ms as u64)
+            .unwrap_or(0);
+        let kb_per_s = exch_per_s.wrapping_mul(8) / 1024;
+        self.out.put(b"core1 speed: ");
+        self.out.put_u32(n);
+        self.out.put(b" round-trips in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(exch_per_s);
+        self.out.put(b" exch/s, ");
+        self.out.put_u64(kb_per_s);
+        self.out.put(b" KB/s (8 B/exchange on the FIFO)\r\n");
+    }
+
+    /// One-way bulk transfer ceiling: `core1 bulk <len> <iters>` moves `len`
+    /// bytes (<=4096) through shared SRAM `iters` times -- core 0 writes the
+    /// buffer, doorbells core 1, core 1 reads+checksums it. Reports MB/s of
+    /// core->core payload.
+    fn core1_bulk(&mut self, a: Option<&str>, b: Option<&str>) {
+        let len = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(4096);
+        let iters = b.and_then(|s| s.parse::<u32>().ok()).unwrap_or(50_000);
+        let ms = self.mailbox.bulk_bench(len, iters);
+        let bytes = (len as u64).wrapping_mul(iters as u64);
+        let kb_per_s =
+            bytes.wrapping_mul(1000).checked_div(ms as u64).unwrap_or(0) / 1024;
+        self.out.put(b"core1 bulk: ");
+        self.out.put_u32(iters);
+        self.out.put(b" x ");
+        self.out.put_u32(len);
+        self.out.put(b" B in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(kb_per_s);
+        self.out
+            .put(b" KB/s one-way (core0->shared SRAM->core1)\r\n");
+    }
+
+    /// Pipelined bulk: `core1 pipe <iters>` transfers `iters` x 2 KiB blocks
+    /// double-buffered, so core 0 fills one buffer while core 1 drains the
+    /// other in parallel (buffers in different SRAM banks) -- the payoff of two
+    /// cores. Compare to `core1 bulk` (sequential write-then-read).
+    fn core1_pipe(&mut self, a: Option<&str>) {
+        let iters = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(100_000);
+        let ms = self.mailbox.bulk_pipe(iters);
+        let bytes = (iters as u64).wrapping_mul(2048);
+        let kb_per_s =
+            bytes.wrapping_mul(1000).checked_div(ms as u64).unwrap_or(0) / 1024;
+        self.out.put(b"core1 pipe: ");
+        self.out.put_u32(iters);
+        self.out.put(b" x 2048 B in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        self.out.put_u64(kb_per_s);
+        self.out.put(b" KB/s one-way (pipelined, 2 SRAM banks)\r\n");
+    }
+
     fn cmd_bench(&mut self, sub: Option<&str>, addr: Option<&str>) {
         if sub != Some("all") {
             self.out.put(b"usage: bench all [i2c-target-hex-addr]\r\n");
@@ -1407,6 +1551,7 @@ pub fn main() -> ! {
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
+        mailbox: Rp235xMailbox::from(MAILBOX.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],

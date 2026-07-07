@@ -983,6 +983,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-core1"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+]
+
+[[package]]
 name = "demo-stm32f4-discovery"
 version = "0.1.0"
 dependencies = [
@@ -2379,6 +2390,32 @@ version = "0.1.0"
 dependencies = [
  "counters",
  "derive-idol-err",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-mailbox"
+version = "0.1.0"
+dependencies = [
+ "drv-rp235x-mailbox-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-mailbox-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
  "idol",
  "num-traits",
  "userlib",
@@ -6872,6 +6909,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-rp235x-core1-beat"
+version = "0.1.0"
+dependencies = [
+ "userlib",
+]
+
+[[package]]
+name = "task-rp235x-core1-fifo"
+version = "0.1.0"
+dependencies = [
+ "rp235x-pac",
+ "userlib",
+]
+
+[[package]]
 name = "task-rp235x-shell"
 version = "0.1.0"
 dependencies = [
@@ -6880,6 +6932,7 @@ dependencies = [
  "drv-rp235x-flash-api",
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",
+ "drv-rp235x-mailbox-api",
  "drv-rp235x-pwm-api",
  "drv-rp235x-spi-api",
  "drv-rp235x-uart-api",

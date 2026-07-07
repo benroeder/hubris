@@ -1,0 +1,36 @@
+// RP2350 (RP235x) inter-core mailbox driver API.
+//
+// Owns the SIO inter-core FIFO on core 0 and bridges it to Hubris IPC: tasks
+// call `exchange` to send a 32-bit request word to the core-1 payload and get
+// its reply. This is the AMP "tasks post between cores" path (branch
+// rp2350-amp) -- an explicit channel, not transparent cross-core IPC.
+
+Interface(
+    name: "Rp235xMailbox",
+    ops: {
+        "exchange": (
+            description: "Send `req` to core 1 over the SIO FIFO and return its reply word. Bounded wait; returns 0xffffffff on timeout.",
+            args: { "req": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+        "bench": (
+            description: "Cross-core transfer speed test: do `n` round-trip exchanges over the SIO FIFO in a tight loop (one IPC), returning the elapsed milliseconds. Measures the raw FIFO+core-1 rate without per-call IPC overhead.",
+            args: { "n": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+        "bulk_bench": (
+            description: "Non-pipelined one-way bulk: for `iters` rounds, write `len` (<=2048) bytes into shared buffer 0, doorbell core 1, wait for its checksum. Core-0 write and core-1 read are sequential.",
+            args: { "len": "u32", "iters": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+        "bulk_pipe": (
+            description: "Pipelined one-way bulk: double-buffered producer/consumer transferring `iters` x 2 KiB blocks. Core 0 fills one buffer while core 1 drains the other in parallel (buffers in different SRAM banks). Returns elapsed milliseconds.",
+            args: { "iters": "u32" },
+            reply: Simple("u32"),
+            idempotent: true,
+        ),
+    },
+)

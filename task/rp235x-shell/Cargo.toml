@@ -11,6 +11,7 @@ drv-rp235x-uart-api = { path = "../../drv/rp235x-uart-api" }
 drv-rp235x-spi-api = { path = "../../drv/rp235x-spi-api" }
 drv-rp235x-i2c-api = { path = "../../drv/rp235x-i2c-api" }
 drv-rp235x-flash-api = { path = "../../drv/rp235x-flash-api" }
+drv-rp235x-mailbox-api = { path = "../../drv/rp235x-mailbox-api" }
 drv-rp235x-adc-api = { path = "../../drv/rp235x-adc-api" }
 drv-rp235x-pwm-api = { path = "../../drv/rp235x-pwm-api" }
 drv-rp235x-cyw43-api = { path = "../../drv/rp235x-cyw43-api" }

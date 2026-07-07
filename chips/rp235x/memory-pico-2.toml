@@ -9,13 +9,13 @@
 # 0x10000000..0x10040000 -> runtime 0x20000000..0x20040000).
 [[flash]]
 address = 0x2000_0000
-size = 0x4_0000        # 256 KiB code window (of 520 KiB total SRAM)
+size = 0x3_8000        # 224 KiB code window (core 0; Wi-Fi image ~180 KiB)
 read = true
 execute = true
 
 [[ram]]
-address = 0x2004_0000  # data pool: the rest of SRAM (striped SRAM0-7 + SRAM8/9)
-size = 0x4_2000
+address = 0x2003_8000  # data pool: 176 KiB (ends at core-1 flash 0x20064000)
+size = 0x2_C000
 read = true
 write = true
 execute = false
@@ -76,3 +76,13 @@ read = true
 address = 0x1c20_0000
 size = 0x18_0000
 read = true
+
+# Shared SRAM buffer for the AMP cross-core transfer test: core 0 writes it,
+# doorbells core 1 over the FIFO, core 1 reads it. Granted to the mailbox driver
+# (core 0) + the core-1 fifo task. SRAM, disjoint from the flash-mirror
+# cyw43_fw region above.
+[[shared]]
+address = 0x2008_0000
+size = 0x2000          # SRAM8+SRAM9: beat mailbox + two bulk buffers (diff banks)
+read = true
+write = true

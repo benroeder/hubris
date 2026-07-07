@@ -17,6 +17,71 @@ mod image_version {
 /// Pico 2 onboard LED.
 const LED_PIN: u32 = 25;
 
+// --- AMP milestone B2: run a second Hubris kernel on core 1 -------------------
+//
+// Optional multicore experiment (branch rp2350-amp). Core 0 runs single-core
+// Hubris as before; just before starting its own kernel it copies core 1's
+// separately-built Hubris image into the upper half of SRAM and launches core 1
+// at that image's reset vector. Core 1 then runs its OWN independent kernel
+// (jefe + a liveness "beat" task + idle). The two kernels share nothing but the
+// SIO FIFO and a shared-SRAM region (0x20080000). Verify over `--core 1`: the
+// beat task writes 0xBEA71234 + an incrementing heartbeat at 0x20080000.
+
+/// Core 1's Hubris kernel image, built by `app/demo-pi-pico-2-core1` and linked
+/// at CORE1_LOAD_ADDR. Embedded in core 0's image and copied into place at boot
+/// -- no second LOAD_MAP entry needed.
+static CORE1_IMAGE: &[u8] = include_bytes!("core1.bin");
+
+/// Where core 1's image is linked / copied to (its vector table base).
+const CORE1_LOAD_ADDR: u32 = 0x2006_4000;
+
+/// Copy core 1's kernel image into its SRAM region and launch core 1 at its
+/// reset vector, so it runs its own Hubris kernel.
+fn launch_core1_kernel(sio: &rp235x_pac::SIO) {
+    // SAFETY: CORE1_LOAD_ADDR..+len is core 1's SRAM region, disjoint from
+    // core 0's (memory-pico-2.toml vs -core1.toml); core 1 is still parked.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            CORE1_IMAGE.as_ptr(),
+            CORE1_LOAD_ADDR as *mut u8,
+            CORE1_IMAGE.len(),
+        );
+    }
+    cortex_m::asm::dsb(); // image must be visible before core 1 fetches it
+    // Vector table at the load address: [0] = initial SP, [1] = reset entry.
+    let vt = CORE1_LOAD_ADDR as *const u32;
+    let sp = unsafe { vt.read() };
+    let entry = unsafe { vt.add(1).read() };
+    launch_core1(sio, CORE1_LOAD_ADDR, sp, entry);
+}
+
+/// Wake core 1 (asleep in the bootrom) and start it at (vtor, sp, entry) using
+/// the SIO inter-core FIFO handshake from datasheet sec 5.3:
+/// send {0, 0, 1, VTOR, SP, entry}, each echoed back before advancing.
+fn launch_core1(sio: &rp235x_pac::SIO, vtor: u32, sp: u32, entry: u32) {
+    let seq = [0u32, 0, 1, vtor, sp, entry];
+    let mut i = 0usize;
+    while i < seq.len() {
+        let cmd = seq[i];
+        if cmd == 0 {
+            // Drain anything core 1 left in our read FIFO, then wake it.
+            while sio.fifo_st().read().vld().bit_is_set() {
+                let _ = sio.fifo_rd().read().bits();
+            }
+            cortex_m::asm::sev();
+        }
+        while sio.fifo_st().read().rdy().bit_is_clear() {}
+        sio.fifo_wr().write(|w| unsafe { w.bits(cmd) });
+        cortex_m::asm::sev();
+        while sio.fifo_st().read().vld().bit_is_clear() {
+            cortex_m::asm::wfe();
+        }
+        let resp = sio.fifo_rd().read().bits();
+        i = if cmd == resp { i + 1 } else { 0 };
+    }
+}
+// -----------------------------------------------------------------------------
+
 /// RP2350 boot metadata: IMAGE_DEF block for a RAM ("packaged") image.
 ///
 /// The boot ROM refuses images without an IMAGE_DEF in the first 4 KiB (the
@@ -58,9 +123,10 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
     // exceeds it, the tail is silently NOT copied -- a task's .rodata/.text
     // near the top of SRAM reads garbage (e.g. a patched task-slot -> boot
     // fault "used bogus task index"). The smoltcp build is ~136 KiB, so 128 KiB
-    // truncated it. 192 KiB covers it with room, still under the 256 KiB
-    // partition.
-    0x0003_0000, // entry 0: size in bytes (192 KiB)
+    // truncated it. With the AMP core-1 blob (~22 KiB) embedded, the core-0
+    // image is ~180 KiB, so copy 224 KiB (= the core-0 code window, ends exactly
+    // at [[ram]] 0x20038000), still under the 256 KiB partition.
+    0x0003_8000, // entry 0: size in bytes (224 KiB)
     // VERSION item (type 0x48, 2 words, no rollback rows): the boot ROM uses
     // this to choose between A/B partitions -- the higher version boots. The
     // second word ((major << 16) | minor) is stamped by build.rs from
@@ -1197,6 +1263,12 @@ fn main() -> ! {
     // per-task region limit already).
     p.RESETS.reset().modify(|_, w| w.pio2().clear_bit());
     while p.RESETS.reset_done().read().pio2().bit_is_clear() {}
+
+    // AMP B2: copy core 1's Hubris image into its SRAM region and launch its
+    // kernel before core 0 enters its own kernel. Core 0 stays single-core
+    // Hubris (running the Wi-Fi stack); core 1 runs its own kernel + tasks (see
+    // the beat heartbeat over `probe-rs --core 1`).
+    launch_core1_kernel(&p.SIO);
 
     unsafe { kern::startup::start_kernel(cycles_per_ms) }
 }
