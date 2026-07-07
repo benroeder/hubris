@@ -121,6 +121,8 @@ struct Cyw43 {
     /// DHCP lease table: client MAC per pool slot; IP = 192.168.4.(2 + slot).
     leases: [[u8; 6]; 8],
     lease_count: u8,
+    /// BDC interface index for TX frames: 1 = AP (portal), 0 = STA (after join).
+    tx_iface: u32,
 }
 
 impl Cyw43 {
@@ -407,6 +409,7 @@ impl Cyw43 {
             settle: 30_000, // conservative during bring-up (firmware upload)
             leases: [[0; 6]; 8],
             lease_count: 0,
+            tx_iface: 1, // AP interface until the STA join switches it to 0
         };
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         me.ssid[..7].copy_from_slice(b"hubris-");
@@ -756,7 +759,7 @@ impl Cyw43 {
         b[2] = (self.tx_seq as u32) | (2 << 8) | (14 << 24); // seq, chan=2, hdr_len=14
         b[3] = 0;
         b[4] = 0x20u32 << 16; // pad,pad,BDC.flags=0x20,BDC.priority=0
-        b[5] = 1; // BDC.flags2 = interface index 1 (AP) so it reaches the client
+        b[5] = self.tx_iface; // BDC.flags2 = interface (1 AP portal, 0 STA)
         for (j, &byte) in eth.iter().enumerate() {
             let pos = 18 + j;
             b[1 + pos / 4] |= (byte as u32) << (8 * (pos % 4));
@@ -1259,8 +1262,9 @@ impl Cyw43 {
 
         // Poll WLC_GET_BSSID: success once associated + stable through the 4-way
         // handshake window (a wrong password associates then deauths -> resets).
+        // Mode-switch + scan + assoc can be slow, so allow ~20s.
         let mut ok = 0u32;
-        for t in 0..24u32 {
+        for t in 0..40u32 {
             userlib::hl::sleep_for(500);
             let st = self.do_ioctl_b(0, 23, 68, 0, &[], 6, fr); // WLC_GET_BSSID
             ok = if st == 0 { ok + 1 } else { 0 };

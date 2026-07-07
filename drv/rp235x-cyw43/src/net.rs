@@ -16,7 +16,7 @@ use core::sync::atomic::Ordering::SeqCst;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
@@ -601,9 +601,39 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
             let res = device.wifi.sta_join(device.fr);
             DIAG[15].store(if res == 0 { 0x00C0_FFEE } else { 0x0BAD_0BAD }, SeqCst);
             if res == 0 {
-                // Connected as a station -- park (STA net loop is future work).
+                // Associated -- become a station: TX on the STA interface, drop
+                // the AP's static IP, and run a DHCP client to get an address on
+                // the joined network.
+                device.wifi.tx_iface = 0;
+                iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                });
+                let dhcp_handle = sockets.add(dhcpv4::Socket::new());
                 loop {
-                    userlib::hl::sleep_for(1000);
+                    let t = userlib::sys_get_timer().now;
+                    iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
+                    match sockets.get_mut::<dhcpv4::Socket<'_>>(dhcp_handle).poll() {
+                        Some(dhcpv4::Event::Configured(cfg)) => {
+                            iface.update_ip_addrs(|addrs| {
+                                addrs.push(IpCidr::Ipv4(cfg.address)).ok();
+                            });
+                            if let Some(gw) = cfg.router {
+                                iface.routes_mut().add_default_ipv4_route(gw).ok();
+                            }
+                            // Leased IP -- read via the probe, then ping it.
+                            DIAG[3].store(
+                                u32::from_be_bytes(cfg.address.address().0),
+                                SeqCst,
+                            );
+                            DIAG[15].store(0x001E_A5ED, SeqCst); // got a lease
+                        }
+                        Some(dhcpv4::Event::Deconfigured) => {
+                            iface.update_ip_addrs(|addrs| {
+                                addrs.clear();
+                            });
+                        }
+                        None => {}
+                    }
                 }
             }
             // Failed: record the error, clear the flag, re-open the AP, rebuild
