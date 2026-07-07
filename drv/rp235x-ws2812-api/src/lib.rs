@@ -13,6 +13,9 @@ use userlib::{FromPrimitive, sys_send};
 pub enum Ws2812Error {
     /// Malformed argument.
     BadArg = 1,
+    /// The PIO state machine did not drain the TX FIFO (not clocking); the
+    /// colour write was dropped rather than blocking the server forever.
+    Stalled = 2,
 }
 
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));

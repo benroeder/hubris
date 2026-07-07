@@ -56,8 +56,18 @@ impl idl::InOrderRp235xWs2812Impl for ServerImpl {
         _: &RecvMessage,
         grb: u32,
     ) -> Result<(), RequestError<Ws2812Error>> {
-        // Wait for the SM0 TX FIFO to have space (txfull bit 0 clear).
-        while self.pio.fstat().read().txfull().bits() & 1 != 0 {}
+        // Wait for the SM0 TX FIFO to have space (txfull bit 0 clear). Bound the
+        // spin: if the SM is not clocking, the 4-deep FIFO never drains, so give
+        // up rather than wedge the server (and every client) forever. The SM is
+        // enabled + fed an 8 MHz clock in setup(), so this bound is only reached
+        // if PIO0 was never brought out of reset.
+        let mut spins = 0u32;
+        while self.pio.fstat().read().txfull().bits() & 1 != 0 {
+            spins += 1;
+            if spins > 1_000_000 {
+                return Err(Ws2812Error::Stalled.into());
+            }
+        }
         // Left-justify the 24-bit GRB value for the MSB-first 24-bit autopull.
         self.pio.txf(0).write(|w| unsafe { w.bits(grb << 8) });
         Ok(())
@@ -122,8 +132,17 @@ fn setup(p: &rp235x_pac::Peripherals) {
     // Make GP22 a PIO output via an immediate `set pindirs, 1`.
     sm.sm_instr()
         .write(|w| unsafe { w.sm0_instr().bits(SET_PINDIRS_OUT) });
-    // Enable SM0.
+    // Enable SM0. With an empty FIFO it stalls on the `out` instruction holding
+    // the line low (side 0).
     pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+    // Blank the pixel. GP22 floats (pindir=0) between the funcsel routing above
+    // and the `set pindirs` output enable, so the WS2812 can latch a garbage
+    // colour during boot. Clearing it needs a >50 us low (reset) BEFORE the 0
+    // frame -- otherwise the pixel treats the lone word as data for a second
+    // (absent) pixel and keeps the garbage. The enabled SM holds the line low,
+    // so sleep 1 ms for a solid reset, then clock the 0 frame to latch off.
+    userlib::hl::sleep_for(1);
+    pio.txf(0).write(|w| unsafe { w.bits(0) });
 }
 
 #[export_name = "main"]
