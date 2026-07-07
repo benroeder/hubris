@@ -19,21 +19,24 @@
 use drv_rp235x_adc_api::{Rp235xAdc, TEMP_CHANNEL};
 #[cfg(feature = "cyw43")]
 use drv_rp235x_cyw43_api::Rp235xCyw43;
+#[cfg(feature = "ds1302")]
+use drv_rp235x_ds1302_api::Rp235xDs1302;
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
 #[cfg(feature = "mailbox")]
 use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
-#[cfg(feature = "slink")]
-use drv_rp235x_slink_api::Rp235xSlink;
-#[cfg(feature = "ws2812")]
-use drv_rp235x_ws2812_api::Rp235xWs2812;
-#[cfg(feature = "ds1302")]
-use drv_rp235x_ds1302_api::Rp235xDs1302;
 #[cfg(feature = "sdcard")]
 use drv_rp235x_sdcard_api::Rp235xSdcard;
+#[cfg(feature = "slink")]
+use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
+#[cfg(feature = "ws2812")]
+use drv_rp235x_ws2812_api::Rp235xWs2812;
+
+#[cfg(feature = "fat")]
+mod fatfs;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
 use userlib::{hl, sys_get_timer, task_slot};
@@ -104,18 +107,24 @@ const HELP: &[u8] = b"commands:\r\n\
 const HELP_MAILBOX: &[u8] =
     b"  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n";
 #[cfg(feature = "slink")]
-const HELP_SLINK: &[u8] = b"  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
+const HELP_SLINK: &[u8] =
+    b"  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
   slink listen [ms]     wait for an S-Link frame; print the bytes\r\n";
 #[cfg(feature = "ws2812")]
 const HELP_WS2812: &[u8] =
     b"  rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n";
 #[cfg(feature = "ds1302")]
-const HELP_DS1302: &[u8] = b"  rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
+const HELP_DS1302: &[u8] =
+    b"  rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
   rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]   set the DS1302 clock\r\n";
 #[cfg(feature = "sdcard")]
 const HELP_SDCARD: &[u8] = b"  sd init               run the SD SPI-mode init handshake (GP10-13)\r\n\
   sd read <block>       read a 512-byte block; hexdump it\r\n\
   sd find <start> <n>   scan n blocks; print any printable-ASCII runs (>=4)\r\n";
+#[cfg(feature = "fat")]
+const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (name + size)\r\n\
+  sd cat <name>         print a file from the FAT root directory\r\n\
+  sd df                 FAT volume total/used/free space (from BPB + FSInfo)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -228,6 +237,8 @@ impl Shell {
                 self.out.put(HELP_DS1302);
                 #[cfg(feature = "sdcard")]
                 self.out.put(HELP_SDCARD);
+                #[cfg(feature = "fat")]
+                self.out.put(HELP_FAT);
             }
             "status" => self.cmd_status(),
             "ticks" => {
@@ -382,12 +393,7 @@ impl Shell {
     /// `rgb <r> <g> <b>`: set the WS2812 (NeoPixel) on GP22. Each channel is a
     /// decimal 0-255; packed into the WS2812 wire order (G<<16 | R<<8 | B).
     #[cfg(feature = "ws2812")]
-    fn cmd_rgb(
-        &mut self,
-        r: Option<&str>,
-        g: Option<&str>,
-        b: Option<&str>,
-    ) {
+    fn cmd_rgb(&mut self, r: Option<&str>, g: Option<&str>, b: Option<&str>) {
         let parse = |s: Option<&str>| s.and_then(|v| v.parse::<u8>().ok());
         let (Some(r), Some(g), Some(b)) = (parse(r), parse(g), parse(b)) else {
             self.out.put(b"usage: rgb <r> <g> <b> (0-255)\r\n");
@@ -1742,12 +1748,7 @@ impl Shell {
     /// ASCII runs (>=4 bytes) -- a way to spot a text message on a formatted
     /// card with no filesystem. Block numbers are plain decimals (like `rgb`).
     #[cfg(feature = "sdcard")]
-    fn cmd_sd(
-        &mut self,
-        verb: Option<&str>,
-        a: Option<&str>,
-        b: Option<&str>,
-    ) {
+    fn cmd_sd(&mut self, verb: Option<&str>, a: Option<&str>, b: Option<&str>) {
         match verb {
             Some("init") => match self.sdcard.init() {
                 Ok(status) => {
@@ -1852,8 +1853,220 @@ impl Shell {
                 self.out.put_u32(hits);
                 self.out.put(b" run(s)\r\n");
             }
-            _ => self.out.put(
-                b"usage: sd init | read <block> | find <start> <count>\r\n",
+            #[cfg(feature = "fat")]
+            Some("ls") => self.fat_ls(),
+            #[cfg(feature = "fat")]
+            Some("cat") => self.fat_cat(a),
+            #[cfg(feature = "fat")]
+            Some("df") => self.fat_df(),
+            _ => {
+                self.out.put(
+                    b"usage: sd init | read <block> | find <start> <count>",
+                );
+                #[cfg(feature = "fat")]
+                self.out.put(b" | ls | cat <name> | df");
+                self.out.put(b"\r\n");
+            }
+        }
+    }
+
+    /// `sd ls`: mount FAT volume 0, list the root directory (name + size).
+    /// UNPROVEN on hardware.
+    #[cfg(feature = "fat")]
+    fn fat_ls(&mut self) {
+        use embedded_sdmmc::{VolumeIdx, VolumeManager};
+        let vm = VolumeManager::new(
+            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
+            fatfs::DummyTime,
+        );
+        let volume = match vm.open_volume(VolumeIdx(0)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.out.put(b"sd ls: open volume failed\r\n");
+                return;
+            }
+        };
+        let root = match volume.open_root_dir() {
+            Ok(d) => d,
+            Err(_) => {
+                self.out.put(b"sd ls: open root dir failed\r\n");
+                return;
+            }
+        };
+        let mut count = 0u32;
+        let res = root.iterate_dir(|entry| {
+            // Skip the volume-label / long-file-name pseudo-entries.
+            if entry.attributes.is_volume() {
+                return;
+            }
+            // Reassemble the 8.3 short name: BASE[.EXT], trailing `/` for dirs.
+            self.out.put(entry.name.base_name());
+            let ext = entry.name.extension();
+            if !ext.is_empty() {
+                self.out.put(b".");
+                self.out.put(ext);
+            }
+            if entry.attributes.is_directory() {
+                self.out.put(b"/");
+            }
+            self.out.put(b"\t");
+            self.out.put_u32(entry.size);
+            self.out.put(b"\r\n");
+            count += 1;
+        });
+        if res.is_err() {
+            self.out.put(b"sd ls: directory read error\r\n");
+        } else if count == 0 {
+            self.out.put(b"(empty)\r\n");
+        }
+    }
+
+    /// `sd cat <NAME>`: open NAME in the root dir read-only, stream it to the
+    /// console until EOF. UNPROVEN on hardware.
+    #[cfg(feature = "fat")]
+    fn fat_cat(&mut self, name: Option<&str>) {
+        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+        let Some(name) = name else {
+            self.out.put(b"usage: sd cat <name>\r\n");
+            return;
+        };
+        let vm = VolumeManager::new(
+            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
+            fatfs::DummyTime,
+        );
+        let volume = match vm.open_volume(VolumeIdx(0)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.out.put(b"sd cat: open volume failed\r\n");
+                return;
+            }
+        };
+        let root = match volume.open_root_dir() {
+            Ok(d) => d,
+            Err(_) => {
+                self.out.put(b"sd cat: open root dir failed\r\n");
+                return;
+            }
+        };
+        let file = match root.open_file_in_dir(name, Mode::ReadOnly) {
+            Ok(f) => f,
+            Err(_) => {
+                self.out.put(b"sd cat: file not found\r\n");
+                return;
+            }
+        };
+        // Small on-stack buffer: embedded-sdmmc already keeps one 512-byte
+        // Block on the stack per read, so keep ours modest.
+        let mut buf = [0u8; 64];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.out.put(&buf[..n]),
+                Err(_) => {
+                    self.out.put(b"\r\nsd cat: read error\r\n");
+                    return;
+                }
+            }
+            if file.is_eof() {
+                break;
+            }
+        }
+        self.out.put(b"\r\n");
+    }
+
+    /// `sd df`: report the FAT volume's total / used / free space. embedded-sdmmc
+    /// 0.9 exposes no free-space API, so this reads the boot sector (BPB) and
+    /// FAT32 FSInfo sector directly via the raw block device. The free count is
+    /// FSInfo's cached value and can be stale (a true df scans the FAT).
+    /// UNPROVEN on hardware.
+    #[cfg(feature = "fat")]
+    fn fat_df(&mut self) {
+        let sdcard = Rp235xSdcard::from(SDCARD.get_task_id());
+        let mut blk = [0u8; 512];
+        let rd16 =
+            |b: &[u8; 512], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let rd32 = |b: &[u8; 512], o: usize| {
+            u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+        };
+
+        // 1. MBR at LBA 0 -> partition 1's start LBA (mirrors what open_volume
+        //    mounts). part_start == 0 means a "superfloppy" (VBR at LBA 0).
+        if sdcard.read_block(0, &mut blk).is_err() {
+            self.out.put(b"sd df: read MBR failed\r\n");
+            return;
+        }
+        if rd16(&blk, 510) != 0xAA55 {
+            self.out.put(b"sd df: no MBR signature\r\n");
+            return;
+        }
+        let part_start = rd32(&blk, 446 + 8);
+
+        // 2. Boot sector / BPB at the partition start.
+        if sdcard.read_block(part_start, &mut blk).is_err() {
+            self.out.put(b"sd df: read boot sector failed\r\n");
+            return;
+        }
+        if rd16(&blk, 510) != 0xAA55 {
+            self.out.put(b"sd df: bad boot signature\r\n");
+            return;
+        }
+        let bytes_per_block = rd16(&blk, 11) as u32;
+        let spc = blk[13] as u32; // blocks (sectors) per cluster
+        let reserved = rd16(&blk, 14) as u32;
+        let num_fats = blk[16] as u32;
+        let root_entries = rd16(&blk, 17) as u32;
+        let total16 = rd16(&blk, 19) as u32;
+        let total32 = rd32(&blk, 32);
+        let fat16 = rd16(&blk, 22) as u32;
+        let fat32 = rd32(&blk, 36);
+        let fs_info = rd16(&blk, 48) as u32;
+        if bytes_per_block != 512 || spc == 0 {
+            self.out.put(b"sd df: unsupported geometry\r\n");
+            return;
+        }
+        let fat_size = if fat16 != 0 { fat16 } else { fat32 };
+        let total_blocks = if total16 != 0 { total16 } else { total32 };
+        let root_dir_blocks = (root_entries * 32).div_ceil(512);
+        let non_data = reserved + num_fats * fat_size + root_dir_blocks;
+        if total_blocks <= non_data {
+            self.out.put(b"sd df: bad geometry\r\n");
+            return;
+        }
+        let cluster_count = (total_blocks - non_data) / spc;
+        let bytes_per_cluster = (spc * 512) as u64;
+        let total_data_bytes = u64::from(cluster_count) * bytes_per_cluster;
+
+        // 3. FAT32 FSInfo cached free-cluster count. FAT16 (fat_size16 != 0)
+        //    has no FSInfo, so free stays unknown there.
+        let mut free_bytes: Option<u64> = None;
+        if fat16 == 0
+            && sdcard.read_block(part_start + fs_info, &mut blk).is_ok()
+            && rd32(&blk, 0) == 0x4161_5252
+            && rd32(&blk, 484) == 0x6141_7272
+        {
+            let free_clusters = rd32(&blk, 488);
+            if free_clusters != 0xFFFF_FFFF && free_clusters <= cluster_count {
+                free_bytes = Some(u64::from(free_clusters) * bytes_per_cluster);
+            }
+        }
+
+        let mib = |bytes: u64| (bytes / (1024 * 1024)) as u32;
+        self.out.put(b"total ");
+        self.out.put_u32(mib(total_data_bytes));
+        self.out.put(b" MiB");
+        match free_bytes {
+            Some(free) => {
+                let used = total_data_bytes.saturating_sub(free);
+                self.out.put(b", used ");
+                self.out.put_u32(mib(used));
+                self.out.put(b" MiB, free ");
+                self.out.put_u32(mib(free));
+                self.out.put(
+                    b" MiB (FSInfo cached free-count, may be stale)\r\n",
+                );
+            }
+            None => self.out.put(
+                b", used/free unknown (no valid FSInfo; real df scans the FAT)\r\n",
             ),
         }
     }

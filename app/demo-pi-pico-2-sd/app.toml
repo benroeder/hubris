@@ -114,10 +114,10 @@ task-slots = ["sys"]
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 32768, ram = 4096}
-stacksize = 2048
+max-sizes = {flash = 49152, ram = 8192}
+stacksize = 4096
 start = true
-features = ["sdcard"]
+features = ["sdcard", "fat"]
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard"]
 
 [tasks.hiffy]

@@ -19,6 +19,7 @@ drv-rp235x-slink-api = { path = "../../drv/rp235x-slink-api", optional = true }
 drv-rp235x-ws2812-api = { path = "../../drv/rp235x-ws2812-api", optional = true }
 drv-rp235x-ds1302-api = { path = "../../drv/rp235x-ds1302-api", optional = true }
 drv-rp235x-sdcard-api = { path = "../../drv/rp235x-sdcard-api", optional = true }
+embedded-sdmmc = { workspace = true, optional = true }
 
 [features]
 cyw43 = ["dep:drv-rp235x-cyw43-api"]
@@ -27,6 +28,7 @@ slink = ["dep:drv-rp235x-slink-api"]
 ws2812 = ["dep:drv-rp235x-ws2812-api"]
 ds1302 = ["dep:drv-rp235x-ds1302-api"]
 sdcard = ["dep:drv-rp235x-sdcard-api"]
+fat = ["sdcard", "dep:embedded-sdmmc"]
 
 [[bin]]
 name = "task-rp235x-shell"

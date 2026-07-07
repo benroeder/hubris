@@ -63,6 +63,7 @@ digest = { version = "0.10", default-features = false }
 directories = { version = "6.0.0" }
 dunce = { version = "1.0.2", default-features = false }
 embedded-hal = { version = "0.2", default-features = false }
+embedded-sdmmc = { version = "0.9", default-features = false }
 enum-kinds = { version = "0.5.1", default-features = false, features = ["no-stdlib"] }
 enum-map = { version = "2.7.3", default-features = false }
 filetime = { version = "0.2.12", default-features = false }
