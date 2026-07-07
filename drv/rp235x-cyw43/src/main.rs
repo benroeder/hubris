@@ -53,6 +53,12 @@ static DATA_FRAME: [AtomicU32; 128] =
 #[used]
 static CREDS: [AtomicU32; 27] = [const { AtomicU32::new(0) }; 27];
 
+/// Nearby SSIDs from the startup scan, packed as newline-separated names for the
+/// portal's network dropdown (up to ~400 bytes).
+#[no_mangle]
+#[used]
+static SCAN_SSIDS: [AtomicU32; 100] = [const { AtomicU32::new(0) }; 100];
+
 // Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h.
 static NVRAM: [u32; 186] = [
     0x4152564e, 0x7665524d, 0x6552243d, 0x6d002476, 0x69666e61, 0x78303d64,
@@ -672,16 +678,54 @@ impl Cyw43 {
         esc[58..74].iter_mut().for_each(|x| *x = 0xff);
         self.do_ioctl_b(2, 0x107, 10, 0, &esc, 80, fr);
         let mut events = 0u32;
+        let mut ssids = [0u8; 384]; // packed "ssid\nssid\n..."
+        let mut slen = 0usize;
         for _ in 0..15_000u32 {
             let (got, chan, _s, bdc, _i) = self.rx(fr);
             if got {
                 self.take_credit(chan, bdc);
                 if chan == 1 {
                     events += 1;
+                    // Parse the AP SSID from the escan-result event: SSID_len is at
+                    // SDPCM header_length + 110, the name follows. Add it, deduped.
+                    let byte = |p: usize| (fr[p / 4] >> (8 * (p % 4))) as u8;
+                    let lp = ((fr[1] >> 24) & 0xFF) as usize + 110;
+                    let sl = byte(lp) as usize;
+                    if (1..=32).contains(&sl) {
+                        let mut ssid = [0u8; 32];
+                        let mut ok = true;
+                        for (i, s) in ssid[..sl].iter_mut().enumerate() {
+                            let c = byte(lp + 1 + i);
+                            if !(0x20..=0x7e).contains(&c) {
+                                ok = false;
+                                break;
+                            }
+                            *s = c;
+                        }
+                        let seen =
+                            ssids[..slen].split(|&b| b == b'\n').any(|e| e == &ssid[..sl]);
+                        if ok && !seen && slen + sl < ssids.len() {
+                            ssids[slen..slen + sl].copy_from_slice(&ssid[..sl]);
+                            slen += sl;
+                            ssids[slen] = b'\n';
+                            slen += 1;
+                        }
+                    }
                 }
             } else {
                 cortex_m::asm::delay(8_000);
             }
+        }
+        // Pack the deduped SSID list into SCAN_SSIDS for the portal.
+        for (i, w) in SCAN_SSIDS.iter().enumerate() {
+            let mut word = 0u32;
+            for j in 0..4 {
+                let k = i * 4 + j;
+                if k < slen {
+                    word |= (ssids[k] as u32) << (8 * j);
+                }
+            }
+            w.store(word, SeqCst);
         }
         events
     }
@@ -1402,6 +1446,9 @@ fn main() -> ! {
         }
     };
     let mut server = ServerImpl { wifi, fr };
+    // Scan nearby networks (STA) before bringing the AP up, to populate the
+    // portal's network dropdown.
+    server.wifi.scan(&mut server.fr);
     // Provisioning mode: bring the SoftAP up and serve DHCP continuously, so a
     // joining client always gets a lease (192.168.4.2) regardless of when it
     // retries. (Idol serving is suspended while provisioning; the probe stays

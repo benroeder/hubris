@@ -334,8 +334,38 @@ fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
 const HTTP_OK_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
 
-/// The portal page: a Wi-Fi network + password form that POSTs to /connect.
-const FORM_BODY: &[u8] = b"<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em\"><h1>Pico 2 W Wi-Fi Setup</h1><form method=POST action=/connect><p>Network<br><input name=ssid autocapitalize=off style=\"width:100%;font-size:1.2em\"></p><p>Password<br><input name=password type=password style=\"width:100%;font-size:1.2em\"></p><p><button style=\"font-size:1.2em;padding:.4em 1em\">Connect</button></p></form></body></html>";
+/// The portal form, built at startup: prefix + one <option> per scanned SSID +
+/// suffix. Includes the HTTP headers so the built buffer is served directly.
+const FORM_PREFIX: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em\"><h1>Pico 2 W Wi-Fi Setup</h1><form method=POST action=/connect><p>Network<br><select name=ssid style=\"width:100%;font-size:1.2em\">";
+const FORM_SUFFIX: &[u8] = b"</select></p><p>Password<br><input name=password type=password style=\"width:100%;font-size:1.2em\"></p><p><button style=\"font-size:1.2em;padding:.4em 1em\">Connect</button></p></form></body></html>";
+
+/// Append `src` to `out` at `*n`, clamped to the buffer.
+fn push(out: &mut [u8], n: &mut usize, src: &[u8]) {
+    let e = (*n + src.len()).min(out.len());
+    out[*n..e].copy_from_slice(&src[..e - *n]);
+    *n = e;
+}
+
+/// Build the portal form (with a network dropdown from SCAN_SSIDS) into `out`.
+fn build_form(out: &mut [u8]) -> usize {
+    let mut raw = [0u8; 400];
+    for (i, w) in crate::SCAN_SSIDS.iter().enumerate() {
+        raw[i * 4..i * 4 + 4].copy_from_slice(&w.load(SeqCst).to_le_bytes());
+    }
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let mut n = 0;
+    push(out, &mut n, FORM_PREFIX);
+    for ssid in raw[..end].split(|&b| b == b'\n') {
+        if ssid.is_empty() {
+            continue;
+        }
+        push(out, &mut n, b"<option>");
+        push(out, &mut n, ssid);
+        push(out, &mut n, b"</option>");
+    }
+    push(out, &mut n, FORM_SUFFIX);
+    n
+}
 
 const CONNECTING_BODY: &[u8] = b"<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Connecting</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto\"><h1>Connecting...</h1><p>The Pico is joining your network. You can close this window.</p></body></html>";
 
@@ -469,15 +499,17 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     fn store() -> SocketStorage<'static> {
         SocketStorage::EMPTY
     }
-    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, http_rx, http_tx, socket_storage) = mutable_statics::mutable_statics! {
+    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, http_rx, http_tx, form_buf, socket_storage) = mutable_statics::mutable_statics! {
         static mut DNS_RX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_RX_PL: [u8; 768] = [zero; _];
         static mut DNS_TX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_TX_PL: [u8; 768] = [zero; _];
         static mut HTTP_RX: [u8; 1024] = [zero; _];
         static mut HTTP_TX: [u8; 2048] = [zero; _];
+        static mut FORM_BUF: [u8; 2048] = [zero; _];
         static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
     };
+    let form_len = build_form(form_buf);
     let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
     let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
     let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
@@ -544,8 +576,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                 } else if n >= 9 && &r[0..9] == b"GET /api " {
                     let _ = http.send_slice(API_JSON); // RFC 8908 -> open portal
                 } else {
-                    let _ = http.send_slice(HTTP_OK_HTML);
-                    let _ = http.send_slice(FORM_BODY); // the portal form
+                    let _ = http.send_slice(&form_buf[..form_len]); // portal form
                 }
                 http.close();
                 DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
