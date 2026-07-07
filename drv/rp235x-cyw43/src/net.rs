@@ -16,7 +16,7 @@ use core::sync::atomic::Ordering::SeqCst;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::udp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
@@ -369,19 +369,27 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     fn store() -> SocketStorage<'static> {
         SocketStorage::EMPTY
     }
-    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, socket_storage) = mutable_statics::mutable_statics! {
+    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, http_rx, http_tx, socket_storage) = mutable_statics::mutable_statics! {
         static mut DNS_RX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_RX_PL: [u8; 768] = [zero; _];
         static mut DNS_TX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_TX_PL: [u8; 768] = [zero; _];
+        static mut HTTP_RX: [u8; 1024] = [zero; _];
+        static mut HTTP_TX: [u8; 1024] = [zero; _];
         static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
     };
     let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
     let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
     let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
     dns_sock.bind(53).ok();
+    // HTTP captive portal on TCP :80.
+    let http_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut http_rx[..]),
+        tcp::SocketBuffer::new(&mut http_tx[..]),
+    );
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
     let dns_handle = sockets.add(dns_sock);
+    let http_handle = sockets.add(http_sock);
 
     for i in 96..122 {
         crate::DATA_FRAME[i].store(0, SeqCst); // channel + chan-2-drop + RX-iface histograms
@@ -394,6 +402,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     DIAG[12].store(0, SeqCst); // DHCP replies sent
     DIAG[13].store(0, SeqCst); // OFFERs built (= DISCOVERs seen)
     DIAG[14].store(0, SeqCst); // ACKs built (= REQUESTs seen)
+    DIAG[4].store(0, SeqCst); // HTTP requests served
     DIAG[10].store(0, SeqCst); // DNS replies sent
     loop {
         let now = userlib::sys_get_timer().now;
@@ -411,6 +420,30 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                     }
                 }
                 Err(_) => break,
+            }
+        }
+
+        // HTTP captive portal on :80. iOS (given option 114 -> http://192.168.4.1
+        // /api) fetches /api expecting RFC 8908 JSON; return captive=true with a
+        // user-portal-url so the CNA opens the portal page (served elsewhere).
+        // One connection at a time: serve, close, re-listen.
+        let http = sockets.get_mut::<tcp::Socket<'_>>(http_handle);
+        if !http.is_open() {
+            http.listen(80).ok();
+        }
+        if http.can_recv() {
+            let mut req = [0u8; 512];
+            let n = http.recv_slice(&mut req).unwrap_or(0);
+            if n > 0 {
+                let is_api = n >= 9 && &req[0..9] == b"GET /api ";
+                let resp: &[u8] = if is_api {
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}"
+                } else {
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif\"><h1>Pico 2 W Wi-Fi Setup</h1><p>Captive portal is up. Wi-Fi scan + password form next.</p></body></html>"
+                };
+                let _ = http.send_slice(resp);
+                http.close();
+                DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
             }
         }
     }
