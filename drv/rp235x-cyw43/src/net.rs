@@ -334,9 +334,12 @@ fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
 const HTTP_OK_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
 
-/// The portal form, built at startup: prefix + one <option> per scanned SSID +
-/// suffix. Includes the HTTP headers so the built buffer is served directly.
-const FORM_PREFIX: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em\"><h1>Pico 2 W Wi-Fi Setup</h1><form method=POST action=/connect><p>Network<br><select name=ssid style=\"width:100%;font-size:1.2em\">";
+/// The portal form, built per attempt: head + optional error banner + form open
+/// + one <option> per scanned SSID + suffix. Includes the HTTP headers so the
+/// built buffer is served directly.
+const FORM_HEAD: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em\"><h1>Pico 2 W Wi-Fi Setup</h1>";
+const FORM_ERR: &[u8] = b"<p style=\"color:#b00;font-weight:bold\">Could not connect -- check the password and try again.</p>";
+const FORM_OPEN: &[u8] = b"<form method=POST action=/connect><p>Network<br><select name=ssid style=\"width:100%;font-size:1.2em\">";
 const FORM_SUFFIX: &[u8] = b"</select></p><p>Password<br><input name=password type=password style=\"width:100%;font-size:1.2em\"></p><p><button style=\"font-size:1.2em;padding:.4em 1em\">Connect</button></p></form></body></html>";
 
 /// Append `src` to `out` at `*n`, clamped to the buffer.
@@ -354,7 +357,11 @@ fn build_form(out: &mut [u8]) -> usize {
     }
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let mut n = 0;
-    push(out, &mut n, FORM_PREFIX);
+    push(out, &mut n, FORM_HEAD);
+    if crate::CREDS[26].load(SeqCst) != 0 {
+        push(out, &mut n, FORM_ERR); // a prior join failed
+    }
+    push(out, &mut n, FORM_OPEN);
     for ssid in raw[..end].split(|&b| b == b'\n') {
         if ssid.is_empty() {
             continue;
@@ -509,7 +516,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
         static mut FORM_BUF: [u8; 2048] = [zero; _];
         static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
     };
-    let form_len = build_form(form_buf);
+    let mut form_len = build_form(form_buf);
     let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
     let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
     let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
@@ -581,6 +588,31 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                 http.close();
                 DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
             }
+        }
+
+        // Credentials submitted -> flush the "Connecting..." page to the client,
+        // then attempt the join (this brings the AP down).
+        if crate::CREDS[0].load(SeqCst) == 1 {
+            for _ in 0..400u32 {
+                let t = userlib::sys_get_timer().now;
+                iface.poll(Instant::from_millis(t as i64), &mut device, &mut sockets);
+                cortex_m::asm::delay(30_000);
+            }
+            let res = device.wifi.sta_join(device.fr);
+            DIAG[15].store(if res == 0 { 0x00C0_FFEE } else { 0x0BAD_0BAD }, SeqCst);
+            if res == 0 {
+                // Connected as a station -- park (STA net loop is future work).
+                loop {
+                    userlib::hl::sleep_for(1000);
+                }
+            }
+            // Failed: record the error, clear the flag, re-open the AP, rebuild
+            // the form (now with an error banner), and re-provision.
+            crate::CREDS[26].store(res, SeqCst);
+            crate::CREDS[0].store(0, SeqCst);
+            device.wifi.ap_start(device.fr);
+            form_len = build_form(form_buf);
+            sockets.get_mut::<tcp::Socket<'_>>(http_handle).abort();
         }
     }
 }

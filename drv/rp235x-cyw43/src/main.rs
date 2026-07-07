@@ -1205,6 +1205,73 @@ impl Cyw43 {
         data_frames
     }
 
+    /// Join the WPA2-PSK network stored in CREDS as a station. Brings the AP
+    /// (bsscfg 1) down first, runs the WPA2 join sequence (cyw43_ll_wifi_join
+    /// order), then polls WLC_GET_BSSID for a stable association. Returns
+    /// 0 = connected, 1 = failed (wrong password / not found / timeout).
+    fn sta_join(&mut self, fr: &mut [u32; 512]) -> u32 {
+        let sl = CREDS[1].load(SeqCst) as usize;
+        let pl = CREDS[2].load(SeqCst) as usize;
+        let mut ssid = [0u8; 32];
+        let mut pass = [0u8; 64];
+        for i in 0..8 {
+            ssid[i * 4..i * 4 + 4]
+                .copy_from_slice(&CREDS[3 + i].load(SeqCst).to_le_bytes());
+        }
+        for i in 0..16 {
+            pass[i * 4..i * 4 + 4]
+                .copy_from_slice(&CREDS[11 + i].load(SeqCst).to_le_bytes());
+        }
+
+        // Bring the AP (bsscfg 1) down.
+        let mut bss = [0u8; 12];
+        bss[..4].copy_from_slice(b"bss\0");
+        bss[4] = 1; // AP index; value (down) stays 0
+        self.do_ioctl_b(2, 0x107, 60, 0, &bss, 12, fr);
+
+        // Enable the WPA supplicant on the STA (bsscfg 0).
+        let mut sw = [0u8; 24];
+        sw[..15].copy_from_slice(b"bsscfg:sup_wpa\0"); // 14 chars + null
+        sw[19] = 1; // index(15..19)=0, value(19..23)=1
+        self.do_ioctl_b(2, 0x107, 61, 0, &sw, 23, fr);
+
+        // Security + auth (all STA iface 0).
+        self.do_ioctl(134, 62, 0, &[0x04], 4, fr); // WLC_SET_WSEC = WPA
+        self.do_ioctl(20, 63, 0, &[1], 4, fr); // WLC_SET_INFRA = 1
+        self.do_ioctl(22, 64, 0, &[0], 4, fr); // WLC_SET_AUTH = open
+        self.do_ioctl(165, 65, 0, &[0x80], 4, fr); // WLC_SET_WPA_AUTH = WPA2-PSK
+
+        // Passphrase: wsec_pmk_t = key_len(u16) + flags(u16=1 passphrase) + key[64].
+        let mut pmk = [0u32; 17];
+        pmk[0] = (pl as u32) | (1u32 << 16);
+        for i in 0..pl.min(64) {
+            pmk[1 + i / 4] |= (pass[i] as u32) << (8 * (i % 4));
+        }
+        self.do_ioctl(268, 66, 0, &pmk, 68, fr); // WLC_SET_WSEC_PMK
+
+        // Join: wl_ssid_t = ssid_len(u32) + ssid[32].
+        let mut js = [0u32; 9];
+        js[0] = sl as u32;
+        for i in 0..sl.min(32) {
+            js[1 + i / 4] |= (ssid[i] as u32) << (8 * (i % 4));
+        }
+        self.do_ioctl(26, 67, 0, &js, 36, fr); // WLC_SET_SSID (join)
+
+        // Poll WLC_GET_BSSID: success once associated + stable through the 4-way
+        // handshake window (a wrong password associates then deauths -> resets).
+        let mut ok = 0u32;
+        for t in 0..24u32 {
+            userlib::hl::sleep_for(500);
+            let st = self.do_ioctl_b(0, 23, 68, 0, &[], 6, fr); // WLC_GET_BSSID
+            ok = if st == 0 { ok + 1 } else { 0 };
+            DIAG[7].store(0x5A00_0000 | (t << 8) | ok, SeqCst);
+            if ok >= 4 {
+                return 0; // stable association -> connected
+            }
+        }
+        1 // timeout / failed
+    }
+
     /// Bring up an OPEN SoftAP with `ssid` on channel 6 (provisioning portal).
     /// Mirrors cyw43_ll_wifi_ap_init/set_up for the open case. AP-interface
     /// (iface 1) ioctls: mfp, gmode, 2g_mrate, dtim. Returns the bss-up status.
