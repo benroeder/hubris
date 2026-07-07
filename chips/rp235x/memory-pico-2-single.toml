@@ -1,0 +1,83 @@
+# RAM image, single-core variant: the whole Hubris image (kernel + tasks) is
+# linked at and runs from SRAM. The boot ROM copies it out of QSPI flash at
+# boot, directed by the LOAD_MAP item in the app's IMAGE_DEF block (datasheet
+# sec 5.1.10 "packaged binaries"). Nothing executes from flash at runtime,
+# which removes the XIP hazard entirely: flash can be erased/programmed while
+# the system runs.
+#
+# Unlike memory-pico-2.toml (which splits SRAM between two AMP kernels), this
+# gives the whole 520 KiB SRAM to a single core: a 256 KiB code window plus a
+# 264 KiB data pool. No [[shared]] region -- there is no second core.
+#
+# The "flash" pool below is therefore an SRAM range (code, read+execute); it
+# must stay inside the 256 KiB window the LOAD_MAP copies (storage
+# 0x10000000..0x10040000 -> runtime 0x20000000..0x20040000).
+[[flash]]
+address = 0x2000_0000
+size = 0x4_0000        # 256 KiB code window (single core)
+read = true
+execute = true
+
+[[ram]]
+address = 0x2004_0000  # data pool: 264 KiB (fills SRAM to 0x20082000)
+size = 0x4_2000
+read = true
+write = true
+execute = false
+
+# Extern regions (granted to specific tasks via `extern-regions`; never
+# allocated from):
+
+# The 32 kB boot ROM (datasheet 2.2.1) -- lets the flash driver call the
+# bootrom flash API (sec 5.4.8). Executable because ROM functions run at the
+# caller's privilege in the caller's MPU context.
+#
+# Starts at 0x20, NOT 0: the kernel gives every task a no-access null region
+# over 0x0..0x20 (sys/kern/build.rs), and PMSAv8 prohibits overlapping MPU
+# regions (observed as a fault/retry loop that starves the system, not a
+# clean error). The ROM's Arm header words at 0x10..0x18 are therefore
+# unreachable from tasks; lib/rp235x-romapi uses the RISC-V well-known copies
+# at 0x7df6+ (same table) and walks the ROM table itself.
+[[rom]]
+address = 0x0000_0020
+size = 0x7fe0
+read = true
+execute = true
+
+# The whole flash, read-only, through the uncached *no-translate* XIP mirror
+# (XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE, 0x1c000000) -- lets the flash driver
+# read any *physical* flash address.
+#
+# The no-translate mirror (not the plain uncached 0x14000000) is essential for
+# A/B: when the boot ROM launches an image from a partition, it programs QMI
+# address translation (ATRANS) so the running image sees ITS OWN partition
+# remapped to XIP offset 0. A read through a translated window (0x10.../0x14...)
+# therefore returns the running partition, not physical flash -- so the driver
+# could not see the partition table or the other slot, and its reads did not
+# match its (physical) QMI direct-mode writes. 0x1c000000 bypasses ATRANS, so
+# reads and writes share one physical address space.
+[[xip]]
+address = 0x1c00_0000
+size = 0x40_0000
+read = true
+
+# Auxiliary-flash region: the Hubris auxflash blob store (TLV-C, SHA3-checked,
+# see [config.auxflash] in the app.toml) that holds the CYW43439 Wi-Fi firmware
+# (WIFI) + CLM (WCLM) now, and the BT firmware later. 1.5 MiB = 6 slots x 256 KiB
+# (auxflash requires >=6, 64 KiB-page-aligned slots; the ~232 KiB fw image needs
+# a 256 KiB slot). At PHYSICAL flash offset 0x20_0000 (2 MiB), read here through
+# the uncached no-translate XIP mirror (0x1c00_0000 + 0x20_0000).
+#
+# CRITICAL: this is a FLASH resource. Because the whole Hubris image is
+# RAM-booted (copied to SRAM), the ~224 KiB blob must NEVER be `include_bytes!`d
+# into a task -- that would consume 224 KiB of the 520 KiB SRAM. The
+# (read-only, memory-mapped) auxflash server reads it here (granted via
+# `extern-regions = ["cyw43_fw"]`) and the cyw43 driver streams it over gSPI.
+#
+# Placed at 2 MiB so it is clear of the RAM-boot image (flash 0..256 KiB) and
+# any A/B image slots (<=512 KiB). The packed auxflash image is flashed
+# separately: `picotool load build-...-auxflash.bin -t bin -o 0x1020_0000`.
+[[cyw43_fw]]
+address = 0x1c20_0000
+size = 0x18_0000
+read = true

@@ -17,12 +17,15 @@
 #![no_main]
 
 use drv_rp235x_adc_api::{Rp235xAdc, TEMP_CHANNEL};
+#[cfg(feature = "cyw43")]
 use drv_rp235x_cyw43_api::Rp235xCyw43;
 use drv_rp235x_flash_api::Rp235xFlash;
 use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
+#[cfg(feature = "mailbox")]
 use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
+#[cfg(feature = "slink")]
 use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
@@ -37,8 +40,11 @@ task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
+#[cfg(feature = "cyw43")]
 task_slot!(CYW43, cyw43);
+#[cfg(feature = "mailbox")]
 task_slot!(MAILBOX, mailbox_driver);
+#[cfg(feature = "slink")]
 task_slot!(SLINK, slink_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
@@ -92,8 +98,11 @@ struct Shell {
     flash: Rp235xFlash,
     adc: Rp235xAdc,
     pwm: Rp235xPwm,
+    #[cfg(feature = "cyw43")]
     cyw43: Rp235xCyw43,
+    #[cfg(feature = "mailbox")]
     mailbox: Rp235xMailbox,
+    #[cfg(feature = "slink")]
     slink: Rp235xSlink,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
@@ -175,6 +184,7 @@ impl Shell {
                 self.out.put(b" ms\r\n");
             }
             "bench" => self.cmd_bench(words.next(), words.next()),
+            #[cfg(feature = "mailbox")]
             "core1" => self.cmd_core1(words.next(), words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
@@ -185,11 +195,13 @@ impl Shell {
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
             "adc" => self.cmd_adc(words.next(), words.next()),
+            #[cfg(feature = "cyw43")]
             "wifi" => self.cmd_wifi(words.next()),
             "slot" => self.cmd_slot(),
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
+            #[cfg(feature = "slink")]
             "slink" => self.cmd_slink(
                 words.next(),
                 words.next(),
@@ -434,6 +446,7 @@ impl Shell {
     /// prints its reply (`n*2 + 1`); `core1 stress <count>` hammers the path.
     /// The mailbox driver bridges core 0's IPC to the SIO FIFO, answered by a
     /// task on core 1's own kernel.
+    #[cfg(feature = "mailbox")]
     fn cmd_core1(&mut self, a: Option<&str>, b: Option<&str>, c: Option<&str>) {
         if a == Some("stress") {
             return self.core1_stress(b);
@@ -470,6 +483,7 @@ impl Shell {
     /// Stress the cross-core mailbox: `count` exchanges with distinct values,
     /// verifying every reply. Reports rate and any wrong/timed-out answers --
     /// proof the two-kernel FIFO path is correct under sustained load.
+    #[cfg(feature = "mailbox")]
     fn core1_stress(&mut self, arg: Option<&str>) {
         let count = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(2000);
         let t0 = sys_get_timer().now;
@@ -508,6 +522,7 @@ impl Shell {
     /// mailbox driver (one IPC), so the number reflects the raw SIO-FIFO +
     /// core-1 rate, not the per-command shell IPC (which caps `core1 stress`).
     /// Each exchange moves a 32-bit word each way = 8 bytes over the FIFO.
+    #[cfg(feature = "mailbox")]
     fn core1_speed(&mut self, arg: Option<&str>) {
         let n = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1_000_000);
         let ms = self.mailbox.bench(n);
@@ -531,6 +546,7 @@ impl Shell {
     /// bytes (<=4096) through shared SRAM `iters` times -- core 0 writes the
     /// buffer, doorbells core 1, core 1 reads+checksums it. Reports MB/s of
     /// core->core payload.
+    #[cfg(feature = "mailbox")]
     fn core1_bulk(&mut self, a: Option<&str>, b: Option<&str>) {
         let len = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(4096);
         let iters = b.and_then(|s| s.parse::<u32>().ok()).unwrap_or(50_000);
@@ -554,6 +570,7 @@ impl Shell {
     /// double-buffered, so core 0 fills one buffer while core 1 drains the
     /// other in parallel (buffers in different SRAM banks) -- the payoff of two
     /// cores. Compare to `core1 bulk` (sequential write-then-read).
+    #[cfg(feature = "mailbox")]
     fn core1_pipe(&mut self, a: Option<&str>) {
         let iters = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(100_000);
         let ms = self.mailbox.bulk_pipe(iters);
@@ -1048,6 +1065,7 @@ impl Shell {
 
     /// CYW43439 Wi-Fi over the drv-rp235x-cyw43 Idol server: MAC, on-board LED,
     /// and an active scan (returns the number of AP result frames).
+    #[cfg(feature = "cyw43")]
     fn cmd_wifi(&mut self, verb: Option<&str>) {
         match verb {
             Some("mac") => match self.cyw43.get_mac() {
@@ -1452,6 +1470,7 @@ impl Shell {
 
     /// Sony S-Link / Control-A1 on GP4: `slink send <hex> <hex> [hex]` bit-bangs
     /// a 2-3 byte frame; `slink listen [ms]` waits for one and prints its bytes.
+    #[cfg(feature = "slink")]
     fn cmd_slink(
         &mut self,
         sub: Option<&str>,
@@ -1671,8 +1690,11 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        #[cfg(feature = "cyw43")]
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
+        #[cfg(feature = "mailbox")]
         mailbox: Rp235xMailbox::from(MAILBOX.get_task_id()),
+        #[cfg(feature = "slink")]
         slink: Rp235xSlink::from(SLINK.get_task_id()),
         out: Out {
             usb,

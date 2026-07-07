@@ -1,13 +1,13 @@
-name = "demo-pi-pico-2"
+name = "demo-pi-pico-2-wifi"
 target = "thumbv8m.main-none-eabihf"
 chip = "../../chips/rp235x"
 board = "pi-pico-2"
-memory = "memory-pico-2.toml"
+memory = "memory-pico-2-single.toml"
 stacksize = 944
 
 [kernel]
-name = "demo-pi-pico-2"
-requires = {flash = 48000, ram = 16384}
+name = "demo-pi-pico-2-wifi"
+requires = {flash = 32768, ram = 16384}
 stacksize = 8192
 
 [tasks.jefe]
@@ -102,31 +102,14 @@ uses = ["watchdog", "psm", "qmi"]
 start = true
 extern-regions = ["rom", "xip"]
 
-[tasks.mailbox_driver]
-name = "drv-rp235x-mailbox"
-priority = 3
-max-sizes = {flash = 8192, ram = 1024}
-stacksize = 512
-uses = ["sio"]
-extern-regions = ["shared"]
-start = true
-
-[tasks.slink_driver]
-name = "drv-rp235x-slink"
-priority = 3
-max-sizes = {flash = 8192, ram = 1024}
-stacksize = 640
-uses = ["sio", "io_bank0", "pads_bank0"]
-start = true
-
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
 max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
-features = ["cyw43", "mailbox", "slink"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43", "mailbox_driver", "slink_driver"]
+features = ["cyw43"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43"]
 
 [tasks.hiffy]
 name = "task-hiffy"

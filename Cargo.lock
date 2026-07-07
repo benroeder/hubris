@@ -983,6 +983,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-amp"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
 name = "demo-pi-pico-2-core1"
 version = "0.1.0"
 dependencies = [
@@ -991,6 +1006,51 @@ dependencies = [
  "cortex-m-rt",
  "kern",
  "rp235x-pac",
+]
+
+[[package]]
+name = "demo-pi-pico-2-slink"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
+name = "demo-pi-pico-2-wifi"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
+name = "demo-pi-pico-2-wifi-amp"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
 ]
 
 [[package]]

@@ -1,13 +1,13 @@
-name = "demo-pi-pico-2"
+name = "demo-pi-pico-2-slink"
 target = "thumbv8m.main-none-eabihf"
 chip = "../../chips/rp235x"
 board = "pi-pico-2"
-memory = "memory-pico-2.toml"
+memory = "memory-pico-2-single.toml"
 stacksize = 944
 
 [kernel]
-name = "demo-pi-pico-2"
-requires = {flash = 48000, ram = 16384}
+name = "demo-pi-pico-2-slink"
+requires = {flash = 32768, ram = 16384}
 stacksize = 8192
 
 [tasks.jefe]
@@ -102,15 +102,6 @@ uses = ["watchdog", "psm", "qmi"]
 start = true
 extern-regions = ["rom", "xip"]
 
-[tasks.mailbox_driver]
-name = "drv-rp235x-mailbox"
-priority = 3
-max-sizes = {flash = 8192, ram = 1024}
-stacksize = 512
-uses = ["sio"]
-extern-regions = ["shared"]
-start = true
-
 [tasks.slink_driver]
 name = "drv-rp235x-slink"
 priority = 3
@@ -125,8 +116,8 @@ priority = 4
 max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
-features = ["cyw43", "mailbox", "slink"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43", "mailbox_driver", "slink_driver"]
+features = ["slink"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "slink_driver"]
 
 [tasks.hiffy]
 name = "task-hiffy"
@@ -137,45 +128,9 @@ start = true
 features = ["micro"]
 notifications = ["timer"]
 
-[tasks.auxflash]
-name = "drv-rp235x-auxflash-server"
-priority = 2
-max-sizes = {flash = 16384, ram = 8192}
-stacksize = 4096
-extern-regions = ["cyw43_fw"]
-start = true
-
-[tasks.cyw43]
-name = "drv-rp235x-cyw43"
-priority = 3
-max-sizes = {flash = 131072, ram = 49152}
-stacksize = 16384
-uses = ["pio2", "sio", "io_bank0", "pads_bank0", "watchdog"]
-task-slots = ["auxflash"]
-start = true
-
 [tasks.idle]
 name = "task-idle"
 priority = 5
 max-sizes = {flash = 128, ram = 256}
 stacksize = 256
 start = true
-
-# Auxiliary-flash blob store (the correct Hubris pattern for large device
-# firmware, cf. the FPGA bitstream loaders). Packs the CYW43439 Wi-Fi firmware
-# + CLM into a TLV-C, SHA3-checksummed image that the read-only rp235x auxflash
-# server serves to the cyw43 driver. 1.5 MiB = 6 x 256 KiB slots (auxflash
-# minimum); slots 2+ hold the BT firmware later. Flashed to 0x1020_0000.
-[config.auxflash]
-memory-size = 1572864   # 1.5 MiB (6 * 256 KiB)
-slot-count = 6
-
-[[auxflash.blobs]]
-file = "support/cyw43-firmware/43439A0.bin"
-compress = false
-tag = "WIFI"
-
-[[auxflash.blobs]]
-file = "support/cyw43-firmware/43439A0_clm.bin"
-compress = false
-tag = "WCLM"

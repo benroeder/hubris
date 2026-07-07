@@ -1,0 +1,29 @@
+[package]
+edition = "2021"
+readme = "README.md"
+name = "demo-pi-pico-2-slink"
+version = "0.1.0"
+
+[dependencies]
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+cfg-if = { workspace = true }
+rp235x-pac = { workspace = true, features = ["rt"] }
+
+kern = { path = "../../sys/kern", default-features = false }
+rp235x-startup = { path = "../../lib/rp235x-startup" }
+rp235x-uart = { path = "../../lib/rp235x-uart" }
+rp235x-romapi = { path = "../../lib/rp235x-romapi" }
+
+[build-dependencies]
+build-util = { path = "../../build/util" }
+
+# this lets you use `cargo fix`!
+[[bin]]
+name = "demo-pi-pico-2-slink"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true
