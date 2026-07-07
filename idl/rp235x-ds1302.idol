@@ -1,0 +1,25 @@
+// RP2350 (RP235x) DS1302 trickle-charge real-time-clock driver API.
+//
+// The DS1302 is a 3-wire (CE, IO, SCLK) bit-banged RTC. Time is packed into a
+// single u64 so the whole clock crosses the IPC boundary in one word:
+//   byte0 = seconds, byte1 = minutes, byte2 = hours (24h), byte3 = date,
+//   byte4 = month, byte5 = weekday (1-7), byte6 = year (0-99), byte7 = 0.
+// All fields are plain decimals (the driver does the BCD conversion).
+
+Interface(
+    name: "Rp235xDs1302",
+    ops: {
+        "now": (
+            description: "Read the clock. Returns the packed time (see the byte layout above).",
+            args: {},
+            reply: Simple("u64"),
+            idempotent: true,
+        ),
+        "set": (
+            description: "Set the clock from a packed time (same byte layout as `now`). Clears write-protect and starts the oscillator.",
+            args: { "packed": "u64" },
+            reply: Result(ok: "()", err: CLike("Ds1302Error")),
+            idempotent: true,
+        ),
+    },
+)

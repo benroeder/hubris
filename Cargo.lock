@@ -1024,6 +1024,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-rtc"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
 name = "demo-pi-pico-2-slink"
 version = "0.1.0"
 dependencies = [
@@ -2378,6 +2393,34 @@ dependencies = [
  "derive-idol-err",
  "idol",
  "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-ds1302"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "drv-rp235x-ds1302-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-ds1302-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
  "num-traits",
  "userlib",
  "zerocopy 0.8.27",
@@ -7060,6 +7103,7 @@ version = "0.1.0"
 dependencies = [
  "drv-rp235x-adc-api",
  "drv-rp235x-cyw43-api",
+ "drv-rp235x-ds1302-api",
  "drv-rp235x-flash-api",
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",

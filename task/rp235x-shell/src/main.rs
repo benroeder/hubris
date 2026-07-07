@@ -29,6 +29,8 @@ use drv_rp235x_pwm_api::Rp235xPwm;
 use drv_rp235x_slink_api::Rp235xSlink;
 #[cfg(feature = "ws2812")]
 use drv_rp235x_ws2812_api::Rp235xWs2812;
+#[cfg(feature = "ds1302")]
+use drv_rp235x_ds1302_api::Rp235xDs1302;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -50,6 +52,8 @@ task_slot!(MAILBOX, mailbox_driver);
 task_slot!(SLINK, slink_driver);
 #[cfg(feature = "ws2812")]
 task_slot!(WS2812, ws2812);
+#[cfg(feature = "ds1302")]
+task_slot!(DS1302, ds1302);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -92,6 +96,8 @@ const HELP: &[u8] = b"commands:\r\n\
   slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
   slink listen [ms]     wait for an S-Link frame; print the bytes\r\n\
   rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n\
+  rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
+  rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]   set the DS1302 clock\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -111,6 +117,8 @@ struct Shell {
     slink: Rp235xSlink,
     #[cfg(feature = "ws2812")]
     ws2812: Rp235xWs2812,
+    #[cfg(feature = "ds1302")]
+    ds1302: Rp235xDs1302,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -170,6 +178,12 @@ impl Out {
         }
     }
 
+    /// Two zero-padded decimal digits (for clock fields, 0-99).
+    #[cfg(feature = "ds1302")]
+    fn put_pad2(&mut self, n: u8) {
+        self.put(&[b'0' + (n / 10) % 10, b'0' + n % 10]);
+    }
+
     fn flush(&mut self) {
         if self.len > 0 {
             self.usb.write(&self.buf[..self.len]);
@@ -217,6 +231,17 @@ impl Shell {
             ),
             #[cfg(feature = "ws2812")]
             "rgb" => self.cmd_rgb(words.next(), words.next(), words.next()),
+            #[cfg(feature = "ds1302")]
+            "rtc" => self.cmd_rtc(
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+            ),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -341,6 +366,76 @@ impl Shell {
         } else {
             b"error\r\n"
         });
+    }
+
+    /// `rtc [get]` reads the DS1302 clock; `rtc set <YY> <MM> <DD> <HH> <MM>
+    /// <SS> [weekday]` sets it. All fields are plain decimals; the driver does
+    /// the BCD conversion. The packed u64 layout is byte0=sec, byte1=min,
+    /// byte2=hour, byte3=date, byte4=month, byte5=weekday, byte6=year (0-99).
+    #[cfg(feature = "ds1302")]
+    fn cmd_rtc(
+        &mut self,
+        sub: Option<&str>,
+        yy: Option<&str>,
+        mm: Option<&str>,
+        dd: Option<&str>,
+        hh: Option<&str>,
+        min: Option<&str>,
+        ss: Option<&str>,
+        wd: Option<&str>,
+    ) {
+        match sub {
+            None | Some("get") => {
+                let packed = self.ds1302.now();
+                let sec = packed as u8;
+                let minute = (packed >> 8) as u8;
+                let hour = (packed >> 16) as u8;
+                let date = (packed >> 24) as u8;
+                let month = (packed >> 32) as u8;
+                let year = (packed >> 48) as u8;
+                // "20YY-MM-DD HH:MM:SS"
+                self.out.put(b"20");
+                self.out.put_pad2(year);
+                self.out.put(b"-");
+                self.out.put_pad2(month);
+                self.out.put(b"-");
+                self.out.put_pad2(date);
+                self.out.put(b" ");
+                self.out.put_pad2(hour);
+                self.out.put(b":");
+                self.out.put_pad2(minute);
+                self.out.put(b":");
+                self.out.put_pad2(sec);
+                self.out.put(b"\r\n");
+            }
+            Some("set") => {
+                let p = |s: Option<&str>| s.and_then(|v| v.parse::<u8>().ok());
+                let (Some(yy), Some(mm), Some(dd), Some(hh), Some(min), Some(ss)) =
+                    (p(yy), p(mm), p(dd), p(hh), p(min), p(ss))
+                else {
+                    self.out.put(
+                        b"usage: rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]\r\n",
+                    );
+                    return;
+                };
+                let weekday = p(wd).unwrap_or(1);
+                let packed = (ss as u64)
+                    | (min as u64) << 8
+                    | (hh as u64) << 16
+                    | (dd as u64) << 24
+                    | (mm as u64) << 32
+                    | (weekday as u64) << 40
+                    | (yy as u64) << 48;
+                self.out.put(if self.ds1302.set(packed).is_ok() {
+                    b"ok\r\n" as &[u8]
+                } else {
+                    b"bad time (check ranges)\r\n"
+                });
+            }
+            _ => self.out.put(
+                b"usage: rtc [get] | rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]\r\n",
+            ),
+        }
     }
 
     fn cmd_gpio(
@@ -1729,6 +1824,8 @@ pub fn main() -> ! {
         slink: Rp235xSlink::from(SLINK.get_task_id()),
         #[cfg(feature = "ws2812")]
         ws2812: Rp235xWs2812::from(WS2812.get_task_id()),
+        #[cfg(feature = "ds1302")]
+        ds1302: Rp235xDs1302::from(DS1302.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
