@@ -683,3 +683,23 @@ per-task region cap (2 mem + 6 periph = 8 > 7) -> xtask dist PANICKED (dist.rs:6
 PIO2-out-of-reset to the privileged pre-kernel main and dropping "resets" from the
 task. Next: build the smoltcp phy::Device on send_frame/recv_frame (TX + this RX
 offset), then DHCP/DNS/HTTP.
+
+## 39. *** DHCP WORKS -- phone joins the SoftAP with 192.168.4.2 ***
+Hand-rolled DHCP server on the F2 DATA path. Phone completes DISCOVER->OFFER->
+REQUEST->ACK and gets 192.168.4.2 (gw/dns = us, 192.168.4.1). TWO fixes were
+needed, both non-obvious:
+1. **BDC.flags2 = interface index**: send_frame MUST set BDC byte 16 (flags2) =
+   1 (AP interface) or the frame goes out the unused STA interface (0) and the
+   associated client never receives it. Found by noticing RX frames FROM the
+   phone carried flags2=0x01. This is THE reason a byte-perfect OFFER was ignored.
+2. **Continuous serving**: one-shot ~15 s Idol ops could never align with the
+   phone's DHCP retry window (kept seeing 0 frames). Restructured the cyw43 task
+   main() into a provisioning loop: init -> ap_start -> loop { dhcp_serve } (Idol
+   serving suspended). Probe stays free for live DIAG reads.
+DHCP OFFER/ACK are L2-BROADCAST (client has no IP yet). OFFER decoded perfectly
+(IP cksum valid, all options) so #1 was pure delivery. Debug tools: DIAG[10]=
+frames, [11]=0xD00000xx last DHCP msgtype (03=REQUEST=client accepted), [12]=
+replies; capture the sent OFFER into DATA_FRAME for offline decode. macOS CLI
+(networksetup) can't join open APs headless (Location perm); the iPhone is the
+working test client. NEXT: DNS hijack (all -> 192.168.4.1) for the captive-portal
+popup, then HTTP portal (scan list + password form) on smoltcp TCP.
