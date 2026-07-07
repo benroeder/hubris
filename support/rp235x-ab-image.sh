@@ -39,10 +39,13 @@ dd if="$PT" of="$OUT" conv=notrunc 2>/dev/null
 dd if="/tmp/${APP}-slotA.bin" of="$OUT" bs=1 seek=8192 conv=notrunc 2>/dev/null    # 0x2000
 dd if="/tmp/${APP}-slotB.bin" of="$OUT" bs=1 seek=270336 conv=notrunc 2>/dev/null  # 0x42000
 
-FLASH_CMD="probe-rs download --chip RP235x --binary-format bin --base-address 0x10000000 $OUT"
+# Select a probe with PROBE=<vid:pid> (needed when more than one is attached),
+# e.g. PROBE=2e8a:000c support/rp235x-ab-image.sh ... --flash
+PROBE_ARG=""; [[ -n "${PROBE:-}" ]] && PROBE_ARG="--probe $PROBE"
+FLASH_CMD="probe-rs download --chip RP235x $PROBE_ARG --binary-format bin --base-address 0x10000000 $OUT"
 if [[ "$FLASH" == 1 ]]; then
     echo ">> flashing: $FLASH_CMD"
-    $FLASH_CMD && probe-rs reset --chip RP235x
+    $FLASH_CMD && probe-rs reset --chip RP235x $PROBE_ARG
 else
     echo ">> built $OUT -- flash with:"
     echo "   $FLASH_CMD"
