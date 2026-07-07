@@ -16,6 +16,7 @@ use core::sync::atomic::Ordering::SeqCst;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
@@ -290,6 +291,46 @@ fn handle_dhcp(wifi: &mut Cyw43, fr: &mut [u32; 512], rx: &[u8], leases: &mut Le
     DIAG[12].store(DIAG[12].load(SeqCst).wrapping_add(1), SeqCst); // DHCP replies sent
 }
 
+/// Captive-portal DNS: answer every A query with 192.168.4.1 (and empty for
+/// non-A) so all lookups resolve to us. Builds the DNS payload only; smoltcp
+/// wraps UDP/IP/Ethernet. Returns the reply length.
+fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
+    if q.len() < 12 {
+        return None;
+    }
+    // Walk the question name (labels terminated by a 0 byte).
+    let qstart = 12;
+    let mut p = qstart;
+    while p < q.len() && q[p] != 0 {
+        p += 1 + q[p] as usize;
+    }
+    if p + 5 > q.len() {
+        return None;
+    }
+    let qtype = ((q[p + 1] as u16) << 8) | q[p + 2] as u16;
+    let qlen = (p + 5) - qstart; // name + null + qtype(2) + qclass(2)
+    let is_a = qtype == 1;
+
+    out[0..2].copy_from_slice(&q[0..2]); // id echo
+    out[2..4].copy_from_slice(&[0x81, 0x80]); // response, RA, no error
+    out[4..6].copy_from_slice(&[0, 1]); // qdcount 1
+    out[6..8].copy_from_slice(&[0, if is_a { 1 } else { 0 }]); // ancount
+    out[8..12].copy_from_slice(&[0, 0, 0, 0]); // ns/ar count 0
+    out[12..12 + qlen].copy_from_slice(&q[qstart..qstart + qlen]); // echo question
+    let mut len = 12 + qlen;
+    if is_a {
+        let a = len;
+        out[a..a + 2].copy_from_slice(&[0xc0, 0x0c]); // name ptr -> offset 12
+        out[a + 2..a + 4].copy_from_slice(&[0, 1]); // type A
+        out[a + 4..a + 6].copy_from_slice(&[0, 1]); // class IN
+        out[a + 6..a + 10].copy_from_slice(&[0, 0, 0, 60]); // TTL 60
+        out[a + 10..a + 12].copy_from_slice(&[0, 4]); // rdlength
+        out[a + 12..a + 16].copy_from_slice(&[192, 168, 4, 1]); // A = us
+        len = a + 16;
+    }
+    Some(len)
+}
+
 /// Provisioning loop: smoltcp Interface at 192.168.4.1/24. smoltcp owns
 /// ARP/IP/UDP/TCP (and auto-answers ARP for the gateway); DHCP is served in the
 /// Device at the frame level. Later phases add DNS/TCP sockets to the SocketSet.
@@ -316,10 +357,31 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
             .ok();
     });
 
-    // No sockets yet (ARP is handled by the Interface itself; DHCP is frame-level
-    // in the Device). DNS (UDP) and HTTP (TCP) sockets land here in later phases.
-    let mut socket_storage: [SocketStorage<'_>; 4] = [SocketStorage::EMPTY; 4];
+    // DNS responder on UDP :53 (hijack all lookups -> 192.168.4.1). ARP is
+    // handled by the Interface; DHCP is frame-level in the Device. Socket buffers
+    // live in statics (Oxide task/net pattern), off the stack.
+    fn zero() -> u8 {
+        0
+    }
+    fn meta() -> udp::PacketMetadata {
+        udp::PacketMetadata::EMPTY
+    }
+    fn store() -> SocketStorage<'static> {
+        SocketStorage::EMPTY
+    }
+    let (dns_rx_meta, dns_rx_pl, dns_tx_meta, dns_tx_pl, socket_storage) = mutable_statics::mutable_statics! {
+        static mut DNS_RX_META: [udp::PacketMetadata; 8] = [meta; _];
+        static mut DNS_RX_PL: [u8; 768] = [zero; _];
+        static mut DNS_TX_META: [udp::PacketMetadata; 8] = [meta; _];
+        static mut DNS_TX_PL: [u8; 768] = [zero; _];
+        static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
+    };
+    let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
+    let dns_tx = udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx_pl[..]);
+    let mut dns_sock = udp::Socket::new(dns_rx, dns_tx);
+    dns_sock.bind(53).ok();
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
+    let dns_handle = sockets.add(dns_sock);
 
     for i in 96..122 {
         crate::DATA_FRAME[i].store(0, SeqCst); // channel + chan-2-drop + RX-iface histograms
@@ -332,8 +394,24 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     DIAG[12].store(0, SeqCst); // DHCP replies sent
     DIAG[13].store(0, SeqCst); // OFFERs built (= DISCOVERs seen)
     DIAG[14].store(0, SeqCst); // ACKs built (= REQUESTs seen)
+    DIAG[10].store(0, SeqCst); // DNS replies sent
     loop {
         let now = userlib::sys_get_timer().now;
         iface.poll(Instant::from_millis(now as i64), &mut device, &mut sockets);
+        // DNS hijack: answer every query -> 192.168.4.1.
+        let dns = sockets.get_mut::<udp::Socket<'_>>(dns_handle);
+        while dns.can_recv() {
+            let mut qbuf = [0u8; 768];
+            match dns.recv_slice(&mut qbuf) {
+                Ok((n, ep)) => {
+                    let mut rbuf = [0u8; 768];
+                    if let Some(len) = build_dns_reply(&qbuf[..n], &mut rbuf) {
+                        let _ = dns.send_slice(&rbuf[..len], ep);
+                        DIAG[10].store(DIAG[10].load(SeqCst).wrapping_add(1), SeqCst);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
