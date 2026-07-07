@@ -1,0 +1,27 @@
+[package]
+name = "drv-rp235x-ws2812"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+idol-runtime = { workspace = true }
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+rp235x-pac = { workspace = true }
+
+drv-rp235x-ws2812-api = { path = "../rp235x-ws2812-api" }
+counters = { path = "../../lib/counters" }
+userlib = { path = "../../sys/userlib" }
+
+[build-dependencies]
+idol = { workspace = true }
+
+[[bin]]
+name = "drv-rp235x-ws2812"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

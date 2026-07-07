@@ -27,6 +27,8 @@ use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
 #[cfg(feature = "slink")]
 use drv_rp235x_slink_api::Rp235xSlink;
+#[cfg(feature = "ws2812")]
+use drv_rp235x_ws2812_api::Rp235xWs2812;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -46,6 +48,8 @@ task_slot!(CYW43, cyw43);
 task_slot!(MAILBOX, mailbox_driver);
 #[cfg(feature = "slink")]
 task_slot!(SLINK, slink_driver);
+#[cfg(feature = "ws2812")]
+task_slot!(WS2812, ws2812);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -87,6 +91,7 @@ const HELP: &[u8] = b"commands:\r\n\
   push <size> <crc>     stream own flash image to a peer over UART\r\n\
   slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
   slink listen [ms]     wait for an S-Link frame; print the bytes\r\n\
+  rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -104,6 +109,8 @@ struct Shell {
     mailbox: Rp235xMailbox,
     #[cfg(feature = "slink")]
     slink: Rp235xSlink,
+    #[cfg(feature = "ws2812")]
+    ws2812: Rp235xWs2812,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -208,6 +215,8 @@ impl Shell {
                 words.next(),
                 words.next(),
             ),
+            #[cfg(feature = "ws2812")]
+            "rgb" => self.cmd_rgb(words.next(), words.next(), words.next()),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -306,6 +315,28 @@ impl Shell {
             }
         };
         self.out.put(if r.is_ok() {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"error\r\n"
+        });
+    }
+
+    /// `rgb <r> <g> <b>`: set the WS2812 (NeoPixel) on GP22. Each channel is a
+    /// decimal 0-255; packed into the WS2812 wire order (G<<16 | R<<8 | B).
+    #[cfg(feature = "ws2812")]
+    fn cmd_rgb(
+        &mut self,
+        r: Option<&str>,
+        g: Option<&str>,
+        b: Option<&str>,
+    ) {
+        let parse = |s: Option<&str>| s.and_then(|v| v.parse::<u8>().ok());
+        let (Some(r), Some(g), Some(b)) = (parse(r), parse(g), parse(b)) else {
+            self.out.put(b"usage: rgb <r> <g> <b> (0-255)\r\n");
+            return;
+        };
+        let grb = ((g as u32) << 16) | ((r as u32) << 8) | (b as u32);
+        self.out.put(if self.ws2812.set(grb).is_ok() {
             b"ok\r\n" as &[u8]
         } else {
             b"error\r\n"
@@ -1696,6 +1727,8 @@ pub fn main() -> ! {
         mailbox: Rp235xMailbox::from(MAILBOX.get_task_id()),
         #[cfg(feature = "slink")]
         slink: Rp235xSlink::from(SLINK.get_task_id()),
+        #[cfg(feature = "ws2812")]
+        ws2812: Rp235xWs2812::from(WS2812.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],

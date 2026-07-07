@@ -1009,6 +1009,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-rgb"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
 name = "demo-pi-pico-2-slink"
 version = "0.1.0"
 dependencies = [
@@ -2613,6 +2628,34 @@ name = "drv-rp235x-uart-api"
 version = "0.1.0"
 dependencies = [
  "counters",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-ws2812"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "drv-rp235x-ws2812-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-ws2812-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
  "idol",
  "num-traits",
  "userlib",
@@ -7024,6 +7067,7 @@ dependencies = [
  "drv-rp235x-slink-api",
  "drv-rp235x-spi-api",
  "drv-rp235x-uart-api",
+ "drv-rp235x-ws2812-api",
  "task-rp235x-usb-api",
  "userlib",
 ]

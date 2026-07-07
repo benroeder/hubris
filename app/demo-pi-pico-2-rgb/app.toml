@@ -1,0 +1,136 @@
+name = "demo-pi-pico-2-rgb"
+target = "thumbv8m.main-none-eabihf"
+chip = "../../chips/rp235x"
+board = "pi-pico-2"
+memory = "memory-pico-2-single.toml"
+stacksize = 944
+
+[kernel]
+name = "demo-pi-pico-2-rgb"
+requires = {flash = 32768, ram = 16384}
+stacksize = 8192
+
+[tasks.jefe]
+name = "task-jefe"
+priority = 0
+max-sizes = {flash = 4096, ram = 2048}
+start = true
+stacksize = 1024
+notifications = ["fault", "timer"]
+
+[tasks.usb]
+name = "task-rp235x-usb"
+priority = 3
+max-sizes = {flash = 32768, ram = 8192}
+stacksize = 4096
+uses = ["usbctrl", "usb_dpram", "resets", "watchdog"]
+start = true
+notifications = ["usb-irq"]
+interrupts = {"usbctrl.irq" = "usb-irq"}
+
+[tasks.sys]
+name = "drv-rp235x-sys"
+priority = 1
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 512
+uses = ["resets"]
+start = true
+
+[tasks.gpio_driver]
+name = "drv-rp235x-gpio"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["io_bank0", "pads_bank0", "sio"]
+start = true
+task-slots = ["sys"]
+
+[tasks.uart_driver]
+name = "drv-rp235x-uart"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["uart0"]
+start = true
+notifications = ["uart-irq"]
+interrupts = {"uart0.irq" = "uart-irq"}
+
+[tasks.spi_driver]
+name = "drv-rp235x-spi"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["spi0"]
+start = true
+task-slots = ["sys"]
+
+[tasks.i2c_driver]
+name = "drv-rp235x-i2c"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1536
+uses = ["i2c0"]
+start = true
+task-slots = ["sys"]
+notifications = ["i2c-irq"]
+interrupts = {"i2c0.irq" = "i2c-irq"}
+
+[tasks.adc_driver]
+name = "drv-rp235x-adc"
+priority = 2
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 768
+uses = ["adc"]
+start = true
+task-slots = ["sys"]
+
+[tasks.pwm_driver]
+name = "drv-rp235x-pwm"
+priority = 2
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 768
+uses = ["pwm"]
+start = true
+task-slots = ["sys"]
+
+[tasks.flash_driver]
+name = "drv-rp235x-flash"
+priority = 2
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+uses = ["watchdog", "psm", "qmi"]
+start = true
+extern-regions = ["rom", "xip"]
+
+[tasks.ws2812]
+name = "drv-rp235x-ws2812"
+priority = 3
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 512
+uses = ["pio0", "io_bank0", "pads_bank0", "sio"]
+start = true
+
+[tasks.shell]
+name = "task-rp235x-shell"
+priority = 4
+max-sizes = {flash = 32768, ram = 4096}
+stacksize = 2048
+start = true
+features = ["ws2812"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "ws2812"]
+
+[tasks.hiffy]
+name = "task-hiffy"
+priority = 4
+max-sizes = {flash = 32768, ram = 32768}
+stacksize = 2048
+start = true
+features = ["micro"]
+notifications = ["timer"]
+
+[tasks.idle]
+name = "task-idle"
+priority = 5
+max-sizes = {flash = 128, ram = 256}
+stacksize = 256
+start = true

@@ -16,11 +16,13 @@ drv-rp235x-adc-api = { path = "../../drv/rp235x-adc-api" }
 drv-rp235x-pwm-api = { path = "../../drv/rp235x-pwm-api" }
 drv-rp235x-cyw43-api = { path = "../../drv/rp235x-cyw43-api", optional = true }
 drv-rp235x-slink-api = { path = "../../drv/rp235x-slink-api", optional = true }
+drv-rp235x-ws2812-api = { path = "../../drv/rp235x-ws2812-api", optional = true }
 
 [features]
 cyw43 = ["dep:drv-rp235x-cyw43-api"]
 mailbox = ["dep:drv-rp235x-mailbox-api"]
 slink = ["dep:drv-rp235x-slink-api"]
+ws2812 = ["dep:drv-rp235x-ws2812-api"]
 
 [[bin]]
 name = "task-rp235x-shell"

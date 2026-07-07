@@ -1,0 +1,17 @@
+// RP2350 (RP235x) WS2812 (NeoPixel) RGB LED driver API.
+//
+// Drives a single WS2812 pixel on GP22 via PIO0 at 800 kHz. `set` takes a
+// 24-bit colour value packed as G<<16 | R<<8 | B (the wire order the WS2812
+// expects, MSB-first).
+
+Interface(
+    name: "Rp235xWs2812",
+    ops: {
+        "set": (
+            description: "Set the pixel colour. `grb` is a 24-bit G<<16 | R<<8 | B value.",
+            args: { "grb": "u32" },
+            reply: Result(ok: "()", err: CLike("Ws2812Error")),
+            idempotent: true,
+        ),
+    },
+)
