@@ -1892,6 +1892,22 @@ impl Shell {
         }
     }
 
+    /// The `TimeSource` every `sd` FAT command hands to its `VolumeManager`.
+    /// In a `ds1302` build this is the live DS1302 clock, so newly written
+    /// files get real timestamps; otherwise the fixed `DummyTime`. Single
+    /// place that picks the source.
+    #[cfg(feature = "fat")]
+    fn fat_time() -> fatfs::FatTime {
+        #[cfg(feature = "ds1302")]
+        {
+            fatfs::RtcTime::new(Rp235xDs1302::from(DS1302.get_task_id()))
+        }
+        #[cfg(not(feature = "ds1302"))]
+        {
+            fatfs::DummyTime
+        }
+    }
+
     /// `sd ls`: mount FAT volume 0, list the root directory (name + size).
     /// UNPROVEN on hardware.
     #[cfg(feature = "fat")]
@@ -1899,7 +1915,7 @@ impl Shell {
         use embedded_sdmmc::{VolumeIdx, VolumeManager};
         let vm = VolumeManager::new(
             fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            fatfs::DummyTime,
+            Self::fat_time(),
         );
         let volume = match vm.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
@@ -1933,6 +1949,19 @@ impl Shell {
             }
             self.out.put(b"\t");
             self.out.put_u32(entry.size);
+            // Last-modified time as "YYYY-MM-DD HH:MM" (from the TimeSource
+            // that stamped the entry when it was written).
+            let t = &entry.mtime;
+            self.out.put(b"\t");
+            self.out.put_u32(1970 + t.year_since_1970 as u32);
+            self.out.put(b"-");
+            self.out.put_pad2(t.zero_indexed_month + 1);
+            self.out.put(b"-");
+            self.out.put_pad2(t.zero_indexed_day + 1);
+            self.out.put(b" ");
+            self.out.put_pad2(t.hours);
+            self.out.put(b":");
+            self.out.put_pad2(t.minutes);
             self.out.put(b"\r\n");
             count += 1;
         });
@@ -1954,7 +1983,7 @@ impl Shell {
         };
         let vm = VolumeManager::new(
             fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            fatfs::DummyTime,
+            Self::fat_time(),
         );
         let volume = match vm.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
@@ -2009,7 +2038,7 @@ impl Shell {
         }
         let vm = VolumeManager::new(
             fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            fatfs::DummyTime,
+            Self::fat_time(),
         );
         let volume = match vm.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
@@ -2063,7 +2092,7 @@ impl Shell {
         };
         let vm = VolumeManager::new(
             fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            fatfs::DummyTime,
+            Self::fat_time(),
         );
         let volume = match vm.open_volume(VolumeIdx(0)) {
             Ok(v) => v,

@@ -111,14 +111,23 @@ uses = ["spi1", "io_bank0", "pads_bank0", "sio"]
 start = true
 task-slots = ["sys"]
 
+[tasks.ds1302]
+name = "drv-rp235x-ds1302"
+priority = 3
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 512
+uses = ["sio", "io_bank0", "pads_bank0"]
+start = true
+# The DS1302 driver talks straight to SIO/IO_BANK0/PADS_BANK0; no task-slots.
+
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
 max-sizes = {flash = 49152, ram = 8192}
 stacksize = 4096
 start = true
-features = ["sdcard", "fat"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard"]
+features = ["sdcard", "fat", "ds1302"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302"]
 
 [tasks.hiffy]
 name = "task-hiffy"

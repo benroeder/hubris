@@ -75,11 +75,13 @@ impl BlockDevice for SdBlockDevice {
     }
 }
 
-/// Fixed timestamp source. The SD image carries no RTC and this layer is
-/// read-only, so nothing consumes the value; DS1302-backed time is a later
-/// step. Corresponds to 2025-01-01 00:00:00 (year_since_1970 = 55).
+/// Fixed timestamp source. Used only in builds without the `ds1302` feature
+/// (no RTC available). Corresponds to 2025-01-01 00:00:00 (year_since_1970 =
+/// 55).
+#[cfg(not(feature = "ds1302"))]
 pub struct DummyTime;
 
+#[cfg(not(feature = "ds1302"))]
 impl TimeSource for DummyTime {
     fn get_timestamp(&self) -> Timestamp {
         Timestamp {
@@ -92,3 +94,50 @@ impl TimeSource for DummyTime {
         }
     }
 }
+
+/// DS1302-backed timestamp source. Reads the live clock over IPC so files
+/// written to the card carry real calendar dates. Only present in `ds1302`
+/// builds.
+#[cfg(feature = "ds1302")]
+pub struct RtcTime {
+    rtc: drv_rp235x_ds1302_api::Rp235xDs1302,
+}
+
+#[cfg(feature = "ds1302")]
+impl RtcTime {
+    pub fn new(rtc: drv_rp235x_ds1302_api::Rp235xDs1302) -> Self {
+        Self { rtc }
+    }
+}
+
+#[cfg(feature = "ds1302")]
+impl TimeSource for RtcTime {
+    fn get_timestamp(&self) -> Timestamp {
+        // Packed u64 from the DS1302 driver: byte0=sec, byte1=min, byte2=hour,
+        // byte3=date, byte4=month, byte5=weekday, byte6=year (0-99).
+        let packed = self.rtc.now();
+        let sec = packed as u8;
+        let min = (packed >> 8) as u8;
+        let hour = (packed >> 16) as u8;
+        let date = (packed >> 24) as u8;
+        let month = (packed >> 32) as u8;
+        let year = (packed >> 48) as u8;
+        Timestamp {
+            // year_since_1970 = 2000 + year - 1970 = year + 30.
+            year_since_1970: year.wrapping_add(30),
+            zero_indexed_month: month.saturating_sub(1),
+            zero_indexed_day: date.saturating_sub(1),
+            hours: hour,
+            minutes: min,
+            seconds: sec,
+        }
+    }
+}
+
+/// The FAT `TimeSource` this build uses: the live DS1302 clock when the
+/// `ds1302` feature is on, otherwise the fixed `DummyTime`. A single alias so
+/// every `sd` command builds its `VolumeManager` with the same source.
+#[cfg(feature = "ds1302")]
+pub type FatTime = RtcTime;
+#[cfg(not(feature = "ds1302"))]
+pub type FatTime = DummyTime;
