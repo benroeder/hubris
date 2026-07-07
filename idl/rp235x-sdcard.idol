@@ -1,0 +1,28 @@
+// RP2350 (RP235x) microSD card raw block-device driver API (SD SPI mode).
+//
+// RAW BLOCK DEVICE ONLY -- no filesystem. `init` runs the SD SPI-mode power-on
+// handshake (CMD0/CMD8/ACMD41/CMD58) on SPI1 (SCK=GP10, MOSI=GP11, MISO=GP12,
+// CS=GP13 driven manually as a SIO GPIO). `read_block` returns exactly one
+// 512-byte block via a write lease, using the same lease idiom as the flash
+// driver's `read`.
+
+Interface(
+    name: "Rp235xSdcard",
+    ops: {
+        "init": (
+            description: "Run the SD SPI-mode init handshake. Returns a small status code (bit0 = SDHC/CCS, bit1 = SD v2) on success.",
+            args: {},
+            reply: Result(ok: "u32", err: CLike("SdError")),
+            idempotent: true,
+        ),
+        "read_block": (
+            description: "Read exactly one 512-byte block into `dest`. `block` is a logical block number (the driver applies byte vs block addressing per the card kind).",
+            args: { "block": "u32" },
+            leases: {
+                "dest": (type: "[u8]", write: true, max_len: Some(512)),
+            },
+            reply: Result(ok: "()", err: CLike("SdError")),
+            idempotent: true,
+        ),
+    },
+)

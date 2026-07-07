@@ -1039,6 +1039,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-sd"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
 name = "demo-pi-pico-2-slink"
 version = "0.1.0"
 dependencies = [
@@ -2559,6 +2574,36 @@ dependencies = [
 
 [[package]]
 name = "drv-rp235x-pwm-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-sdcard"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "counters",
+ "drv-rp235x-sdcard-api",
+ "drv-rp235x-sys-api",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-sdcard-api"
 version = "0.1.0"
 dependencies = [
  "counters",
@@ -7109,6 +7154,7 @@ dependencies = [
  "drv-rp235x-i2c-api",
  "drv-rp235x-mailbox-api",
  "drv-rp235x-pwm-api",
+ "drv-rp235x-sdcard-api",
  "drv-rp235x-slink-api",
  "drv-rp235x-spi-api",
  "drv-rp235x-uart-api",

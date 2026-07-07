@@ -31,6 +31,8 @@ use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_ws2812_api::Rp235xWs2812;
 #[cfg(feature = "ds1302")]
 use drv_rp235x_ds1302_api::Rp235xDs1302;
+#[cfg(feature = "sdcard")]
+use drv_rp235x_sdcard_api::Rp235xSdcard;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -54,6 +56,8 @@ task_slot!(SLINK, slink_driver);
 task_slot!(WS2812, ws2812);
 #[cfg(feature = "ds1302")]
 task_slot!(DS1302, ds1302);
+#[cfg(feature = "sdcard")]
+task_slot!(SDCARD, sdcard);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -98,6 +102,9 @@ const HELP: &[u8] = b"commands:\r\n\
   rgb <r> <g> <b>       set the WS2812 NeoPixel on GP22 (0-255 each)\r\n\
   rtc [get]             read the DS1302 clock (GP6/7/8)\r\n\
   rtc set <YY> <MM> <DD> <HH> <MM> <SS> [weekday]   set the DS1302 clock\r\n\
+  sd init               run the SD SPI-mode init handshake (GP10-13)\r\n\
+  sd read <block>       read a 512-byte block; hexdump it\r\n\
+  sd find <start> <n>   scan n blocks; print any printable-ASCII runs (>=4)\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -119,6 +126,8 @@ struct Shell {
     ws2812: Rp235xWs2812,
     #[cfg(feature = "ds1302")]
     ds1302: Rp235xDs1302,
+    #[cfg(feature = "sdcard")]
+    sdcard: Rp235xSdcard,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -242,6 +251,8 @@ impl Shell {
                 words.next(),
                 words.next(),
             ),
+            #[cfg(feature = "sdcard")]
+            "sd" => self.cmd_sd(words.next(), words.next(), words.next()),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -1704,6 +1715,127 @@ impl Shell {
         }
     }
 
+    /// `sd init` runs the SD SPI-mode handshake; `sd read <block>` hexdumps one
+    /// 512-byte block; `sd find <start> <count>` scans blocks for printable-
+    /// ASCII runs (>=4 bytes) -- a way to spot a text message on a formatted
+    /// card with no filesystem. Block numbers are plain decimals (like `rgb`).
+    #[cfg(feature = "sdcard")]
+    fn cmd_sd(
+        &mut self,
+        verb: Option<&str>,
+        a: Option<&str>,
+        b: Option<&str>,
+    ) {
+        match verb {
+            Some("init") => match self.sdcard.init() {
+                Ok(status) => {
+                    self.out.put(b"init ok: ");
+                    self.out.put(
+                        if status & drv_rp235x_sdcard_api::STATUS_V2 != 0 {
+                            b"SDv2 " as &[u8]
+                        } else {
+                            b"SDv1 "
+                        },
+                    );
+                    self.out.put(
+                        if status & drv_rp235x_sdcard_api::STATUS_CCS != 0 {
+                            b"SDHC/block-addressed\r\n" as &[u8]
+                        } else {
+                            b"SDSC/byte-addressed\r\n"
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.out.put(b"init error ");
+                    self.out.put_u32(e as u32);
+                    self.out.put(b"\r\n");
+                }
+            },
+            Some("read") => {
+                let Some(block) = a.and_then(|s| s.parse::<u32>().ok()) else {
+                    self.out.put(b"usage: sd read <block>\r\n");
+                    return;
+                };
+                let mut buf = [0u8; 512];
+                match self.sdcard.read_block(block, &mut buf) {
+                    Ok(()) => {
+                        // Hexdump, 16 bytes per line with an ASCII gutter.
+                        for (li, chunk) in buf.chunks(16).enumerate() {
+                            self.out.put_hex32((li as u32) * 16);
+                            self.out.put(b": ");
+                            for &x in chunk {
+                                self.out.put_hex_byte(x);
+                                self.out.put(b" ");
+                            }
+                            self.out.put(b" |");
+                            for &x in chunk {
+                                let p = [x];
+                                self.out.put(if (0x20..0x7f).contains(&x) {
+                                    &p
+                                } else {
+                                    b"."
+                                });
+                            }
+                            self.out.put(b"|\r\n");
+                        }
+                    }
+                    Err(e) => {
+                        self.out.put(b"read error ");
+                        self.out.put_u32(e as u32);
+                        self.out.put(b"\r\n");
+                    }
+                }
+            }
+            Some("find") => {
+                let (Some(start), Some(count)) = (
+                    a.and_then(|s| s.parse::<u32>().ok()),
+                    b.and_then(|s| s.parse::<u32>().ok()),
+                ) else {
+                    self.out.put(b"usage: sd find <start-block> <count>\r\n");
+                    return;
+                };
+                let mut hits = 0u32;
+                for i in 0..count {
+                    let block = start.wrapping_add(i);
+                    let mut buf = [0u8; 512];
+                    if self.sdcard.read_block(block, &mut buf).is_err() {
+                        self.out.put(b"read error at block ");
+                        self.out.put_u32(block);
+                        self.out.put(b"\r\n");
+                        break;
+                    }
+                    // Print each run of >=4 consecutive printable ASCII bytes.
+                    let mut run = 0usize;
+                    for j in 0..=buf.len() {
+                        let printable =
+                            j < buf.len() && (0x20..0x7f).contains(&buf[j]);
+                        if printable {
+                            run += 1;
+                        } else {
+                            if run >= 4 {
+                                let s = j - run;
+                                self.out.put_u32(block);
+                                self.out.put(b"+");
+                                self.out.put_u32(s as u32);
+                                self.out.put(b": ");
+                                self.out.put(&buf[s..j]);
+                                self.out.put(b"\r\n");
+                                hits += 1;
+                            }
+                            run = 0;
+                        }
+                    }
+                }
+                self.out.put(b"done, ");
+                self.out.put_u32(hits);
+                self.out.put(b" run(s)\r\n");
+            }
+            _ => self.out.put(
+                b"usage: sd init | read <block> | find <start> <count>\r\n",
+            ),
+        }
+    }
+
     fn cmd_reboot(&mut self, mode: Option<&str>) {
         let bootsel = match mode {
             Some("bootsel") => 1,
@@ -1826,6 +1958,8 @@ pub fn main() -> ! {
         ws2812: Rp235xWs2812::from(WS2812.get_task_id()),
         #[cfg(feature = "ds1302")]
         ds1302: Rp235xDs1302::from(DS1302.get_task_id()),
+        #[cfg(feature = "sdcard")]
+        sdcard: Rp235xSdcard::from(SDCARD.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
