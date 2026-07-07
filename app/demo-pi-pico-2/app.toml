@@ -111,13 +111,21 @@ uses = ["sio"]
 extern-regions = ["shared"]
 start = true
 
+[tasks.slink_driver]
+name = "drv-rp235x-slink"
+priority = 3
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 640
+uses = ["sio", "io_bank0", "pads_bank0"]
+start = true
+
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
 max-sizes = {flash = 32768, ram = 4096}
 stacksize = 2048
 start = true
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43", "mailbox_driver"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "cyw43", "mailbox_driver", "slink_driver"]
 
 [tasks.hiffy]
 name = "task-hiffy"

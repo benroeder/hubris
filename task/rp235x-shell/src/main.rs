@@ -23,6 +23,7 @@ use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2c_api::Rp235xI2c;
 use drv_rp235x_mailbox_api::Rp235xMailbox;
 use drv_rp235x_pwm_api::Rp235xPwm;
+use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
@@ -38,6 +39,7 @@ task_slot!(ADC, adc_driver);
 task_slot!(PWM, pwm_driver);
 task_slot!(CYW43, cyw43);
 task_slot!(MAILBOX, mailbox_driver);
+task_slot!(SLINK, slink_driver);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
@@ -77,6 +79,8 @@ const HELP: &[u8] = b"commands:\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
   push <size> <crc>     stream own flash image to a peer over UART\r\n\
+  slink send <hex..>    send a Sony S-Link frame (2-3 bytes) on GP4\r\n\
+  slink listen [ms]     wait for an S-Link frame; print the bytes\r\n\
   reboot [bootsel]      reboot; with `bootsel`, land in USB flashing mode\r\n";
 
 struct Shell {
@@ -90,6 +94,7 @@ struct Shell {
     pwm: Rp235xPwm,
     cyw43: Rp235xCyw43,
     mailbox: Rp235xMailbox,
+    slink: Rp235xSlink,
     out: Out,
     /// Idle-loop LED heartbeat; `led on|off|toggle` takes manual control of
     /// the LED (turns this off), `led blink` gives it back.
@@ -185,9 +190,16 @@ impl Shell {
             "update" => self.cmd_update(words.next(), words.next()),
             "uart-update" => self.cmd_uart_update(words.next(), words.next()),
             "push" => self.cmd_push(words.next(), words.next()),
+            "slink" => self.cmd_slink(
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+            ),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
-                // shell (and, on AMP, that core 1's kernel is unaffected).
+                // shell + re-attaches the USB console (and, on AMP, that core
+                // 1's kernel is unaffected).
                 self.out
                     .put(b"crashing shell (jefe should restart me)...\r\n");
                 self.out.flush();
@@ -1438,6 +1450,115 @@ impl Shell {
         }
     }
 
+    /// Sony S-Link / Control-A1 on GP4: `slink send <hex> <hex> [hex]` bit-bangs
+    /// a 2-3 byte frame; `slink listen [ms]` waits for one and prints its bytes.
+    fn cmd_slink(
+        &mut self,
+        sub: Option<&str>,
+        a: Option<&str>,
+        b: Option<&str>,
+        c: Option<&str>,
+    ) {
+        match sub {
+            Some("send") => {
+                let p = |s: Option<&str>| {
+                    s.and_then(|x| u8::from_str_radix(x, 16).ok())
+                };
+                let (Some(b0), Some(b1)) = (p(a), p(b)) else {
+                    self.out.put(b"usage: slink send <hex> <hex> [hex]\r\n");
+                    return;
+                };
+                let (b2, n) = match p(c) {
+                    Some(b2) => (b2, 3u8),
+                    None => (0, 2),
+                };
+                self.slink.send(b0, b1, b2, n);
+                self.out.put(b"sent ");
+                self.out.put_u32(n as u32);
+                self.out.put(b" bytes: ");
+                self.out.put_hex_byte(b0);
+                self.out.put(b" ");
+                self.out.put_hex_byte(b1);
+                if n == 3 {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(b2);
+                }
+                self.out.put(b"\r\n");
+            }
+            Some("listen") => {
+                let ms = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(5000);
+                self.out.put(b"listening ");
+                self.out.put_u32(ms);
+                self.out.put(b" ms...\r\n");
+                self.out.flush();
+                let r = self.slink.listen(ms);
+                let n = (r >> 24) & 0xff;
+                if n == 0 {
+                    self.out.put(b"no frame (timeout)\r\n");
+                    return;
+                }
+                self.out.put(b"rx ");
+                self.out.put_u32(n);
+                self.out.put(b" bytes: ");
+                self.out.put_hex_byte((r >> 16) as u8);
+                self.out.put(b" ");
+                self.out.put_hex_byte((r >> 8) as u8);
+                if n == 3 {
+                    self.out.put(b" ");
+                    self.out.put_hex_byte(r as u8);
+                }
+                self.out.put(b"\r\n");
+            }
+            Some("flood") => {
+                let n = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(256);
+                self.out.put(b"flooding ");
+                self.out.put_u32(n);
+                self.out.put(b" frames...\r\n");
+                self.out.flush();
+                self.slink.flood(n);
+                self.out.put(b"flood done (");
+                self.out.put_u32(n);
+                self.out.put(b" frames sent)\r\n");
+            }
+            Some("soak") => {
+                let n = a.and_then(|s| s.parse::<u32>().ok()).unwrap_or(256);
+                let ms =
+                    b.and_then(|s| s.parse::<u32>().ok()).unwrap_or(60000);
+                self.out.put(b"soaking up to ");
+                self.out.put_u32(n);
+                self.out.put(b" frames...\r\n");
+                self.out.flush();
+                let r = self.slink.soak(n, ms);
+                let good = r & 0xffff;
+                let bad = r >> 16;
+                let m1 = self.slink.margin_ones();
+                let m0 = self.slink.margin_zeros();
+                self.out.put(b"soak: good=");
+                self.out.put_u32(good);
+                self.out.put(b" bad=");
+                self.out.put_u32(bad);
+                self.out.put(b" (");
+                self.out.put(if bad == 0 && good > 0 {
+                    b"PASS" as &[u8]
+                } else {
+                    b"CHECK"
+                });
+                self.out.put(b")\r\n  mark width us: ones ");
+                self.out.put_u32(m1 >> 16);
+                self.out.put(b"-");
+                self.out.put_u32(m1 & 0xffff);
+                self.out.put(b" (nom 1200), zeros ");
+                self.out.put_u32(m0 >> 16);
+                self.out.put(b"-");
+                self.out.put_u32(m0 & 0xffff);
+                self.out.put(b" (nom 600)\r\n");
+            }
+            _ => self.out.put(
+                b"usage: slink send <hex..> | listen [ms] | flood <n> | soak <n> [ms]\r\n",
+            ),
+        }
+    }
+
     fn cmd_reboot(&mut self, mode: Option<&str>) {
         let bootsel = match mode {
             Some("bootsel") => 1,
@@ -1552,6 +1673,7 @@ pub fn main() -> ! {
         pwm: Rp235xPwm::from(PWM.get_task_id()),
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
         mailbox: Rp235xMailbox::from(MAILBOX.get_task_id()),
+        slink: Rp235xSlink::from(SLINK.get_task_id()),
         out: Out {
             usb,
             buf: [0u8; 256],
