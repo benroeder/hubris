@@ -47,6 +47,12 @@ static DIAG: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 static DATA_FRAME: [AtomicU32; 128] =
     [const { AtomicU32::new(0) }; 128];
 
+/// Credentials captured from the captive-portal POST, for the STA join.
+/// [0]=ready(1) [1]=ssid_len [2]=pass_len [3..11]=ssid(32B) [11..27]=pass(64B).
+#[no_mangle]
+#[used]
+static CREDS: [AtomicU32; 27] = [const { AtomicU32::new(0) }; 27];
+
 // Pico W CYW43439 NVRAM (config vars), from cyw43-driver wifi_nvram_43439.h.
 static NVRAM: [u32; 186] = [
     0x4152564e, 0x7665524d, 0x6552243d, 0x6d002476, 0x69666e61, 0x78303d64,

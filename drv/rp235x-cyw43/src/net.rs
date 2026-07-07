@@ -331,6 +331,106 @@ fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
+const HTTP_OK_HTML: &[u8] =
+    b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+
+/// The portal page: a Wi-Fi network + password form that POSTs to /connect.
+const FORM_BODY: &[u8] = b"<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em\"><h1>Pico 2 W Wi-Fi Setup</h1><form method=POST action=/connect><p>Network<br><input name=ssid autocapitalize=off style=\"width:100%;font-size:1.2em\"></p><p>Password<br><input name=password type=password style=\"width:100%;font-size:1.2em\"></p><p><button style=\"font-size:1.2em;padding:.4em 1em\">Connect</button></p></form></body></html>";
+
+const CONNECTING_BODY: &[u8] = b"<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Connecting</title></head><body style=\"font-family:sans-serif;max-width:420px;margin:2em auto\"><h1>Connecting...</h1><p>The Pico is joining your network. You can close this window.</p></body></html>";
+
+const API_JSON: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}";
+
+fn hexval(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// URL-decode `src` into `dst` ('+' -> space, %XX -> byte); returns the length.
+fn urldecode(src: &[u8], dst: &mut [u8]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < src.len() && n < dst.len() {
+        match src[i] {
+            b'+' => {
+                dst[n] = b' ';
+                i += 1;
+            }
+            b'%' if i + 2 < src.len() => {
+                dst[n] = (hexval(src[i + 1]) << 4) | hexval(src[i + 2]);
+                i += 3;
+            }
+            c => {
+                dst[n] = c;
+                i += 1;
+            }
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Store the submitted SSID + password into the CREDS static for the STA join.
+fn store_creds(ssid: &[u8], pass: &[u8]) {
+    let sl = ssid.len().min(32);
+    let pl = pass.len().min(64);
+    let pack = |bytes: &[u8], base: usize, words: usize| {
+        for i in 0..words {
+            let mut w = 0u32;
+            for j in 0..4 {
+                let k = i * 4 + j;
+                if k < bytes.len() {
+                    w |= (bytes[k] as u32) << (8 * j);
+                }
+            }
+            crate::CREDS[base + i].store(w, SeqCst);
+        }
+    };
+    pack(&ssid[..sl], 3, 8);
+    pack(&pass[..pl], 11, 16);
+    crate::CREDS[1].store(sl as u32, SeqCst);
+    crate::CREDS[2].store(pl as u32, SeqCst);
+    crate::CREDS[0].store(1, SeqCst); // ready
+}
+
+/// Parse a urlencoded POST body for ssid + password and store them.
+fn handle_post(req: &[u8]) -> bool {
+    let mut body: &[u8] = &[];
+    let mut i = 0;
+    while i + 4 <= req.len() {
+        if &req[i..i + 4] == b"\r\n\r\n" {
+            body = &req[i + 4..];
+            break;
+        }
+        i += 1;
+    }
+    let mut ssid = [0u8; 32];
+    let mut sl = 0;
+    let mut pass = [0u8; 64];
+    let mut pl = 0;
+    let mut got = false;
+    for field in body.split(|&b| b == b'&') {
+        if let Some(eq) = field.iter().position(|&b| b == b'=') {
+            match &field[..eq] {
+                b"ssid" => {
+                    sl = urldecode(&field[eq + 1..], &mut ssid);
+                    got = true;
+                }
+                b"password" => pl = urldecode(&field[eq + 1..], &mut pass),
+                _ => {}
+            }
+        }
+    }
+    if got {
+        store_creds(&ssid[..sl], &pass[..pl]);
+    }
+    got
+}
+
 /// Provisioning loop: smoltcp Interface at 192.168.4.1/24. smoltcp owns
 /// ARP/IP/UDP/TCP (and auto-answers ARP for the gateway); DHCP is served in the
 /// Device at the frame level. Later phases add DNS/TCP sockets to the SocketSet.
@@ -375,7 +475,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
         static mut DNS_TX_META: [udp::PacketMetadata; 8] = [meta; _];
         static mut DNS_TX_PL: [u8; 768] = [zero; _];
         static mut HTTP_RX: [u8; 1024] = [zero; _];
-        static mut HTTP_TX: [u8; 1024] = [zero; _];
+        static mut HTTP_TX: [u8; 2048] = [zero; _];
         static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [store; _];
     };
     let dns_rx = udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx_pl[..]);
@@ -432,16 +532,21 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
             http.listen(80).ok();
         }
         if http.can_recv() {
-            let mut req = [0u8; 512];
+            let mut req = [0u8; 1024];
             let n = http.recv_slice(&mut req).unwrap_or(0);
             if n > 0 {
-                let is_api = n >= 9 && &req[0..9] == b"GET /api ";
-                let resp: &[u8] = if is_api {
-                    b"HTTP/1.0 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}"
+                let r = &req[..n];
+                if r.starts_with(b"POST ") {
+                    // Credentials submitted -> store them, show "Connecting...".
+                    handle_post(r);
+                    let _ = http.send_slice(HTTP_OK_HTML);
+                    let _ = http.send_slice(CONNECTING_BODY);
+                } else if n >= 9 && &r[0..9] == b"GET /api " {
+                    let _ = http.send_slice(API_JSON); // RFC 8908 -> open portal
                 } else {
-                    b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Pico 2 W Setup</title></head><body style=\"font-family:sans-serif\"><h1>Pico 2 W Wi-Fi Setup</h1><p>Captive portal is up. Wi-Fi scan + password form next.</p></body></html>"
-                };
-                let _ = http.send_slice(resp);
+                    let _ = http.send_slice(HTTP_OK_HTML);
+                    let _ = http.send_slice(FORM_BODY); // the portal form
+                }
                 http.close();
                 DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
             }
