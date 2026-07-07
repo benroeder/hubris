@@ -999,11 +999,31 @@ impl Cyw43 {
         self.do_ioctl_b(2, 0x107, 43, 0, &sb, 52, fr);
         // Channel 6 (STA).
         self.do_ioctl(30, 44, 0, &[6], 4, fr);
-        // bsscfg:wsec = [AP=1, 0=open].
+        // bsscfg:wsec = [AP=1, 4=WPA]. WPA2-protected setup AP so the user's home
+        // password is encrypted over the air during onboarding, not sent in the
+        // clear over an open AP. The PSK is the chip-id suffix of the SSID
+        // (hubris-<id> -> PSK <id>): usable for a demo (read it off the SSID) but
+        // derivable from it; a real product would burn a random per-device key
+        // and print it on a label.
         let mut ws = [0u8; 20];
         ws[..12].copy_from_slice(b"bsscfg:wsec\0");
-        ws[12] = 1;
+        ws[12] = 1; // AP index
+        ws[16] = 4; // WSEC = WPA
         self.do_ioctl_b(2, 0x107, 45, 0, &ws, 20, fr);
+        // AP passphrase (WLC_SET_WSEC_PMK on the AP iface): the chip-id chars.
+        let pl = n.saturating_sub(7); // ssid = "hubris-" + chip-id hex
+        let mut pmk = [0u32; 17];
+        pmk[0] = (pl as u32) | (1u32 << 16); // key_len + flags(1=passphrase)
+        for i in 0..pl.min(64) {
+            pmk[1 + i / 4] |= (ssid_buf[7 + i] as u32) << (8 * (i % 4));
+        }
+        self.do_ioctl(WLC_SET_WSEC_PMK, 54, 1, &pmk, 68, fr);
+        // bsscfg:wpa_auth = [AP=1, 0x80=WPA2-PSK].
+        let mut wa = [0u8; 24];
+        wa[..16].copy_from_slice(b"bsscfg:wpa_auth\0"); // 15 chars + null
+        wa[16] = 1; // AP index
+        wa[20] = 0x80; // WPA2-PSK
+        self.do_ioctl_b(2, 0x107, 55, 0, &wa, 24, fr);
         // mfp = 0, gmode = 1, 2g_mrate = 22, dtim = 1 (all on the AP interface).
         let mut mfp = [0u8; 8];
         mfp[..4].copy_from_slice(b"mfp\0");
