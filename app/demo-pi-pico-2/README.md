@@ -21,6 +21,41 @@ below is verified on hardware.
 | `shell` | interactive command shell, a pure IPC client of everything |
 | `idle` | lowest-priority spin |
 
+## Image variants
+
+The drivers/tasks all live on one branch, but build as separate images -- each
+its own `app/<name>/app.toml` (which tasks), `src/main.rs` (single- vs dual-core
+pre-kernel), and memory map. Pick one; they don't share an image.
+
+| Image (`app/<name>`) | Cores | Contents | Flash |
+|---|---|---|---|
+| `demo-pi-pico-2-wifi` | 1 (full SRAM) | captive-portal Wi-Fi (WPA2) | 58% |
+| `demo-pi-pico-2-slink` | 1 (full SRAM) | Sony S-Link one-wire | 34% |
+| `demo-pi-pico-2-amp` | 2 | AMP: 2nd kernel on core 1 + mailbox | 45% |
+| `demo-pi-pico-2-wifi-amp` | 2 | Wi-Fi on core 0 + kernel on core 1 | 74% |
+| `demo-pi-pico-2` | 2 | combined: Wi-Fi + AMP + S-Link | 76% |
+
+The shell is feature-gated (`cyw43`/`mailbox`/`slink`), so each image's console
+only carries the commands for what it includes. Single-core images use
+`memory-pico-2-single.toml` (all 520 KiB SRAM to core 0); dual-core images use
+`memory-pico-2.toml` (core-0 224 KiB / core-1 48 KiB split). Every image fits a
+256 KiB A/B partition and keeps the `update` command, so any is field-updatable.
+
+## A/B (unbrickable) images
+
+Any variant builds into a two-slot A/B image (the boot ROM boots the
+higher-version slot; a field `update` writes the *inactive* slot, so an
+interrupted transfer never bricks the running image -- see
+`examples/04-uart-update.md`):
+
+    support/rp235x-ab-image.sh <app> [slotA_ver] [slotB_ver] [--flash]
+    # e.g. support/rp235x-ab-image.sh demo-pi-pico-2-wifi 2.0 1.0 --flash
+
+It builds the variant at both versions and combines the partition table
+(`chips/rp235x/ab-partitions.json`) @0 + slot A @0x2000 + slot B @0x42000 into
+one image. (The `ab-partitions.json` schema may need a tweak for your picotool
+version.)
+
 ## Build and flash
 
     cargo xtask dist app/demo-pi-pico-2/app.toml
