@@ -40,13 +40,6 @@ const CLK: u32 = 29; // gSPI CLK
 #[used]
 static DIAG: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 
-/// Capture of the first channel-2 (DATA) frame seen -- e.g. a client's DHCP
-/// DISCOVER after it joins the SoftAP. Proves the F2 DATA path (smoltcp's phy).
-#[no_mangle]
-#[used]
-static DATA_FRAME: [AtomicU32; 128] =
-    [const { AtomicU32::new(0) }; 128];
-
 /// Credentials captured from the captive-portal POST, for the STA join.
 /// [0]=ready(1) [1]=ssid_len [2]=pass_len [3..11]=ssid(32B) [11..27]=pass(64B).
 #[no_mangle]
@@ -772,11 +765,6 @@ impl Cyw43 {
         if !got {
             return 0;
         }
-        // Diagnostic: per-SDPCM-channel histogram in DATA_FRAME[96..112].
-        if (chan as usize) < 16 {
-            let i = 96 + chan as usize;
-            DATA_FRAME[i].store(DATA_FRAME[i].load(SeqCst).wrapping_add(1), SeqCst);
-        }
         self.take_credit(chan, bdc);
         if chan != 2 {
             return 0;
@@ -798,10 +786,8 @@ impl Cyw43 {
         // can't index past the buffer (OOB read -> task fault).
         let fr_bytes = fr.len() * 4;
         if eth_start >= fr_bytes || total <= eth_start {
-            DATA_FRAME[116].store(DATA_FRAME[116].load(SeqCst).wrapping_add(1), SeqCst); // chan-2 length drops
             return 0;
         }
-        DATA_FRAME[122].store(hdr_len as u32, SeqCst); // last RX header_length (diag)
         let n = (total - eth_start).min(out.len()).min(fr_bytes - eth_start);
         for (i, o) in out[..n].iter_mut().enumerate() {
             let pos = eth_start + i;
@@ -867,13 +853,8 @@ impl Cyw43 {
         // WLC_E_PSK_SUP (46) status tells 4-way-handshake success (0) vs
         // wrong-key (non-zero) directly. event_type/status are big-endian in the
         // wl_event_msg at header_length+36/+40 (same framing as the escan event).
-        // Capture the (type,status) sequence to DATA_FRAME[32..] to verify the
-        // offsets on-target. Returns 0 = connected, 1 = wrong key, 2 = timeout.
-        for slot in DATA_FRAME[32..80].iter() {
-            slot.store(0, SeqCst); // clear the capture for this attempt
-        }
+        // Returns 0 = connected, 1 = wrong key, 2 = timeout.
         let start = userlib::sys_get_timer().now;
-        let mut captured = 0usize;
         loop {
             let (got, chan, _s, bdc, _) = self.rx(fr);
             if got {
@@ -889,11 +870,6 @@ impl Cyw43 {
                     };
                     let et = be32(hl + 36); // event_type (big-endian)
                     let est = be32(hl + 40); // WLC_E_PSK_SUP supplicant state
-                    if captured < 24 {
-                        DATA_FRAME[32 + captured * 2].store(et, SeqCst);
-                        DATA_FRAME[33 + captured * 2].store(est, SeqCst);
-                        captured += 1;
-                    }
                     if et == 46 {
                         // Supplicant state: 6 = WLC_SUP_KEYED (4-way handshake
                         // complete -> connected); 7+ = timeout/failure (wrong

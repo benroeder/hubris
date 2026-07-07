@@ -54,7 +54,6 @@ pub struct Cyw43TxToken<'a> {
 
 impl phy::TxToken for Cyw43TxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        DIAG[7].store(DIAG[7].load(SeqCst).wrapping_add(1), SeqCst); // smoltcp TX (ARP etc.)
         let mut buf = [0u8; MTU];
         let r = f(&mut buf[..len]);
         self.wifi.send_frame(&buf[..len], self.fr);
@@ -92,37 +91,9 @@ impl Device for Cyw43Device<'_> {
             if n == 0 {
                 return None;
             }
-            DIAG[9].store(DIAG[9].load(SeqCst).wrapping_add(1), SeqCst); // raw frames
             if !self.sta_mode && is_dhcp_request(&buf[..n]) {
                 handle_dhcp(self.wifi, self.fr, &buf[..n], &mut self.leases);
                 continue;
-            }
-            if buf[12] == 0x08 && buf[13] == 0x06 {
-                DIAG[6].store(DIAG[6].load(SeqCst).wrapping_add(1), SeqCst); // ARP in
-            }
-            // L2 unicast addressed to our MAC (definitive unicast-to-host test).
-            if buf[0..6] == self.wifi.mac {
-                DIAG[2].store(DIAG[2].load(SeqCst).wrapping_add(1), SeqCst);
-                // Capture the first 64 bytes for offline decode (eth + IP hdr).
-                for i in 0..16 {
-                    let p = i * 4;
-                    let w = (buf[p] as u32)
-                        | ((buf[p + 1] as u32) << 8)
-                        | ((buf[p + 2] as u32) << 16)
-                        | ((buf[p + 3] as u32) << 24);
-                    crate::DATA_FRAME[i].store(w, SeqCst);
-                }
-            }
-            // Count IPv4 frames addressed TO us (.1) -- does unicast-to-host work?
-            if buf[12] == 0x08
-                && buf[13] == 0x00
-                && n >= 34
-                && buf[30] == 192
-                && buf[31] == 168
-                && buf[32] == 4
-                && buf[33] == 1
-            {
-                DIAG[5].store(DIAG[5].load(SeqCst).wrapping_add(1), SeqCst); // IPv4 to .1
             }
             let rx = Cyw43RxToken { buf, len: n };
             let tx = Cyw43TxToken {
@@ -226,12 +197,6 @@ fn build_dhcp_reply(req: &[u8], out: &mut [u8], leases: &mut Leases) -> Option<u
     }
     out[p] = 255;
     p += 1;
-    DIAG[11].store(0xD000_0000 | msgtype as u32, SeqCst);
-    if reply_type == 2 {
-        DIAG[13].store(DIAG[13].load(SeqCst).wrapping_add(1), SeqCst); // OFFERs built
-    } else {
-        DIAG[14].store(DIAG[14].load(SeqCst).wrapping_add(1), SeqCst); // ACKs built
-    }
     Some(p)
 }
 
@@ -293,7 +258,6 @@ fn handle_dhcp(wifi: &mut Cyw43, fr: &mut [u32; 512], rx: &[u8], leases: &mut Le
     let ck = ip_checksum(&tx[14..34]);
     tx[24..26].copy_from_slice(&ck.to_be_bytes());
     wifi.send_frame(&tx[..flen], fr);
-    DIAG[12].store(DIAG[12].load(SeqCst).wrapping_add(1), SeqCst); // DHCP replies sent
 }
 
 /// Captive-portal DNS: answer every A query with 192.168.4.1 (and empty for
@@ -571,7 +535,6 @@ fn serve_http(sock: &mut tcp::Socket<'_>, form: &[u8]) {
         let _ = sock.send_slice(form);
     }
     sock.close();
-    DIAG[4].store(DIAG[4].load(SeqCst).wrapping_add(1), SeqCst); // HTTP served
 }
 
 /// Provisioning loop: smoltcp Interface at 192.168.4.1/24. smoltcp owns
@@ -665,19 +628,6 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
         )),
     ];
 
-    for i in 96..122 {
-        crate::DATA_FRAME[i].store(0, SeqCst); // channel + chan-2-drop + RX-iface histograms
-    }
-    DIAG[2].store(0, SeqCst); // L2 unicast-to-us frames (was polluted by ALP init)
-    DIAG[5].store(0, SeqCst); // IPv4 frames addressed to us (.1)
-    DIAG[6].store(0, SeqCst); // ARP frames in
-    DIAG[7].store(0, SeqCst); // smoltcp TX out (ARP replies etc.)
-    DIAG[9].store(0, SeqCst); // raw frames into smoltcp
-    DIAG[12].store(0, SeqCst); // DHCP replies sent
-    DIAG[13].store(0, SeqCst); // OFFERs built (= DISCOVERs seen)
-    DIAG[14].store(0, SeqCst); // ACKs built (= REQUESTs seen)
-    DIAG[4].store(0, SeqCst); // HTTP requests served
-    DIAG[10].store(0, SeqCst); // DNS replies sent
     loop {
         let now = userlib::sys_get_timer().now;
         iface.poll(Instant::from_millis(now as i64), &mut device, &mut sockets);
@@ -690,7 +640,6 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
                     let mut rbuf = [0u8; 768];
                     if let Some(len) = build_dns_reply(&qbuf[..n], &mut rbuf) {
                         let _ = dns.send_slice(&rbuf[..len], ep);
-                        DIAG[10].store(DIAG[10].load(SeqCst).wrapping_add(1), SeqCst);
                     }
                 }
                 Err(_) => break,
