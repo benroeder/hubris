@@ -137,28 +137,6 @@ impl Device for Cyw43Device<'_> {
     }
 }
 
-impl Cyw43Device<'_> {
-    /// Announce the gateway (192.168.4.1 -> our MAC) via a gratuitous ARP, so
-    /// clients cache it without ARPing us. The CYW43 AP firmware does not hand
-    /// client ARP-for-.1 to the host, so without this the gateway resolves very
-    /// slowly (clients infer it from DHCP). With it, ping/DNS/HTTP to .1 work.
-    fn send_gratuitous_arp(&mut self) {
-        let mut arp = [0u8; 42];
-        arp[0..6].copy_from_slice(&[0xff; 6]); // L2 broadcast
-        arp[6..12].copy_from_slice(&self.wifi.mac);
-        arp[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
-        arp[14..16].copy_from_slice(&[0, 1]); // htype ethernet
-        arp[16..18].copy_from_slice(&[8, 0]); // ptype IPv4
-        arp[18] = 6; // hlen
-        arp[19] = 4; // plen
-        arp[20..22].copy_from_slice(&[0, 1]); // oper = request (announcement)
-        arp[22..28].copy_from_slice(&self.wifi.mac); // sender MAC = us
-        arp[28..32].copy_from_slice(&[192, 168, 4, 1]); // sender IP = gateway
-        arp[38..42].copy_from_slice(&[192, 168, 4, 1]); // target IP = gateway
-        self.wifi.send_frame(&arp, self.fr);
-    }
-}
-
 /// DHCP lease table: client MAC per pool slot; IP = 192.168.4.(2 + slot).
 struct Leases {
     macs: [[u8; 6]; 8],
@@ -354,14 +332,8 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     DIAG[12].store(0, SeqCst); // DHCP replies sent
     DIAG[13].store(0, SeqCst); // OFFERs built (= DISCOVERs seen)
     DIAG[14].store(0, SeqCst); // ACKs built (= REQUESTs seen)
-    let mut last_garp = 0u64;
     loop {
         let now = userlib::sys_get_timer().now;
         iface.poll(Instant::from_millis(now as i64), &mut device, &mut sockets);
-        // Re-announce the gateway ~1/s so clients keep .1 -> our MAC cached.
-        if now.wrapping_sub(last_garp) >= 1000 {
-            last_garp = now;
-            device.send_gratuitous_arp();
-        }
     }
 }
