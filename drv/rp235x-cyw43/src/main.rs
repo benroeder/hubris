@@ -676,6 +676,7 @@ impl Cyw43 {
         b[2] = (self.tx_seq as u32) | (2 << 8) | (14 << 24); // seq, chan=2, hdr_len=14
         b[3] = 0;
         b[4] = 0x20u32 << 16; // pad,pad,BDC.flags=0x20,BDC.priority=0
+        b[5] = 1; // BDC.flags2 = interface index 1 (AP) so it reaches the client
         for (j, &byte) in eth.iter().enumerate() {
             let pos = 18 + j;
             b[1 + pos / 4] |= (byte as u32) << (8 * (pos % 4));
@@ -687,7 +688,6 @@ impl Cyw43 {
 
     /// Try to receive one Ethernet frame (SDPCM channel 2). Returns the number
     /// of bytes copied into `out` (0 if no DATA frame). This is smoltcp's RX.
-    #[allow(dead_code)] // used by the smoltcp phy (next phase)
     fn recv_frame(&mut self, out: &mut [u8], fr: &mut [u32; 512]) -> usize {
         let (got, chan, _s, bdc, _i) = self.rx(fr);
         if !got {
@@ -727,6 +727,140 @@ impl Cyw43 {
         } else {
             0
         }
+    }
+
+    /// 1's-complement checksum over a header (IPv4 header checksum).
+    fn ip_checksum(hdr: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i + 1 < hdr.len() {
+            sum += ((hdr[i] as u32) << 8) | hdr[i + 1] as u32;
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Minimal DHCP server for the provisioning AP: leases the joining client
+    /// 192.168.4.2, with gateway + DNS = us (192.168.4.1). Hand-rolled on the F2
+    /// DATA path because DHCP is broadcast (awkward for smoltcp, which has no
+    /// server anyway). Runs ~15 s; returns the number of OFFER/ACK replies sent.
+    fn dhcp_serve(&mut self, fr: &mut [u32; 512]) -> u32 {
+        let mut served = 0u32;
+        let mut frames = 0u32;
+        let mut rx = [0u8; 1536];
+        for _ in 0..200_000u32 {
+            let n = self.recv_frame(&mut rx, fr);
+            if n == 0 {
+                cortex_m::asm::delay(8_000);
+                continue;
+            }
+            frames += 1;
+            DIAG[10].store(frames, SeqCst); // any DATA frame seen
+            // Ethernet(14) + IPv4 + UDP(8) + DHCP(240 fixed+magic).
+            if n < 282 || rx[12] != 0x08 || rx[13] != 0x00 {
+                continue;
+            }
+            let ihl = (rx[14] & 0x0f) as usize * 4;
+            if rx[14 + 9] != 17 {
+                continue; // not UDP
+            }
+            let udp = 14 + ihl;
+            let dport = ((rx[udp + 2] as u16) << 8) | rx[udp + 3] as u16;
+            if dport != 67 || rx[udp + 8] != 1 {
+                continue; // not a DHCP BOOTREQUEST
+            }
+            let dh = udp + 8;
+            let mut cmac = [0u8; 6];
+            cmac.copy_from_slice(&rx[dh + 28..dh + 34]);
+            let xid = [rx[dh + 4], rx[dh + 5], rx[dh + 6], rx[dh + 7]];
+            // DHCP message-type option (53): 1=DISCOVER, 3=REQUEST.
+            let mut msgtype = 0u8;
+            let mut o = dh + 240;
+            while o + 1 < n {
+                let code = rx[o];
+                if code == 255 {
+                    break;
+                }
+                if code == 0 {
+                    o += 1;
+                    continue;
+                }
+                if code == 53 && rx[o + 1] >= 1 {
+                    msgtype = rx[o + 2];
+                }
+                o += 2 + rx[o + 1] as usize;
+            }
+            DIAG[11].store(0xD000_0000 | msgtype as u32, SeqCst); // DHCP msg type seen
+            let reply_type = match msgtype {
+                1 => 2u8, // DISCOVER -> OFFER
+                3 => 5u8, // REQUEST -> ACK
+                _ => continue,
+            };
+            // Build Ethernet + IPv4 + UDP + DHCP reply.
+            let mut tx = [0u8; 342];
+            tx[0..6].copy_from_slice(&[0xff; 6]); // L2 broadcast: client has no IP yet
+            tx[6..12].copy_from_slice(&self.mac); // src = us
+            tx[12..14].copy_from_slice(&[0x08, 0x00]);
+            tx[14] = 0x45; // IPv4, IHL 5
+            tx[22] = 64; // TTL
+            tx[23] = 17; // UDP
+            tx[26..30].copy_from_slice(&[192, 168, 4, 1]); // src IP
+            tx[30..34].copy_from_slice(&[255, 255, 255, 255]); // dst = broadcast
+            tx[34..36].copy_from_slice(&[0, 67]); // UDP src 67
+            tx[36..38].copy_from_slice(&[0, 68]); // UDP dst 68
+            let d = 42;
+            tx[d] = 2; // BOOTREPLY
+            tx[d + 1] = 1; // htype ethernet
+            tx[d + 2] = 6; // hlen
+            tx[d + 4..d + 8].copy_from_slice(&xid);
+            tx[d + 16..d + 20].copy_from_slice(&[192, 168, 4, 2]); // yiaddr
+            tx[d + 20..d + 24].copy_from_slice(&[192, 168, 4, 1]); // siaddr
+            tx[d + 28..d + 34].copy_from_slice(&cmac); // chaddr
+            tx[d + 236..d + 240].copy_from_slice(&[99, 130, 83, 99]); // magic
+            let mut p = d + 240;
+            let opts: [&[u8]; 6] = [
+                &[53, 1, reply_type],
+                &[54, 4, 192, 168, 4, 1],       // server id
+                &[51, 4, 0, 1, 0x51, 0x80],     // lease 86400 s
+                &[1, 4, 255, 255, 255, 0],      // subnet mask
+                &[3, 4, 192, 168, 4, 1],        // router
+                &[6, 4, 192, 168, 4, 1],        // DNS
+            ];
+            for opt in opts {
+                tx[p..p + opt.len()].copy_from_slice(opt);
+                p += opt.len();
+            }
+            tx[p] = 255; // end
+            p += 1;
+            let flen = p;
+            tx[16..18].copy_from_slice(&((flen - 14) as u16).to_be_bytes()); // IP total len
+            tx[38..40].copy_from_slice(&((flen - 34) as u16).to_be_bytes()); // UDP len
+            let ck = Self::ip_checksum(&tx[14..34]);
+            tx[24..26].copy_from_slice(&ck.to_be_bytes());
+            if served == 0 {
+                // Capture the first OFFER we send, so we can decode + verify it.
+                for (k, slot) in DATA_FRAME.iter().enumerate() {
+                    let mut w = 0u32;
+                    for b in 0..4 {
+                        let idx = k * 4 + b;
+                        if idx < flen {
+                            w |= (tx[idx] as u32) << (8 * b);
+                        }
+                    }
+                    slot.store(w, SeqCst);
+                }
+            }
+            self.send_frame(&tx[..flen], fr);
+            served += 1;
+            DIAG[12].store(served, SeqCst);
+            if reply_type == 5 {
+                return served; // ACK sent -- the client now has its lease
+            }
+        }
+        served
     }
 
     /// Read F2 frames for a few seconds and count channel-2 (DATA) frames --
@@ -937,6 +1071,12 @@ impl idl::InOrderRp235xCyw43Impl for ServerImpl {
     ) -> Result<u32, RequestError<Cyw43Error>> {
         Ok(self.wifi.data_test(&mut self.fr))
     }
+    fn dhcp(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<Cyw43Error>> {
+        Ok(self.wifi.dhcp_serve(&mut self.fr))
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {
@@ -960,9 +1100,14 @@ fn main() -> ! {
         }
     };
     let mut server = ServerImpl { wifi, fr };
-    let mut incoming = [0u8; idl::INCOMING_SIZE];
+    // Provisioning mode: bring the SoftAP up and serve DHCP continuously, so a
+    // joining client always gets a lease (192.168.4.2) regardless of when it
+    // retries. (Idol serving is suspended while provisioning; the probe stays
+    // free for live DIAG reads.)
+    server.wifi.ap_start(&mut server.fr);
+    let _ = &idl::INCOMING_SIZE;
     loop {
-        idol_runtime::dispatch(&mut incoming, &mut server);
+        server.wifi.dhcp_serve(&mut server.fr);
     }
 }
 

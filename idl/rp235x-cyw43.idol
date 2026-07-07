@@ -37,5 +37,9 @@ Interface(
             description: "TX self-test: send a gratuitous ARP over the DATA channel; returns 1 if accepted.",
             reply: Result(ok: "u32", err: CLike("Cyw43Error")),
         ),
+        "dhcp": (
+            description: "Run a minimal DHCP server (~15s) leasing the joining client 192.168.4.2; returns replies sent.",
+            reply: Result(ok: "u32", err: CLike("Cyw43Error")),
+        ),
     },
 )
