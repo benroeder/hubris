@@ -14,6 +14,10 @@
 
 use core::sync::atomic::Ordering::SeqCst;
 
+use cyw43_portal::{
+    Leases, build_dhcp_reply, build_dns_reply, http_request_len, ip_checksum,
+    is_dhcp_request, parse_creds,
+};
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{dhcpv4, tcp, udp};
@@ -112,124 +116,6 @@ impl Device for Cyw43Device<'_> {
     }
 }
 
-/// DHCP lease table: client MAC per pool slot; IP = 192.168.4.(2 + slot).
-struct Leases {
-    macs: [[u8; 6]; 8],
-    count: u8,
-}
-
-impl Leases {
-    fn ip_for(&mut self, mac: &[u8; 6]) -> u8 {
-        // Known MAC -> its existing slot (idempotent across DISCOVER/REQUEST).
-        for (i, m) in self.macs.iter().enumerate() {
-            if m == mac {
-                return 2 + i as u8;
-            }
-        }
-        // New MAC -> next slot round-robin, evicting the oldest when full. Keeps
-        // all 8 pool IPs distinct; only >8 simultaneous clients recycle a slot
-        // (fine for a provisioning AP), instead of collapsing onto .9.
-        let slot = (self.count as usize) % self.macs.len();
-        self.macs[slot] = *mac;
-        self.count = self.count.wrapping_add(1);
-        2 + slot as u8
-    }
-}
-
-/// Build a DHCP reply *payload* (BOOTP + magic + options) into `out`.
-/// smoltcp wraps it in UDP/IP/Ethernet, so no headers/checksums here.
-/// Returns the payload length, or None if the request is not a BOOTREQUEST.
-fn build_dhcp_reply(
-    req: &[u8],
-    out: &mut [u8],
-    leases: &mut Leases,
-) -> Option<usize> {
-    // Fixed BOOTP section is 236 bytes, then 4-byte magic, then options.
-    if req.len() < 240 || req[0] != 1 {
-        return None; // not a BOOTREQUEST
-    }
-    // DHCP message type (option 53): 1=DISCOVER -> OFFER(2), 3=REQUEST -> ACK(5).
-    let mut msgtype = 0u8;
-    let mut o = 240;
-    while o + 1 < req.len() {
-        let code = req[o];
-        if code == 255 {
-            break;
-        }
-        if code == 0 {
-            o += 1;
-            continue;
-        }
-        let len = req[o + 1] as usize;
-        if code == 53 && len >= 1 && o + 2 < req.len() {
-            msgtype = req[o + 2];
-        }
-        o += 2 + len;
-    }
-    let reply_type = match msgtype {
-        1 => 2, // DISCOVER -> OFFER
-        3 => 5, // REQUEST  -> ACK
-        _ => return None,
-    };
-    let mut cmac = [0u8; 6];
-    cmac.copy_from_slice(&req[28..34]);
-    let yip = leases.ip_for(&cmac);
-
-    out[..240].fill(0);
-    out[0] = 2; // op = BOOTREPLY
-    out[1] = 1; // htype ethernet
-    out[2] = 6; // hlen
-    out[4..8].copy_from_slice(&req[4..8]); // xid echo
-    out[16..20].copy_from_slice(&[192, 168, 4, yip]); // yiaddr
-    out[20..24].copy_from_slice(&[192, 168, 4, 1]); // siaddr
-    out[28..34].copy_from_slice(&cmac); // chaddr
-    out[236..240].copy_from_slice(&[99, 130, 83, 99]); // magic cookie
-
-    let opts: [&[u8]; 7] = [
-        &[53, 1, reply_type],
-        &[54, 4, 192, 168, 4, 1],          // server id
-        &[51, 4, 0, 1, 0x51, 0x80],        // lease 86400 s
-        &[1, 4, 255, 255, 255, 0],         // subnet mask
-        &[3, 4, 192, 168, 4, 1],           // router
-        &[6, 4, 192, 168, 4, 1],           // DNS
-        b"\x72\x16http://192.168.4.1/api", // option 114 (RFC 8910)
-    ];
-    let mut p = 240;
-    for opt in opts {
-        out[p..p + opt.len()].copy_from_slice(opt);
-        p += opt.len();
-    }
-    out[p] = 255;
-    p += 1;
-    Some(p)
-}
-
-/// True if the frame is a DHCP BOOTREQUEST (IPv4 / UDP / dst port 67).
-fn is_dhcp_request(f: &[u8]) -> bool {
-    if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[14 + 9] != 17 {
-        return false;
-    }
-    let udp = 14 + (f[14] & 0x0f) as usize * 4;
-    if udp + 4 > f.len() {
-        return false;
-    }
-    (((f[udp + 2] as u16) << 8) | f[udp + 3] as u16) == 67
-}
-
-/// 1's-complement IP header checksum.
-fn ip_checksum(hdr: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < hdr.len() {
-        sum += ((hdr[i] as u32) << 8) | hdr[i + 1] as u32;
-        i += 2;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 /// Serve a DHCP BOOTREQUEST: build the full OFFER/ACK frame (Ethernet + IP + UDP
 /// + DHCP payload) and L2/L3-broadcast it (the client has no IP yet). This is the
 /// frame-level DHCP server smoltcp cannot provide.
@@ -267,54 +153,6 @@ fn handle_dhcp(
     let ck = ip_checksum(&tx[14..34]);
     tx[24..26].copy_from_slice(&ck.to_be_bytes());
     wifi.send_frame(&tx[..flen], fr);
-}
-
-/// Captive-portal DNS: answer every A query with 192.168.4.1 (and empty for
-/// non-A) so all lookups resolve to us. Builds the DNS payload only; smoltcp
-/// wraps UDP/IP/Ethernet. Returns the reply length.
-fn build_dns_reply(q: &[u8], out: &mut [u8]) -> Option<usize> {
-    if q.len() < 12 {
-        return None;
-    }
-    // Walk the question name (labels terminated by a 0 byte).
-    let qstart = 12;
-    let mut p = qstart;
-    while p < q.len() && q[p] != 0 {
-        p += 1 + q[p] as usize;
-    }
-    if p + 5 > q.len() {
-        return None;
-    }
-    let qtype = ((q[p + 1] as u16) << 8) | q[p + 2] as u16;
-    let qlen = (p + 5) - qstart; // name + null + qtype(2) + qclass(2)
-    let is_a = qtype == 1;
-
-    // Bound the whole reply against the output buffer BEFORE writing. A crafted
-    // query whose name fills the packet would otherwise push the 16-byte A-record
-    // past `out` and fault the task -- remotely triggerable on :53.
-    let reply_len = 12 + qlen + if is_a { 16 } else { 0 };
-    if reply_len > out.len() {
-        return None;
-    }
-
-    out[0..2].copy_from_slice(&q[0..2]); // id echo
-    out[2..4].copy_from_slice(&[0x81, 0x80]); // response, RA, no error
-    out[4..6].copy_from_slice(&[0, 1]); // qdcount 1
-    out[6..8].copy_from_slice(&[0, if is_a { 1 } else { 0 }]); // ancount
-    out[8..12].copy_from_slice(&[0, 0, 0, 0]); // ns/ar count 0
-    out[12..12 + qlen].copy_from_slice(&q[qstart..qstart + qlen]); // echo question
-    let mut len = 12 + qlen;
-    if is_a {
-        let a = len;
-        out[a..a + 2].copy_from_slice(&[0xc0, 0x0c]); // name ptr -> offset 12
-        out[a + 2..a + 4].copy_from_slice(&[0, 1]); // type A
-        out[a + 4..a + 6].copy_from_slice(&[0, 1]); // class IN
-        out[a + 6..a + 10].copy_from_slice(&[0, 0, 0, 60]); // TTL 60
-        out[a + 10..a + 12].copy_from_slice(&[0, 4]); // rdlength
-        out[a + 12..a + 16].copy_from_slice(&[192, 168, 4, 1]); // A = us
-        len = a + 16;
-    }
-    Some(len)
 }
 
 const HTTP_OK_HTML: &[u8] =
@@ -364,39 +202,6 @@ const CONNECTING_BODY: &[u8] = b"<!DOCTYPE html><html><head><meta name=viewport 
 
 const API_JSON: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: application/captive+json\r\nConnection: close\r\n\r\n{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}";
 
-fn hexval(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => 0,
-    }
-}
-
-/// URL-decode `src` into `dst` ('+' -> space, %XX -> byte); returns the length.
-fn urldecode(src: &[u8], dst: &mut [u8]) -> usize {
-    let mut n = 0;
-    let mut i = 0;
-    while i < src.len() && n < dst.len() {
-        match src[i] {
-            b'+' => {
-                dst[n] = b' ';
-                i += 1;
-            }
-            b'%' if i + 2 < src.len() => {
-                dst[n] = (hexval(src[i + 1]) << 4) | hexval(src[i + 2]);
-                i += 3;
-            }
-            c => {
-                dst[n] = c;
-                i += 1;
-            }
-        }
-        n += 1;
-    }
-    n
-}
-
 /// Store the submitted SSID + password into the CREDS static for the STA join.
 fn store_creds(ssid: &[u8], pass: &[u8]) {
     let sl = ssid.len().min(32);
@@ -431,75 +236,11 @@ fn handle_post(req: &[u8]) -> bool {
         }
         i += 1;
     }
-    let mut ssid = [0u8; 32];
-    let mut sl = 0;
-    let mut pass = [0u8; 64];
-    let mut pl = 0;
-    let mut got = false;
-    for field in body.split(|&b| b == b'&') {
-        if let Some(eq) = field.iter().position(|&b| b == b'=') {
-            match &field[..eq] {
-                b"ssid" => {
-                    sl = urldecode(&field[eq + 1..], &mut ssid);
-                    got = true;
-                }
-                b"password" => pl = urldecode(&field[eq + 1..], &mut pass),
-                _ => {}
-            }
-        }
-    }
-    if got {
-        store_creds(&ssid[..sl], &pass[..pl]);
-    }
-    got
-}
-
-/// Case-insensitively find `Content-Length:` in the header block and parse it.
-fn content_length(hdrs: &[u8]) -> usize {
-    let needle = b"content-length:";
-    let last = hdrs.len().saturating_sub(needle.len());
-    'scan: for i in 0..=last {
-        for (j, &nc) in needle.iter().enumerate() {
-            let c = hdrs[i + j];
-            let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
-            if lc != nc {
-                continue 'scan;
-            }
-        }
-        let mut k = i + needle.len();
-        while k < hdrs.len() && hdrs[k] == b' ' {
-            k += 1;
-        }
-        let mut n = 0usize;
-        while k < hdrs.len() && hdrs[k].is_ascii_digit() {
-            n = n * 10 + (hdrs[k] - b'0') as usize;
-            k += 1;
-        }
-        return n;
-    }
-    0
-}
-
-/// If `data` holds a COMPLETE HTTP request, return its total byte length; else
-/// None so the caller waits for more (avoids parsing a truncated header/body --
-/// e.g. a POST whose credential body lands in a later TCP segment).
-fn http_request_len(data: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    let hdr_end = loop {
-        if i + 4 > data.len() {
-            return None; // headers not yet terminated
-        }
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            break i + 4;
-        }
-        i += 1;
+    let Some(c) = parse_creds(body) else {
+        return false;
     };
-    if data.starts_with(b"POST ") {
-        let total = hdr_end + content_length(&data[..hdr_end]);
-        (data.len() >= total).then_some(total)
-    } else {
-        Some(hdr_end)
-    }
+    store_creds(&c.ssid[..c.ssid_len], &c.pass[..c.pass_len]);
+    true
 }
 
 /// Serve one pooled HTTP connection: (re-)listen when closed; respond only once
@@ -554,10 +295,7 @@ pub fn run_portal(wifi: &mut Cyw43, fr: &mut [u32; 512]) -> ! {
     let mut device = Cyw43Device {
         wifi,
         fr,
-        leases: Leases {
-            macs: [[0; 6]; 8],
-            count: 0,
-        },
+        leases: Leases::new(),
         sta_mode: false,
     };
 

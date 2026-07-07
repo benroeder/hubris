@@ -923,6 +923,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyw43-portal"
+version = "0.1.0"
+
+[[package]]
 name = "darling"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2266,6 +2270,7 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "counters",
+ "cyw43-portal",
  "drv-auxflash-api",
  "drv-rp235x-cyw43-api",
  "idol",
