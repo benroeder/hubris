@@ -118,9 +118,6 @@ struct Cyw43 {
     /// gSPI CS-low settle delay (cycles). Large + safe during bring-up, then
     /// dropped for the runtime loop so it keeps up with client packet bursts.
     settle: u32,
-    /// DHCP lease table: client MAC per pool slot; IP = 192.168.4.(2 + slot).
-    leases: [[u8; 6]; 8],
-    lease_count: u8,
     /// BDC interface index for TX frames: 1 = AP (portal), 0 = STA (after join).
     tx_iface: u32,
 }
@@ -407,8 +404,6 @@ impl Cyw43 {
             ssid: [0; 32],
             ssid_len: 0,
             settle: 30_000, // conservative during bring-up (firmware upload)
-            leases: [[0; 6]; 8],
-            lease_count: 0,
             tx_iface: 1, // AP interface until the STA join switches it to 0
         };
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
