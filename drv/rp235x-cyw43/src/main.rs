@@ -99,6 +99,14 @@ const SOCSRAM_WRAP: u32 = 0x1810_4000;
 const SOCSRAM_BASE: u32 = 0x1800_4000;
 const RAM_SIZE: u32 = 0x8_0000;
 
+// WLC ioctl command numbers (Broadcom WLC API), used by the STA join.
+const WLC_SET_INFRA: u32 = 20;
+const WLC_SET_AUTH: u32 = 22;
+const WLC_SET_SSID: u32 = 26;
+const WLC_SET_WSEC: u32 = 134;
+const WLC_SET_WPA_AUTH: u32 = 165;
+const WLC_SET_WSEC_PMK: u32 = 268;
+
 struct Cyw43 {
     pio: rp235x_pac::PIO2,
     sio: rp235x_pac::SIO,
@@ -888,10 +896,10 @@ impl Cyw43 {
         self.do_ioctl_b(2, 0x107, 61, 0, &sw, 23, fr);
 
         // Security + auth (all STA iface 0).
-        self.do_ioctl(134, 62, 0, &[0x04], 4, fr); // WLC_SET_WSEC = WPA
-        self.do_ioctl(20, 63, 0, &[1], 4, fr); // WLC_SET_INFRA = 1
-        self.do_ioctl(22, 64, 0, &[0], 4, fr); // WLC_SET_AUTH = open
-        self.do_ioctl(165, 65, 0, &[0x80], 4, fr); // WLC_SET_WPA_AUTH = WPA2-PSK
+        self.do_ioctl(WLC_SET_WSEC, 62, 0, &[0x04], 4, fr); // WPA
+        self.do_ioctl(WLC_SET_INFRA, 63, 0, &[1], 4, fr);
+        self.do_ioctl(WLC_SET_AUTH, 64, 0, &[0], 4, fr); // open
+        self.do_ioctl(WLC_SET_WPA_AUTH, 65, 0, &[0x80], 4, fr); // WPA2-PSK
 
         // Passphrase: wsec_pmk_t = key_len(u16) + flags(u16=1 passphrase) + key[64].
         let mut pmk = [0u32; 17];
@@ -899,7 +907,7 @@ impl Cyw43 {
         for i in 0..pl.min(64) {
             pmk[1 + i / 4] |= (pass[i] as u32) << (8 * (i % 4));
         }
-        self.do_ioctl(268, 66, 0, &pmk, 68, fr); // WLC_SET_WSEC_PMK
+        self.do_ioctl(WLC_SET_WSEC_PMK, 66, 0, &pmk, 68, fr);
 
         // Join: wl_ssid_t = ssid_len(u32) + ssid[32].
         let mut js = [0u32; 9];
@@ -907,7 +915,7 @@ impl Cyw43 {
         for i in 0..sl.min(32) {
             js[1 + i / 4] |= (ssid[i] as u32) << (8 * (i % 4));
         }
-        self.do_ioctl(26, 67, 0, &js, 36, fr); // WLC_SET_SSID (join)
+        self.do_ioctl(WLC_SET_SSID, 67, 0, &js, 36, fr); // join
 
         // Watch the async join events (enabled by scan's event_msgs) for an
         // authoritative result instead of racing the deauth with a BSSID poll:
