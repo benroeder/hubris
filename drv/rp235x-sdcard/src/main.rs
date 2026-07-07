@@ -10,7 +10,10 @@
 //! * `init` runs the standard SD SPI-mode power-on handshake
 //!   (CMD0 -> CMD8 -> ACMD41 -> CMD58) and records the card kind;
 //! * `read_block` reads one 512-byte block into a write lease (same lease
-//!   idiom as the flash driver's `read`).
+//!   idiom as the flash driver's `read`);
+//! * `write_block` programs one 512-byte block from a read lease (CMD24
+//!   single-block write; same read-lease idiom as the flash driver's
+//!   `program`).
 //!
 //! Pins (assumed; confirmed on hardware at bring-up): SPI1 funcsel 1 on
 //! SCK=GP10, MOSI/TX=GP11, MISO/RX=GP12. CS=GP13 is driven MANUALLY as a SIO
@@ -27,7 +30,7 @@
 
 use drv_rp235x_sdcard_api::{STATUS_CCS, STATUS_V2, SdError};
 use drv_rp235x_sys_api::{self as sys_api, Rp235xSys};
-use idol_runtime::{Leased, LenLimit, RequestError, W};
+use idol_runtime::{Leased, LenLimit, R, RequestError, W};
 use userlib::{RecvMessage, task_slot};
 
 task_slot!(SYS, sys);
@@ -77,6 +80,11 @@ const MS_CYCLES: u32 = 150_000;
 /// Data-start-token poll budget for `read_block` (each iteration is one byte
 /// exchange; the card asserts the token within a few hundred bytes).
 const TOKEN_POLLS: u32 = 100_000;
+/// Busy-line poll budget for `write_block`. The card holds MISO low while it
+/// programs the block, which can take many milliseconds. At DATA speed one
+/// byte exchange is ~1.3 us, so this budget covers a couple of seconds --
+/// comfortably above the SD spec's single-block write ceiling.
+const WRITE_BUSY: u32 = 2_000_000;
 
 /// One 512-byte SD block.
 const BLOCK_LEN: usize = 512;
@@ -359,6 +367,75 @@ impl idl::InOrderRp235xSdcardImpl for ServerImpl {
         let n = dest.len().min(BLOCK_LEN);
         dest.write_range(0..n, &buf[..n])
             .map_err(|_| RequestError::went_away())?;
+        Ok(())
+    }
+
+    fn write_block(
+        &mut self,
+        _: &RecvMessage,
+        block: u32,
+        src: LenLimit<Leased<R, [u8]>, BLOCK_LEN>,
+    ) -> Result<(), RequestError<SdError>> {
+        if !self.ready {
+            return Err(SdError::NotInitialized.into());
+        }
+
+        // Pull the client's bytes into a local block buffer, zero-padding a
+        // short lease out to the full 512 (mirrors the flash driver's
+        // read-lease `program`).
+        let mut buf = [0u8; BLOCK_LEN];
+        let n = src.len().min(BLOCK_LEN);
+        src.read_range(0..n, &mut buf[..n])
+            .map_err(|_| RequestError::went_away())?;
+
+        // SDHC/SDXC address by block; SDSC by byte (same rule as read_block).
+        let addr = if self.ccs {
+            block
+        } else {
+            block.wrapping_mul(BLOCK_LEN as u32)
+        };
+
+        self.cs_low();
+        // CMD24: WRITE_BLOCK.
+        if self.command(24, addr, 0x01) != 0x00 {
+            self.cs_high();
+            return Err(SdError::Cmd.into());
+        }
+
+        // One gap byte, the data-start token, the 512-byte payload, then two
+        // dummy CRC bytes (SPI-mode CRC is off by default).
+        self.xfer(FILLER);
+        self.xfer(TOKEN_START);
+        for &b in buf.iter() {
+            self.xfer(b);
+        }
+        self.xfer(FILLER);
+        self.xfer(FILLER);
+
+        // Data-response byte: the low five bits are `0bxxx0_0101` (0x05) when
+        // the card accepts the block; anything else is a CRC/write error.
+        let resp = self.read_byte();
+        if resp & 0x1F != 0x05 {
+            self.cs_high();
+            return Err(SdError::DataError.into());
+        }
+
+        // The card holds MISO low (0x00) while it programs the block. Poll in
+        // a bounded loop until it releases the busy line (a non-zero byte).
+        let mut done = false;
+        for _ in 0..WRITE_BUSY {
+            if self.read_byte() != 0x00 {
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            self.cs_high();
+            return Err(SdError::Timeout.into());
+        }
+
+        self.cs_high();
+        self.xfer(FILLER);
         Ok(())
     }
 }

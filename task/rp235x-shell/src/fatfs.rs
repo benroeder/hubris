@@ -2,13 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Read-only FAT filesystem layer over the raw microSD block device.
+//! FAT filesystem layer over the raw microSD block device.
 //!
 //! Bridges embedded-sdmmc's `BlockDevice`/`TimeSource` traits onto the
 //! `Rp235xSdcard` Idol client, which serves exactly one 512-byte block per
-//! IPC (the same lease idiom as the flash driver's `read`). READ-ONLY: the
-//! `write` half of `BlockDevice` returns `Unsupported`, so no FAT mutation can
-//! ever reach the card.
+//! IPC (the same lease idiom as the flash driver's `read`/`program`). Both
+//! halves of `BlockDevice` are wired: `read` fans out to `read_block` and
+//! `write` to `write_block`, so embedded-sdmmc can mutate the FAT.
 
 use drv_rp235x_sdcard_api::Rp235xSdcard;
 use embedded_sdmmc::{
@@ -19,10 +19,8 @@ use embedded_sdmmc::{
 /// requires `Debug`.
 #[derive(Debug)]
 pub enum Error {
-    /// An underlying sdcard IPC `read_block` failed.
+    /// An underlying sdcard IPC `read_block`/`write_block` failed.
     Io,
-    /// Writes are not implemented -- this is a read-only mount.
-    Unsupported,
 }
 
 /// Presents the sdcard Idol client as an embedded-sdmmc `BlockDevice`.
@@ -58,11 +56,16 @@ impl BlockDevice for SdBlockDevice {
 
     fn write(
         &self,
-        _blocks: &[Block],
-        _start_block_idx: BlockIdx,
+        blocks: &[Block],
+        start_block_idx: BlockIdx,
     ) -> Result<(), Self::Error> {
-        // Read-only: refuse every write so embedded-sdmmc cannot dirty the card.
-        Err(Error::Unsupported)
+        for (i, block) in blocks.iter().enumerate() {
+            let lba = start_block_idx.0 + i as u32;
+            self.sdcard
+                .write_block(lba, &block.contents)
+                .map_err(|_| Error::Io)?;
+        }
+        Ok(())
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {

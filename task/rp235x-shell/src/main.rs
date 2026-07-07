@@ -124,7 +124,9 @@ const HELP_SDCARD: &[u8] = b"  sd init               run the SD SPI-mode init ha
 #[cfg(feature = "fat")]
 const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (name + size)\r\n\
   sd cat <name>         print a file from the FAT root directory\r\n\
-  sd df                 FAT volume total/used/free space (from BPB + FSInfo)\r\n";
+  sd df                 FAT volume total/used/free space (from BPB + FSInfo)\r\n\
+  sd write <name> <text>  create/truncate <name> in the root dir; write <text>\r\n\
+  sd rm <name>          delete <name> from the FAT root directory\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -285,7 +287,7 @@ impl Shell {
                 words.next(),
             ),
             #[cfg(feature = "sdcard")]
-            "sd" => self.cmd_sd(words.next(), words.next(), words.next()),
+            "sd" => self.cmd_sd(line, words.next(), words.next(), words.next()),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -1748,7 +1750,14 @@ impl Shell {
     /// ASCII runs (>=4 bytes) -- a way to spot a text message on a formatted
     /// card with no filesystem. Block numbers are plain decimals (like `rgb`).
     #[cfg(feature = "sdcard")]
-    fn cmd_sd(&mut self, verb: Option<&str>, a: Option<&str>, b: Option<&str>) {
+    fn cmd_sd(
+        &mut self,
+        line: &str,
+        verb: Option<&str>,
+        a: Option<&str>,
+        b: Option<&str>,
+    ) {
+        let _ = line;
         match verb {
             Some("init") => match self.sdcard.init() {
                 Ok(status) => {
@@ -1859,12 +1868,25 @@ impl Shell {
             Some("cat") => self.fat_cat(a),
             #[cfg(feature = "fat")]
             Some("df") => self.fat_df(),
+            #[cfg(feature = "fat")]
+            Some("write") => {
+                // "sd write <NAME> <text...>": NAME is the first token after
+                // "write", the file body is the rest of the line verbatim.
+                let rest = subcommand_rest(line, "write");
+                let mut it = rest.splitn(2, char::is_whitespace);
+                let name = it.next().unwrap_or("");
+                let text = it.next().unwrap_or("").trim_start();
+                self.fat_write(name, text);
+            }
+            #[cfg(feature = "fat")]
+            Some("rm") => self.fat_rm(a),
             _ => {
                 self.out.put(
                     b"usage: sd init | read <block> | find <start> <count>",
                 );
                 #[cfg(feature = "fat")]
-                self.out.put(b" | ls | cat <name> | df");
+                self.out
+                    .put(b" | ls | cat <name> | df | write <name> <text> | rm <name>");
                 self.out.put(b"\r\n");
             }
         }
@@ -1972,6 +1994,95 @@ impl Shell {
             }
         }
         self.out.put(b"\r\n");
+    }
+
+    /// `sd write <NAME> <text...>`: create-or-truncate NAME in the FAT root
+    /// directory and write `text` (the rest of the command line) as its body.
+    /// The handle is closed before returning so embedded-sdmmc flushes the
+    /// directory entry + FAT to the card. UNPROVEN on hardware.
+    #[cfg(feature = "fat")]
+    fn fat_write(&mut self, name: &str, text: &str) {
+        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+        if name.is_empty() {
+            self.out.put(b"usage: sd write <name> <text...>\r\n");
+            return;
+        }
+        let vm = VolumeManager::new(
+            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
+            fatfs::DummyTime,
+        );
+        let volume = match vm.open_volume(VolumeIdx(0)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.out.put(b"sd write: open volume failed\r\n");
+                return;
+            }
+        };
+        let root = match volume.open_root_dir() {
+            Ok(d) => d,
+            Err(_) => {
+                self.out.put(b"sd write: open root dir failed\r\n");
+                return;
+            }
+        };
+        let file = match root
+            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                self.out.put(b"sd write: open file failed\r\n");
+                return;
+            }
+        };
+        let bytes = text.as_bytes();
+        if file.write(bytes).is_err() {
+            self.out.put(b"sd write: write error\r\n");
+            // Best-effort: release the handle (may itself fail on a bad card).
+            let _ = file.close();
+            return;
+        }
+        // close() flushes the metadata (directory entry + FAT) and commits the
+        // write; without it the data would not be persisted.
+        if file.close().is_err() {
+            self.out.put(b"sd write: flush/close error\r\n");
+            return;
+        }
+        self.out.put(b"wrote ");
+        self.out.put_u32(bytes.len() as u32);
+        self.out.put(b" bytes\r\n");
+    }
+
+    /// `sd rm <NAME>`: delete NAME from the FAT root directory. UNPROVEN on
+    /// hardware.
+    #[cfg(feature = "fat")]
+    fn fat_rm(&mut self, name: Option<&str>) {
+        use embedded_sdmmc::{VolumeIdx, VolumeManager};
+        let Some(name) = name else {
+            self.out.put(b"usage: sd rm <name>\r\n");
+            return;
+        };
+        let vm = VolumeManager::new(
+            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
+            fatfs::DummyTime,
+        );
+        let volume = match vm.open_volume(VolumeIdx(0)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.out.put(b"sd rm: open volume failed\r\n");
+                return;
+            }
+        };
+        let root = match volume.open_root_dir() {
+            Ok(d) => d,
+            Err(_) => {
+                self.out.put(b"sd rm: open root dir failed\r\n");
+                return;
+            }
+        };
+        match root.delete_file_in_dir(name) {
+            Ok(()) => self.out.put(b"removed\r\n"),
+            Err(_) => self.out.put(b"sd rm: delete failed (not found?)\r\n"),
+        }
     }
 
     /// `sd df`: report the FAT volume's total / used / free space. embedded-sdmmc

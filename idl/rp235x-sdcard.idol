@@ -24,5 +24,14 @@ Interface(
             reply: Result(ok: "()", err: CLike("SdError")),
             idempotent: true,
         ),
+        "write_block": (
+            description: "Write exactly one 512-byte block from `src` (CMD24 single-block write). `block` is a logical block number (the driver applies byte vs block addressing per the card kind). A lease shorter than 512 bytes is zero-padded to a full block.",
+            args: { "block": "u32" },
+            leases: {
+                "src": (type: "[u8]", read: true, max_len: Some(512)),
+            },
+            reply: Result(ok: "()", err: CLike("SdError")),
+            idempotent: true,
+        ),
     },
 )

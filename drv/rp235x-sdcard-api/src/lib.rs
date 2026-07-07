@@ -5,7 +5,8 @@
 //! Client API for the RP2350 (RP235x) microSD raw block-device driver.
 //!
 //! RAW BLOCK DEVICE ONLY -- no filesystem. `init` runs the SD SPI-mode
-//! power-on handshake; `read_block` returns one 512-byte block.
+//! power-on handshake; `read_block` returns one 512-byte block; `write_block`
+//! programs one 512-byte block.
 
 #![no_std]
 
