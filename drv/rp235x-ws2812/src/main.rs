@@ -46,6 +46,11 @@ const DIV_INT: u16 = 18;
 /// Fractional part: 0.75 * 256 = 192.
 const DIV_FRAC: u8 = 192;
 
+/// clk_sys cycles to hold the data line low for the WS2812 reset/latch. The
+/// part needs >50 us; 10_000 cycles at 150 MHz is ~67 us. This is a hardware
+/// timing gap, not a scheduling delay, so it's a busy-wait rather than a sleep.
+const RESET_CYCLES: u32 = 10_000;
+
 struct ServerImpl {
     pio: rp235x_pac::PIO0,
 }
@@ -140,8 +145,8 @@ fn setup(p: &rp235x_pac::Peripherals) {
     // colour during boot. Clearing it needs a >50 us low (reset) BEFORE the 0
     // frame -- otherwise the pixel treats the lone word as data for a second
     // (absent) pixel and keeps the garbage. The enabled SM holds the line low,
-    // so sleep 1 ms for a solid reset, then clock the 0 frame to latch off.
-    userlib::hl::sleep_for(1);
+    // so busy-wait one reset period, then clock the 0 frame to latch off.
+    cortex_m::asm::delay(RESET_CYCLES);
     pio.txf(0).write(|w| unsafe { w.bits(0) });
 }
 

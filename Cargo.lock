@@ -2639,6 +2639,7 @@ dependencies = [
 name = "drv-rp235x-ws2812"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
  "counters",
  "drv-rp235x-ws2812-api",
  "idol",
