@@ -87,9 +87,9 @@ task-slots = ["sys"]
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
 priority = 2
-max-sizes = {flash = 8192, ram = 1024}
+max-sizes = {flash = 8192, ram = 16384}
 stacksize = 768
-uses = ["pwm"]
+uses = ["pwm", "dma"]
 start = true
 task-slots = ["sys"]
 

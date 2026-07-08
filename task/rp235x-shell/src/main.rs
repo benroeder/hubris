@@ -126,6 +126,7 @@ const HELP: &[u8] = b"commands:\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
   sine <hz> <ms>        play a sine (PWM-DAC) on the buzzer\r\n\
+  audio <hz> | stop     DMA sine on the jack (GP18, exact pitch, non-blocking)\r\n\
   beep                  short 1 kHz beep\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
@@ -301,6 +302,7 @@ impl Shell {
             "led" => self.cmd_led(words.next(), words.next()),
             "buzzer" => self.cmd_buzzer(words.next(), words.next()),
             "sine" => self.cmd_sine(words.next(), words.next()),
+            "audio" => self.cmd_audio(words.next()),
             "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -498,6 +500,45 @@ impl Shell {
         } else {
             b"sine failed (hz 50-5000)\r\n"
         });
+    }
+
+    /// `audio <hz>` | `audio stop`: DMA-fed continuous sine on the audio jack
+    /// (GP18 = PWM slice 1 chan A). `audio <hz>` routes GP18 to PWM and starts a
+    /// seamless-looping, exact-pitch, non-blocking sine (the DMA ring is paced
+    /// by the slice-1 wrap, so the shell returns immediately and the tone plays
+    /// until `audio stop`). Unlike `sine`, this does not block and the pitch is
+    /// hardware-exact. `audio stop` aborts the DMA and silences the slice.
+    ///
+    /// Same pin/slice as `buzzer`/`sine`, so do not mix with `spi role`/`spi
+    /// bench` in the same session (they reclaim GP18 for SPI0). If BUZZER_SW is
+    /// on, the piezo will also buzz alongside the jack output.
+    fn cmd_audio(&mut self, arg: Option<&str>) {
+        match arg {
+            Some("stop") => {
+                let ok = self.pwm.audio_stop().is_ok();
+                self.out.put(if ok {
+                    b"ok\r\n" as &[u8]
+                } else {
+                    b"audio stop failed\r\n"
+                });
+            }
+            Some(s) => {
+                let Some(freq) = s.parse::<u32>().ok() else {
+                    self.out.put(b"usage: audio <hz> | stop (hz 50-8000)\r\n");
+                    return;
+                };
+                let ok =
+                    self.route_buzzer() && self.pwm.audio_start(freq).is_ok();
+                self.out.put(if ok {
+                    b"ok\r\n" as &[u8]
+                } else {
+                    b"audio failed (hz 50-8000)\r\n"
+                });
+            }
+            None => {
+                self.out.put(b"usage: audio <hz> | stop (hz 50-8000)\r\n");
+            }
+        }
     }
 
     /// `beep`: a default 1 kHz, 200 ms beep on the GP18 buzzer (slice 1).
