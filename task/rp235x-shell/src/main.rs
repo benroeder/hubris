@@ -108,6 +108,8 @@ const MIC_PIN: u8 = 28;
 /// Seengreat push buttons, silk-screened by GPIO. Each wires to GND, so with a
 /// pull-up the pin idles 1 (released) and reads 0 while pressed (active-low).
 const BUTTON_PINS: [u8; 2] = [20, 21];
+/// Default sine frequency for the `audiosel` source picker (GP21 = sine).
+const AUDIO_DEFAULT_HZ: u32 = 440;
 
 const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
@@ -146,6 +148,8 @@ const HELP: &[u8] = b"commands:\r\n\
   sine <hz> <ms>        play a sine (PWM-DAC) on the buzzer\r\n\
   audio <hz> | stop     DMA sine in both ears (GP18/GP19, exact pitch, non-blocking)\r\n\
   audio2 <hzL> <hzR>    DMA stereo sine: left tone on GP18, right on GP19\r\n\
+  passthrough on|off    real-time mic (GP28) -> jack left (GP18); off stops it\r\n\
+  audiosel [secs]       pick jack source with buttons: GP20=mic GP21=sine\r\n\
   beep                  short 1 kHz beep\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
@@ -323,6 +327,7 @@ impl Shell {
             "sine" => self.cmd_sine(words.next(), words.next()),
             "audio" => self.cmd_audio(words.next()),
             "audio2" => self.cmd_audio2(words.next(), words.next()),
+            "passthrough" => self.cmd_passthrough(words.next()),
             "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -333,6 +338,7 @@ impl Shell {
             "temp" => self.cmd_temp(),
             "mic" => self.cmd_mic(words.next()),
             "buttons" => self.cmd_buttons(words.next()),
+            "audiosel" => self.cmd_audiosel(words.next()),
             "adc" => self.cmd_adc(words.next(), words.next()),
             #[cfg(feature = "cyw43")]
             "wifi" => self.cmd_wifi(words.next()),
@@ -534,6 +540,13 @@ impl Shell {
             && self.gpio.set_function(AUDIO_RIGHT_PIN, 4).is_ok()
     }
 
+    /// Prepare the audio-source pins: put the mic pad (GP28) in analog mode and
+    /// route the jack (GP18/19) to PWM. Shared by `passthrough` and `audiosel`.
+    fn prep_audio_source(&mut self) -> bool {
+        let _ = self.gpio.configure_analog(MIC_PIN);
+        self.route_audio_jack()
+    }
+
     /// `audio <hz>` | `audio stop`: DMA-fed continuous sine on the audio jack,
     /// the SAME tone in both ears (GP18 = slice 1 chan A = left, GP19 = chan B
     /// = right). `audio <hz>` routes both pins to PWM and starts a seamless-
@@ -593,6 +606,41 @@ impl Shell {
         } else {
             b"audio2 failed (hz 50-8000 each)\r\n"
         });
+    }
+
+    /// `passthrough on|off`: real-time mic -> jack passthrough. `on` (or bare
+    /// `passthrough`) puts GP28 in analog mode (so the digital pad does not load
+    /// the mic), routes the jack pins to PWM, then arms the ADC-free-run -> DMA
+    /// -> PWM path (`audio_mic_start`): the mic plays out the jack LEFT channel
+    /// (GP18) with zero CPU per sample. MONO -- GP19 (right) stays silent.
+    /// Non-blocking; the DMA runs until `passthrough off` (`audio_mic_stop`,
+    /// which also stops the ADC). Needs the board's Mic_SW jumper on.
+    ///
+    /// Shares slice 1 + DMA ch0 with `audio`/`sine`/`buzzer`, so switching
+    /// between them is clean (each aborts ch0 first). Do not mix with `spi
+    /// role`/`spi bench` (they reclaim GP18 for SPI0).
+    fn cmd_passthrough(&mut self, arg: Option<&str>) {
+        match arg {
+            Some("off") => {
+                let ok = self.pwm.audio_mic_stop().is_ok();
+                self.out.put(if ok {
+                    b"ok\r\n" as &[u8]
+                } else {
+                    b"passthrough off failed\r\n"
+                });
+            }
+            None | Some("on") => {
+                let ok = self.prep_audio_source()
+                    && self.pwm.audio_mic_start().is_ok();
+                self.out.put(if ok {
+                    b"ok (mic -> jack left; passthrough off to stop)\r\n"
+                        as &[u8]
+                } else {
+                    b"passthrough failed\r\n"
+                });
+            }
+            _ => self.out.put(b"usage: passthrough on|off\r\n"),
+        }
     }
 
     /// `beep`: a default 1 kHz, 200 ms beep on the GP18 buzzer (slice 1).
@@ -1532,6 +1580,50 @@ impl Shell {
             });
         }
         self.out.put(b"\r\n");
+    }
+
+    /// `audiosel [secs]`: live audio source picker for the jack. Starts on the
+    /// sine and watches the buttons for `secs` (default 30, on-board tight loop):
+    /// press GP20 to switch the source to the mic passthrough, GP21 back to the
+    /// sine. Both play via DMA (non-blocking) so the button watch stays live;
+    /// each switch aborts + re-arms DMA ch0. Silences everything on exit.
+    fn cmd_audiosel(&mut self, secs: Option<&str>) {
+        let secs = secs
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 120);
+        for &pin in BUTTON_PINS.iter() {
+            let _ = self.gpio.configure_input(pin);
+            let _ = self.gpio.set_pull(pin, drv_rp235x_gpio_api::PULL_UP);
+        }
+        let _ = self.prep_audio_source();
+        // Start on the sine so there is immediate sound.
+        let _ = self.pwm.audio_start(AUDIO_DEFAULT_HZ);
+        self.out.put(b"source: sine  (GP20=mic  GP21=sine)\r\n");
+        let mut last = [1u8; 2];
+        let t0 = sys_get_timer().now;
+        while sys_get_timer().now - t0 < secs * 1000 {
+            for (i, &pin) in BUTTON_PINS.iter().enumerate() {
+                let v = self.gpio.read(pin).unwrap_or(1);
+                if v == 0 && last[i] == 1 {
+                    // Press edge -> switch source (each op aborts + re-arms ch0).
+                    if pin == BUTTON_PINS[0] {
+                        let _ = self.pwm.audio_mic_start();
+                        self.out.put(b"source: mic\r\n");
+                    } else {
+                        let _ = self.pwm.audio_start(AUDIO_DEFAULT_HZ);
+                        self.out.put(b"source: sine\r\n");
+                    }
+                }
+                last[i] = v;
+            }
+            // 1 ms poll: still catches presses, but does not hammer the gpio/timer
+            // servers with back-to-back IPC for the whole (up to 120 s) window.
+            hl::sleep_for(1);
+        }
+        // Stop everything: aborts DMA, stops the ADC free-run, silences slice 1.
+        let _ = self.pwm.audio_mic_stop();
+        self.out.put(b"audiosel done\r\n");
     }
 
     /// `log <count> [secs]`: capstone that COMPOSES four drivers -- ADC (die
