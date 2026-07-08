@@ -5,9 +5,9 @@
 //! ADC driver server for the RP2350 (RP235x).
 //!
 //! One-shot 12-bit conversions behind an Idol interface (`idl/rp235x-adc.idol`).
-//! Channels 0-3 are GPIO26-29. NOTE: no API configures those pads for analog
-//! use yet (which wants OD=1, IE=0) -- reads of 0-3 work but sample the pad
-//! as reset/left, so treat them as approximate until a pad-config op exists.
+//! Channels 0-3 are GPIO26-29. For a clean read, put the pad in analog mode
+//! first (OD=1, IE=0) via the gpio driver's `configure_analog` op; otherwise the
+//! digital pad loads the pin and the read is only approximate.
 //! Channel 4 is the internal temperature sensor (datasheet sec 12.4.6),
 //! whose bias is enabled at init so reads are always settled.
 //!

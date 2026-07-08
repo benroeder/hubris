@@ -84,6 +84,26 @@ impl idl::InOrderRp235xGpioImpl for ServerImpl {
         Ok(())
     }
 
+    fn configure_analog(
+        &mut self,
+        _: &RecvMessage,
+        pin: u8,
+    ) -> Result<(), RequestError<GpioError>> {
+        let p = Self::check(pin)?;
+        // Analog mode for the ADC: disable the output driver (OD=1) AND the input
+        // buffer (IE=0) so the digital pad neither drives nor loads the pin, and
+        // clear the isolation latch. The ADC taps the pin voltage directly.
+        self.pads_bank0
+            .gpio(p)
+            .modify(|_, w| w.od().set_bit().ie().clear_bit().iso().clear_bit());
+        // Disconnect the digital function mux (NULL funcsel = 0x1f).
+        self.io_bank0
+            .gpio(p)
+            .gpio_ctrl()
+            .modify(|_, w| unsafe { w.funcsel().bits(0x1f) });
+        Ok(())
+    }
+
     fn set_high(
         &mut self,
         _: &RecvMessage,
