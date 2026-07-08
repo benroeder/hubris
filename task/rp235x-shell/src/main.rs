@@ -37,6 +37,29 @@ use drv_rp235x_ws2812_api::Rp235xWs2812;
 
 #[cfg(feature = "fat")]
 mod fatfs;
+
+/// Scratch filenames used by the destructive `sd` self-tests. `bench` uses its
+/// own so a `bench` and a `test`/`soak` never collide; `test` and `soak` share
+/// TEST.TMP (they never run at once). Single-sourced so the create, readback
+/// and cleanup paths can never drift apart.
+#[cfg(feature = "fat")]
+const SCRATCH_BENCH: &str = "BENCH.TMP";
+#[cfg(feature = "fat")]
+const SCRATCH_TEST: &str = "TEST.TMP";
+
+/// Why a readback verify failed. Carried out of `read_verify` so the caller can
+/// print its own message in its own words while the byte-checking loop lives in
+/// one place.
+#[cfg(feature = "fat")]
+enum VerifyFail {
+    /// A byte did not match: (absolute file offset, expected, got).
+    Mismatch(u32, u8, u8),
+    /// `File::read` returned an error before EOF.
+    ReadError,
+    /// The file ended early: (bytes actually read, bytes expected).
+    Short(u32, u32),
+}
+
 use drv_rp235x_uart_api::Rp235xUart;
 use task_rp235x_usb_api::UsbCons;
 use userlib::{hl, sys_get_timer, task_slot};
@@ -127,7 +150,9 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd df                 FAT volume total/used/free space (from BPB + FSInfo)\r\n\
   sd write <name> <text>  create/truncate <name> in the root dir; write <text>\r\n\
   sd rm <name>          delete <name> from the FAT root directory\r\n\
-  sd bench [n]          measure raw-read + FS write/read speed (n KiB, default 128)\r\n";
+  sd bench [n]          measure raw-read + FS write/read speed (n KiB, default 128)\r\n\
+  sd test [n]           data-integrity self-test: write/read/verify patterns (n KiB, default 64)\r\n\
+  sd soak [secs]        sustained write/read/verify loop for secs seconds (default 10)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -1883,13 +1908,17 @@ impl Shell {
             Some("rm") => self.fat_rm(a),
             #[cfg(feature = "fat")]
             Some("bench") => self.fat_bench(a),
+            #[cfg(feature = "fat")]
+            Some("test") => self.fat_test(a),
+            #[cfg(feature = "fat")]
+            Some("soak") => self.fat_soak(a),
             _ => {
                 self.out.put(
                     b"usage: sd init | read <block> | find <start> <count>",
                 );
                 #[cfg(feature = "fat")]
                 self.out
-                    .put(b" | ls | cat <name> | df | write <name> <text> | rm <name> | bench [n]");
+                    .put(b" | ls | cat <name> | df | write <name> <text> | rm <name> | bench [n] | test [n] | soak [secs]");
                 self.out.put(b"\r\n");
             }
         }
@@ -1911,10 +1940,23 @@ impl Shell {
         }
     }
 
-    /// `sd ls`: mount FAT volume 0, list the root directory (name + size).
-    /// UNPROVEN on hardware.
+    /// Mount FAT volume 0, open its root directory, and run `f` with it. Every
+    /// `sd` FAT command needs exactly this preamble, so it lives here once: on a
+    /// volume- or root-open failure it prints "<prefix>: open volume failed" /
+    /// "<prefix>: open root dir failed" (the messages each command printed
+    /// inline before) and returns `None`; otherwise it returns `Some(f(...))`.
+    ///
+    /// `f` gets `&mut self` back alongside the borrowed root so a command can
+    /// still write to `self.out` while it works. The block device and time
+    /// source are freshly built from task ids and do not borrow `self`, so the
+    /// reborrow type-checks: the `VolumeManager` (and thus `root`) borrows only
+    /// the locals in this frame, not `self`.
     #[cfg(feature = "fat")]
-    fn fat_ls(&mut self) {
+    fn with_root<R>(
+        &mut self,
+        prefix: &[u8],
+        f: impl FnOnce(&mut Self, &fatfs::FatDir<'_>) -> R,
+    ) -> Option<R> {
         use embedded_sdmmc::{VolumeIdx, VolumeManager};
         let vm = VolumeManager::new(
             fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
@@ -1923,109 +1965,136 @@ impl Shell {
         let volume = match vm.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
             Err(_) => {
-                self.out.put(b"sd ls: open volume failed\r\n");
-                return;
+                self.out.put(prefix);
+                self.out.put(b": open volume failed\r\n");
+                return None;
             }
         };
         let root = match volume.open_root_dir() {
             Ok(d) => d,
             Err(_) => {
-                self.out.put(b"sd ls: open root dir failed\r\n");
-                return;
+                self.out.put(prefix);
+                self.out.put(b": open root dir failed\r\n");
+                return None;
             }
         };
-        let mut count = 0u32;
-        let res = root.iterate_dir(|entry| {
-            // Skip the volume-label / long-file-name pseudo-entries.
-            if entry.attributes.is_volume() {
-                return;
+        Some(f(self, &root))
+    }
+
+    /// Read `file` to EOF, checking every byte against `expect(offset)`. Shared
+    /// by `sd test` and `sd soak`, whose only difference is the expected-byte
+    /// rule. Tracks the absolute file offset so a partial `File::read` is
+    /// handled correctly, and flags a file that ends before `total` bytes.
+    #[cfg(feature = "fat")]
+    fn read_verify(
+        file: &fatfs::FatFile<'_>,
+        total: u32,
+        expect: impl Fn(u32) -> u8,
+    ) -> Result<(), VerifyFail> {
+        let mut rbuf = [0u8; 512];
+        let mut pos: u32 = 0;
+        loop {
+            let got = match file.read(&mut rbuf) {
+                Ok(0) => break,
+                Ok(c) => c,
+                Err(_) => return Err(VerifyFail::ReadError),
+            };
+            for &g in &rbuf[..got] {
+                let exp = expect(pos);
+                if g != exp {
+                    return Err(VerifyFail::Mismatch(pos, exp, g));
+                }
+                pos += 1;
             }
-            // Reassemble the 8.3 short name: BASE[.EXT], trailing `/` for dirs.
-            self.out.put(entry.name.base_name());
-            let ext = entry.name.extension();
-            if !ext.is_empty() {
-                self.out.put(b".");
-                self.out.put(ext);
-            }
-            if entry.attributes.is_directory() {
-                self.out.put(b"/");
-            }
-            self.out.put(b"\t");
-            self.out.put_u32(entry.size);
-            // Last-modified time as "YYYY-MM-DD HH:MM" (from the TimeSource
-            // that stamped the entry when it was written).
-            let t = &entry.mtime;
-            self.out.put(b"\t");
-            self.out.put_u32(1970 + t.year_since_1970 as u32);
-            self.out.put(b"-");
-            self.out.put_pad2(t.zero_indexed_month + 1);
-            self.out.put(b"-");
-            self.out.put_pad2(t.zero_indexed_day + 1);
-            self.out.put(b" ");
-            self.out.put_pad2(t.hours);
-            self.out.put(b":");
-            self.out.put_pad2(t.minutes);
-            self.out.put(b"\r\n");
-            count += 1;
-        });
-        if res.is_err() {
-            self.out.put(b"sd ls: directory read error\r\n");
-        } else if count == 0 {
-            self.out.put(b"(empty)\r\n");
         }
+        if pos != total {
+            return Err(VerifyFail::Short(pos, total));
+        }
+        Ok(())
+    }
+
+    /// `sd ls`: mount FAT volume 0, list the root directory (name + size).
+    /// UNPROVEN on hardware.
+    #[cfg(feature = "fat")]
+    fn fat_ls(&mut self) {
+        self.with_root(b"sd ls", |sh, root| {
+            let mut count = 0u32;
+            let res = root.iterate_dir(|entry| {
+                // Skip the volume-label / long-file-name pseudo-entries.
+                if entry.attributes.is_volume() {
+                    return;
+                }
+                // Reassemble the 8.3 short name: BASE[.EXT], `/` for dirs.
+                sh.out.put(entry.name.base_name());
+                let ext = entry.name.extension();
+                if !ext.is_empty() {
+                    sh.out.put(b".");
+                    sh.out.put(ext);
+                }
+                if entry.attributes.is_directory() {
+                    sh.out.put(b"/");
+                }
+                sh.out.put(b"\t");
+                sh.out.put_u32(entry.size);
+                // Last-modified time as "YYYY-MM-DD HH:MM" (from the TimeSource
+                // that stamped the entry when it was written).
+                let t = &entry.mtime;
+                sh.out.put(b"\t");
+                sh.out.put_u32(1970 + t.year_since_1970 as u32);
+                sh.out.put(b"-");
+                sh.out.put_pad2(t.zero_indexed_month + 1);
+                sh.out.put(b"-");
+                sh.out.put_pad2(t.zero_indexed_day + 1);
+                sh.out.put(b" ");
+                sh.out.put_pad2(t.hours);
+                sh.out.put(b":");
+                sh.out.put_pad2(t.minutes);
+                sh.out.put(b"\r\n");
+                count += 1;
+            });
+            if res.is_err() {
+                sh.out.put(b"sd ls: directory read error\r\n");
+            } else if count == 0 {
+                sh.out.put(b"(empty)\r\n");
+            }
+        });
     }
 
     /// `sd cat <NAME>`: open NAME in the root dir read-only, stream it to the
     /// console until EOF. UNPROVEN on hardware.
     #[cfg(feature = "fat")]
     fn fat_cat(&mut self, name: Option<&str>) {
-        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+        use embedded_sdmmc::Mode;
         let Some(name) = name else {
             self.out.put(b"usage: sd cat <name>\r\n");
             return;
         };
-        let vm = VolumeManager::new(
-            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            Self::fat_time(),
-        );
-        let volume = match vm.open_volume(VolumeIdx(0)) {
-            Ok(v) => v,
-            Err(_) => {
-                self.out.put(b"sd cat: open volume failed\r\n");
-                return;
-            }
-        };
-        let root = match volume.open_root_dir() {
-            Ok(d) => d,
-            Err(_) => {
-                self.out.put(b"sd cat: open root dir failed\r\n");
-                return;
-            }
-        };
-        let file = match root.open_file_in_dir(name, Mode::ReadOnly) {
-            Ok(f) => f,
-            Err(_) => {
-                self.out.put(b"sd cat: file not found\r\n");
-                return;
-            }
-        };
-        // Small on-stack buffer: embedded-sdmmc already keeps one 512-byte
-        // Block on the stack per read, so keep ours modest.
-        let mut buf = [0u8; 64];
-        loop {
-            match file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => self.out.put(&buf[..n]),
+        self.with_root(b"sd cat", |sh, root| {
+            let file = match root.open_file_in_dir(name, Mode::ReadOnly) {
+                Ok(f) => f,
                 Err(_) => {
-                    self.out.put(b"\r\nsd cat: read error\r\n");
+                    sh.out.put(b"sd cat: file not found\r\n");
                     return;
                 }
+            };
+            // Small on-stack buffer: embedded-sdmmc already keeps one 512-byte
+            // Block on the stack per read, so keep ours modest.
+            let mut buf = [0u8; 64];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => sh.out.put(&buf[..n]),
+                    Err(_) => {
+                        sh.out.put(b"\r\nsd cat: read error\r\n");
+                        return;
+                    }
+                }
+                if file.is_eof() {
+                    break;
+                }
             }
-            if file.is_eof() {
-                break;
-            }
-        }
-        self.out.put(b"\r\n");
+            sh.out.put(b"\r\n");
+        });
     }
 
     /// `sd write <NAME> <text...>`: create-or-truncate NAME in the FAT root
@@ -2034,87 +2103,54 @@ impl Shell {
     /// directory entry + FAT to the card. UNPROVEN on hardware.
     #[cfg(feature = "fat")]
     fn fat_write(&mut self, name: &str, text: &str) {
-        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+        use embedded_sdmmc::Mode;
         if name.is_empty() {
             self.out.put(b"usage: sd write <name> <text...>\r\n");
             return;
         }
-        let vm = VolumeManager::new(
-            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            Self::fat_time(),
-        );
-        let volume = match vm.open_volume(VolumeIdx(0)) {
-            Ok(v) => v,
-            Err(_) => {
-                self.out.put(b"sd write: open volume failed\r\n");
+        self.with_root(b"sd write", |sh, root| {
+            let file = match root
+                .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    sh.out.put(b"sd write: open file failed\r\n");
+                    return;
+                }
+            };
+            let bytes = text.as_bytes();
+            if file.write(bytes).is_err() {
+                sh.out.put(b"sd write: write error\r\n");
+                // Best-effort: release the handle (may itself fail).
+                let _ = file.close();
                 return;
             }
-        };
-        let root = match volume.open_root_dir() {
-            Ok(d) => d,
-            Err(_) => {
-                self.out.put(b"sd write: open root dir failed\r\n");
+            // close() flushes the metadata (directory entry + FAT) and commits
+            // the write; without it the data would not be persisted.
+            if file.close().is_err() {
+                sh.out.put(b"sd write: flush/close error\r\n");
                 return;
             }
-        };
-        let file = match root
-            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
-        {
-            Ok(f) => f,
-            Err(_) => {
-                self.out.put(b"sd write: open file failed\r\n");
-                return;
-            }
-        };
-        let bytes = text.as_bytes();
-        if file.write(bytes).is_err() {
-            self.out.put(b"sd write: write error\r\n");
-            // Best-effort: release the handle (may itself fail on a bad card).
-            let _ = file.close();
-            return;
-        }
-        // close() flushes the metadata (directory entry + FAT) and commits the
-        // write; without it the data would not be persisted.
-        if file.close().is_err() {
-            self.out.put(b"sd write: flush/close error\r\n");
-            return;
-        }
-        self.out.put(b"wrote ");
-        self.out.put_u32(bytes.len() as u32);
-        self.out.put(b" bytes\r\n");
+            sh.out.put(b"wrote ");
+            sh.out.put_u32(bytes.len() as u32);
+            sh.out.put(b" bytes\r\n");
+        });
     }
 
     /// `sd rm <NAME>`: delete NAME from the FAT root directory. UNPROVEN on
     /// hardware.
     #[cfg(feature = "fat")]
     fn fat_rm(&mut self, name: Option<&str>) {
-        use embedded_sdmmc::{VolumeIdx, VolumeManager};
         let Some(name) = name else {
             self.out.put(b"usage: sd rm <name>\r\n");
             return;
         };
-        let vm = VolumeManager::new(
-            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            Self::fat_time(),
-        );
-        let volume = match vm.open_volume(VolumeIdx(0)) {
-            Ok(v) => v,
-            Err(_) => {
-                self.out.put(b"sd rm: open volume failed\r\n");
-                return;
+        self.with_root(b"sd rm", |sh, root| {
+            match root.delete_file_in_dir(name) {
+                Ok(()) => sh.out.put(b"removed\r\n"),
+                Err(_) => sh.out.put(b"sd rm: delete failed (not found?)\r\n"),
             }
-        };
-        let root = match volume.open_root_dir() {
-            Ok(d) => d,
-            Err(_) => {
-                self.out.put(b"sd rm: open root dir failed\r\n");
-                return;
-            }
-        };
-        match root.delete_file_in_dir(name) {
-            Ok(()) => self.out.put(b"removed\r\n"),
-            Err(_) => self.out.put(b"sd rm: delete failed (not found?)\r\n"),
-        }
+        });
     }
 
     /// Print one bench line: "<bytes> B in <ms> ms = <KB/s> KB/s". KB/s is
@@ -2156,7 +2192,7 @@ impl Shell {
     /// meaningful when run on a real card.
     #[cfg(feature = "fat")]
     fn fat_bench(&mut self, n_arg: Option<&str>) {
-        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+        use embedded_sdmmc::Mode;
 
         // n = KiB to transfer; each KiB is two 512-byte blocks/writes. Bound it:
         // `total = n * 1024` must stay within u32 (overflow starts at n = 4 Mi),
@@ -2186,95 +2222,384 @@ impl Shell {
         let ms = (sys_get_timer().now - t0) as u32;
         self.bench_kbs(b"raw read: ", total, ms);
 
-        // 2. FS WRITE: BENCH.TMP, n*2 writes of the reused 512-byte buffer.
-        //    close() is inside the timed region (it flushes FAT + dir entry).
-        let vm = VolumeManager::new(
-            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
-            Self::fat_time(),
-        );
-        let volume = match vm.open_volume(VolumeIdx(0)) {
-            Ok(v) => v,
-            Err(_) => {
-                self.out.put(b"sd bench: open volume failed\r\n");
-                return;
-            }
-        };
-        let root = match volume.open_root_dir() {
-            Ok(d) => d,
-            Err(_) => {
-                self.out.put(b"sd bench: open root dir failed\r\n");
-                return;
-            }
-        };
-
-        let write_err = {
-            let file = match root
-                .open_file_in_dir("BENCH.TMP", Mode::ReadWriteCreateOrTruncate)
-            {
-                Ok(f) => f,
-                Err(_) => {
-                    self.out.put(b"sd bench: open (write) failed\r\n");
-                    return;
+        // 2-4 need a mounted volume. buf, blocks and total move into the
+        // closure by value/copy; the reused 512-byte buffer never grows.
+        self.with_root(b"sd bench", |sh, root| {
+            // 2. FS WRITE: BENCH.TMP, n*2 writes of the reused 512-byte buffer.
+            //    close() is inside the timed region (flushes FAT + dir entry).
+            let write_err = {
+                let file = match root.open_file_in_dir(
+                    SCRATCH_BENCH,
+                    Mode::ReadWriteCreateOrTruncate,
+                ) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        sh.out.put(b"sd bench: open (write) failed\r\n");
+                        return;
+                    }
+                };
+                let t0 = sys_get_timer().now;
+                let mut err = false;
+                for _ in 0..blocks {
+                    if file.write(&buf).is_err() {
+                        err = true;
+                        break;
+                    }
                 }
-            };
-            let t0 = sys_get_timer().now;
-            let mut err = false;
-            for _ in 0..blocks {
-                if file.write(&buf).is_err() {
+                // Flush inside the timed span: close() commits the FAT + dir
+                // entry, so the rate reflects the true cost of persisting the
+                // file. It takes ownership, so it is called exactly once either
+                // way; a close failure after clean writes still counts as error.
+                if file.close().is_err() {
                     err = true;
-                    break;
                 }
-            }
-            // Flush inside the timed span: close() commits the FAT + dir entry,
-            // so the rate reflects the true cost of persisting the file. It
-            // takes ownership, so it is called exactly once either way; a close
-            // failure after clean writes still counts as an error.
-            if file.close().is_err() {
-                err = true;
-            }
-            let ms = (sys_get_timer().now - t0) as u32;
-            if err {
-                self.out.put(b"sd bench: fs write error\r\n");
-            } else {
-                self.bench_kbs(b"fs write (incl close): ", total, ms);
-            }
-            err
-        };
+                let ms = (sys_get_timer().now - t0) as u32;
+                if err {
+                    sh.out.put(b"sd bench: fs write error\r\n");
+                } else {
+                    sh.bench_kbs(b"fs write (incl close): ", total, ms);
+                }
+                err
+            };
 
-        // 3. FS READ back to EOF (skip if the write never produced a file).
-        if !write_err {
-            match root.open_file_in_dir("BENCH.TMP", Mode::ReadOnly) {
-                Ok(file) => {
-                    let t0 = sys_get_timer().now;
-                    let mut read = 0u32;
-                    let mut err = false;
-                    loop {
-                        match file.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(c) => read += c as u32,
-                            Err(_) => {
-                                err = true;
-                                break;
+            // 3. FS READ back to EOF (skip if the write never made a file).
+            if !write_err {
+                match root.open_file_in_dir(SCRATCH_BENCH, Mode::ReadOnly) {
+                    Ok(file) => {
+                        let t0 = sys_get_timer().now;
+                        let mut read = 0u32;
+                        let mut err = false;
+                        loop {
+                            match file.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(c) => read += c as u32,
+                                Err(_) => {
+                                    err = true;
+                                    break;
+                                }
                             }
                         }
+                        let ms = (sys_get_timer().now - t0) as u32;
+                        let _ = file.close();
+                        if err {
+                            sh.out.put(b"sd bench: fs read error\r\n");
+                        } else {
+                            sh.bench_kbs(b"fs read: ", read, ms);
+                        }
                     }
-                    let ms = (sys_get_timer().now - t0) as u32;
-                    let _ = file.close();
-                    if err {
-                        self.out.put(b"sd bench: fs read error\r\n");
+                    Err(_) => sh.out.put(b"sd bench: open (read) failed\r\n"),
+                }
+            }
+
+            // 4. Cleanup -- always attempt, even after an earlier error.
+            match root.delete_file_in_dir(SCRATCH_BENCH) {
+                Ok(()) => sh.out.put(b"cleaned up\r\n"),
+                Err(_) => sh.out.put(b"sd bench: cleanup delete failed\r\n"),
+            }
+        });
+    }
+
+    /// `sd test [n]`: data-integrity self-test over `n` KiB (default 64, bounded
+    /// 1..1024). For each pattern it writes TEST.TMP of n KiB, closes, reopens
+    /// ReadOnly, reads it back block-by-block into a 512-byte buffer and verifies
+    /// every byte. Patterns: constant fills 0x00/0xFF/0xAA/0x55 and an address
+    /// pattern that encodes each block's FULL index (byte 0 = high byte, the
+    /// rest = low byte) so a swap of blocks whose low bytes alias (i vs i+256)
+    /// is still caught -- catches block mis-ordering / mis-addressing. One reused
+    /// write buffer, one reused readback buffer -- no n-KiB stack allocation.
+    /// TEST.TMP is always deleted at the end. This validates the read/write data
+    /// path (not throughput); PASS/FAIL is UNPROVEN until run on a real card.
+    #[cfg(feature = "fat")]
+    fn fat_test(&mut self, n_arg: Option<&str>) {
+        use embedded_sdmmc::Mode;
+
+        let n: u32 = n_arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(64);
+        if n == 0 || n > 1024 {
+            self.out.put(b"sd test: n must be 1..1024 (KiB)\r\n");
+            return;
+        }
+        let blocks = n * 2; // 512-byte blocks per pattern
+
+        self.with_root(b"sd test", |sh, root| {
+            let mut all_pass = true;
+
+            // Each pattern is (name, constant byte, is_address_pattern). For the
+            // address pattern the written/expected byte encodes the block index
+            // rather than the constant, which catches block mis-ordering.
+            const PATTERNS: [(&[u8], u8, bool); 5] = [
+                (b"0x00", 0x00, false),
+                (b"0xFF", 0xFF, false),
+                (b"0xAA", 0xAA, false),
+                (b"0x55", 0x55, false),
+                (b"addr", 0x00, true),
+            ];
+
+            let mut wbuf = [0u8; 512];
+
+            for &(name, val, is_addr) in PATTERNS.iter() {
+                // 1. WRITE TEST.TMP: `blocks` writes of the 512-byte buffer.
+                let file = match root.open_file_in_dir(
+                    SCRATCH_TEST,
+                    Mode::ReadWriteCreateOrTruncate,
+                ) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        sh.out.put(b"  ");
+                        sh.out.put(name);
+                        sh.out.put(b": open (write) failed\r\n");
+                        all_pass = false;
+                        continue;
+                    }
+                };
+                let mut werr = false;
+                for i in 0..blocks {
+                    if is_addr {
+                        // Encode the FULL block index so a swap of blocks whose
+                        // low bytes alias (i vs i+256) is still caught: byte 0
+                        // holds the high byte of the index, the rest the low
+                        // byte.
+                        wbuf.fill((i & 0xFF) as u8);
+                        wbuf[0] = (i >> 8) as u8;
                     } else {
-                        self.bench_kbs(b"fs read: ", read, ms);
+                        wbuf.fill(val);
+                    }
+                    if file.write(&wbuf).is_err() {
+                        werr = true;
+                        break;
                     }
                 }
-                Err(_) => self.out.put(b"sd bench: open (read) failed\r\n"),
-            }
-        }
+                if file.close().is_err() {
+                    werr = true;
+                }
+                if werr {
+                    sh.out.put(b"  ");
+                    sh.out.put(name);
+                    sh.out.put(b": write error\r\n");
+                    all_pass = false;
+                    continue;
+                }
 
-        // 4. Cleanup -- always attempt, even after an earlier error.
-        match root.delete_file_in_dir("BENCH.TMP") {
-            Ok(()) => self.out.put(b"cleaned up\r\n"),
-            Err(_) => self.out.put(b"sd bench: cleanup delete failed\r\n"),
+                // 2. REOPEN ReadOnly and verify every byte. The expected byte
+                //    for the address pattern must mirror the write above: at a
+                //    block boundary (pos % 512 == 0) it is the high byte of the
+                //    block index, otherwise the low byte.
+                let file =
+                    match root.open_file_in_dir(SCRATCH_TEST, Mode::ReadOnly) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            sh.out.put(b"  ");
+                            sh.out.put(name);
+                            sh.out.put(b": open (read) failed\r\n");
+                            all_pass = false;
+                            continue;
+                        }
+                    };
+                let result = Self::read_verify(&file, blocks * 512, |pos| {
+                    if is_addr {
+                        let blk = pos / 512;
+                        if pos % 512 == 0 {
+                            (blk >> 8) as u8
+                        } else {
+                            (blk & 0xFF) as u8
+                        }
+                    } else {
+                        val
+                    }
+                });
+                let _ = file.close();
+
+                match result {
+                    Err(VerifyFail::ReadError) => {
+                        sh.out.put(b"  ");
+                        sh.out.put(name);
+                        sh.out.put(b": read error\r\n");
+                        all_pass = false;
+                    }
+                    Err(VerifyFail::Mismatch(off, exp, got)) => {
+                        sh.out.put(b"  ");
+                        sh.out.put(name);
+                        sh.out.put(b": FAIL at byte ");
+                        sh.out.put_u32(off);
+                        sh.out.put(b" exp ");
+                        sh.out.put_hex_byte(exp);
+                        sh.out.put(b" got ");
+                        sh.out.put_hex_byte(got);
+                        sh.out.put(b"\r\n");
+                        all_pass = false;
+                    }
+                    Err(VerifyFail::Short(pos, total)) => {
+                        // Short file: fewer bytes than we wrote came back.
+                        sh.out.put(b"  ");
+                        sh.out.put(name);
+                        sh.out.put(b": FAIL short read ");
+                        sh.out.put_u32(pos);
+                        sh.out.put(b"/");
+                        sh.out.put_u32(total);
+                        sh.out.put(b"\r\n");
+                        all_pass = false;
+                    }
+                    Ok(()) => {
+                        sh.out.put(b"  ");
+                        sh.out.put(name);
+                        sh.out.put(b": PASS\r\n");
+                    }
+                }
+            }
+
+            // Always delete TEST.TMP, even on failure.
+            let _ = root.delete_file_in_dir(SCRATCH_TEST);
+
+            sh.out.put(if all_pass {
+                b"sd test: ALL PASS\r\n" as &[u8]
+            } else {
+                b"sd test: FAILED\r\n"
+            });
+        });
+    }
+
+    /// `sd soak [secs]`: sustained write/read/verify loop for `secs` seconds
+    /// (default 10, bounded 1..300). Each iteration writes a fixed 64 KiB
+    /// TEST.TMP filled with a rotating byte (iteration & 0xFF), reads it back and
+    /// verifies byte-exact. Accumulates iterations, total bytes verified and an
+    /// error count. The FIRST mismatch is printed (iteration, offset, exp, got)
+    /// but the loop keeps going and counts it. This is the real gate for the
+    /// 25 MHz speed change -- it runs many cycles. TEST.TMP is deleted at the end.
+    /// PASS/FAIL is UNPROVEN until run on a real card.
+    #[cfg(feature = "fat")]
+    fn fat_soak(&mut self, secs_arg: Option<&str>) {
+        use embedded_sdmmc::Mode;
+
+        let secs: u32 =
+            secs_arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
+        if secs == 0 || secs > 300 {
+            self.out.put(b"sd soak: secs must be 1..300\r\n");
+            return;
         }
+        // 64 KiB per iteration = 128 blocks of 512 bytes.
+        const BLOCKS: u32 = 128;
+        const FILE_BYTES: u32 = BLOCKS * 512;
+
+        self.with_root(b"sd soak", |sh, root| {
+            let mut wbuf = [0u8; 512];
+            let mut iters: u32 = 0;
+            let mut errors: u32 = 0;
+            let mut bytes: u64 = 0;
+            let mut reported_first = false;
+
+            let t0 = sys_get_timer().now;
+            while (sys_get_timer().now - t0) < (secs as u64) * 1000 {
+                let byte = (iters & 0xFF) as u8;
+                for b in wbuf.iter_mut() {
+                    *b = byte;
+                }
+
+                // WRITE the 64 KiB file.
+                let file = match root.open_file_in_dir(
+                    SCRATCH_TEST,
+                    Mode::ReadWriteCreateOrTruncate,
+                ) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        errors += 1;
+                        iters += 1;
+                        continue;
+                    }
+                };
+                let mut werr = false;
+                for _ in 0..BLOCKS {
+                    if file.write(&wbuf).is_err() {
+                        werr = true;
+                        break;
+                    }
+                }
+                if file.close().is_err() {
+                    werr = true;
+                }
+                if werr {
+                    errors += 1;
+                    iters += 1;
+                    continue;
+                }
+
+                // READ back + verify byte-exact.
+                let file =
+                    match root.open_file_in_dir(SCRATCH_TEST, Mode::ReadOnly) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            errors += 1;
+                            iters += 1;
+                            continue;
+                        }
+                    };
+                let result = Self::read_verify(&file, FILE_BYTES, |_| byte);
+                let _ = file.close();
+
+                match result {
+                    Ok(()) => bytes += FILE_BYTES as u64,
+                    Err(fail) => {
+                        errors += 1;
+                        if !reported_first {
+                            reported_first = true;
+                            match fail {
+                                VerifyFail::Mismatch(off, exp, got) => {
+                                    sh.out.put(b"first mismatch: iter ");
+                                    sh.out.put_u32(iters);
+                                    sh.out.put(b" offset ");
+                                    sh.out.put_u32(off);
+                                    sh.out.put(b" exp ");
+                                    sh.out.put_hex_byte(exp);
+                                    sh.out.put(b" got ");
+                                    sh.out.put_hex_byte(got);
+                                    sh.out.put(b"\r\n");
+                                }
+                                VerifyFail::ReadError => {
+                                    sh.out.put(b"first error: iter ");
+                                    sh.out.put_u32(iters);
+                                    sh.out.put(b" read error\r\n");
+                                }
+                                VerifyFail::Short(pos, total) => {
+                                    sh.out.put(b"first error: iter ");
+                                    sh.out.put_u32(iters);
+                                    sh.out.put(b" short read ");
+                                    sh.out.put_u32(pos);
+                                    sh.out.put(b"/");
+                                    sh.out.put_u32(total);
+                                    sh.out.put(b"\r\n");
+                                }
+                            }
+                            sh.out.flush();
+                        }
+                    }
+                }
+                iters += 1;
+            }
+            let ms = (sys_get_timer().now - t0) as u32;
+
+            // Always delete TEST.TMP.
+            let _ = root.delete_file_in_dir(SCRATCH_TEST);
+
+            // Report: "sd soak <secs>s: <passes> passes, <MiB> MiB verified,
+            //          <errors> errors, ~<KB/s> KB/s". `passes` counts only
+            //          clean iterations; `iters` also counts failed ones, so
+            //          passes = iters - errors.
+            sh.out.put(b"sd soak ");
+            sh.out.put_u32(secs);
+            sh.out.put(b"s: ");
+            sh.out.put_u32(iters - errors);
+            sh.out.put(b" passes, ");
+            sh.out.put_u64(bytes / (1024 * 1024));
+            sh.out.put(b" MiB verified, ");
+            sh.out.put_u32(errors);
+            sh.out.put(b" errors, ~");
+            // KB/s over verified bytes; guard the zero-elapsed case.
+            let kbs = if ms > 0 {
+                bytes.wrapping_mul(1000) / (ms as u64) / 1024
+            } else {
+                0
+            };
+            sh.out.put_u64(kbs);
+            sh.out.put(b" KB/s\r\n");
+        });
     }
 
     /// `sd df`: report the FAT volume's total / used / free space. embedded-sdmmc

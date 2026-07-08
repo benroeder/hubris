@@ -58,7 +58,9 @@ const INIT_CPSDVSR: u8 = 254;
 const INIT_SCR: u8 = 1;
 /// DATA-speed prescale: 150 MHz / 6 = 25 MHz (SCR = 0) -- the SD SPI-mode
 /// default-speed ceiling. The card is clocked at this rate only after the
-/// <400 kHz init handshake succeeds.
+/// <400 kHz init handshake succeeds. (37.5 MHz was tried and FAILED the sd
+/// test/soak integrity harness on this card + Seengreat wiring -- corrupt reads,
+/// FAT parse errors. 25 MHz is the reliable max here.)
 const DATA_CPSDVSR: u8 = 6;
 /// DATA-speed serial-clock-rate.
 const DATA_SCR: u8 = 0;

@@ -12,7 +12,8 @@
 
 use drv_rp235x_sdcard_api::Rp235xSdcard;
 use embedded_sdmmc::{
-    Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Timestamp,
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, File, TimeSource,
+    Timestamp,
 };
 
 /// Errors surfaced by the block-device adapter. Kept tiny; embedded-sdmmc only
@@ -151,3 +152,13 @@ impl TimeSource for RtcTime {
 pub type FatTime = RtcTime;
 #[cfg(not(feature = "ds1302"))]
 pub type FatTime = DummyTime;
+
+/// A `VolumeManager` directory over the sdcard block device, with the FAT
+/// `TimeSource` this build uses. The const generics are embedded-sdmmc's
+/// defaults (MAX_DIRS = 4, MAX_FILES = 4, MAX_VOLUMES = 1), so a plain
+/// `VolumeManager::new(...)` produces exactly this type. Spelled once here so
+/// the shell's `with_root` helper can name the directory it hands back.
+pub type FatDir<'a> = Directory<'a, SdBlockDevice, FatTime, 4, 4, 1>;
+
+/// A file handle within a `FatDir`, matching const generics as above.
+pub type FatFile<'a> = File<'a, SdBlockDevice, FatTime, 4, 4, 1>;
