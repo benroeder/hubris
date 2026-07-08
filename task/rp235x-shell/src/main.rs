@@ -208,8 +208,8 @@ impl Out {
         }
     }
 
-    /// Two zero-padded decimal digits (for clock fields, 0-99).
-    #[cfg(feature = "ds1302")]
+    /// Two zero-padded decimal digits (clock fields + FAT `sd ls` dates, 0-99).
+    #[cfg(any(feature = "ds1302", feature = "fat"))]
     fn put_pad2(&mut self, n: u8) {
         self.put(&[b'0' + (n / 10) % 10, b'0' + n % 10]);
     }
@@ -2130,7 +2130,10 @@ impl Shell {
         };
 
         // 1. MBR at LBA 0 -> partition 1's start LBA (mirrors what open_volume
-        //    mounts). part_start == 0 means a "superfloppy" (VBR at LBA 0).
+        //    mounts). This assumes an MBR-partitioned card (the usual case for
+        //    SD/SDHC). A "superfloppy" (no MBR, VBR at LBA 0) is NOT handled: its
+        //    boot sector also ends in 0xAA55, so the offset-454 read would yield
+        //    garbage rather than 0 -- df would then misparse or error, not crash.
         if sdcard.read_block(0, &mut blk).is_err() {
             self.out.put(b"sd df: read MBR failed\r\n");
             return;

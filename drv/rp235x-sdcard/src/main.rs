@@ -412,24 +412,37 @@ impl idl::InOrderRp235xSdcardImpl for ServerImpl {
         self.xfer(FILLER);
         self.xfer(FILLER);
 
-        // Data-response byte: the low five bits are `0bxxx0_0101` (0x05) when
-        // the card accepts the block; anything else is a CRC/write error.
-        let resp = self.read_byte();
+        // Data-response byte: the card may clock out 0xFF wait bytes first, so
+        // poll (bounded) for the real response. Low five bits == 0x05 means the
+        // block was accepted; anything else is a CRC/write error.
+        let mut resp = FILLER;
+        for _ in 0..R1_POLLS {
+            resp = self.read_byte();
+            if resp != FILLER {
+                break;
+            }
+        }
         if resp & 0x1F != 0x05 {
             self.cs_high();
             return Err(SdError::DataError.into());
         }
 
-        // The card holds MISO low (0x00) while it programs the block. Poll in
-        // a bounded loop until it releases the busy line (a non-zero byte).
-        let mut done = false;
+        // The card pulls MISO low (0x00) while it programs the block. Wait for
+        // busy to ASSERT before waiting for it to release: a stalled SPI makes
+        // xfer() return 0xFF, so requiring a 0x00 first stops a dead bus from
+        // being misread as an instant completion (it never sees busy -> Timeout,
+        // not a false Ok). A single-block program always holds busy for ms.
+        let mut busy_seen = false;
+        let mut released = false;
         for _ in 0..WRITE_BUSY {
-            if self.read_byte() != 0x00 {
-                done = true;
+            if self.read_byte() == 0x00 {
+                busy_seen = true;
+            } else if busy_seen {
+                released = true;
                 break;
             }
         }
-        if !done {
+        if !(busy_seen && released) {
             self.cs_high();
             return Err(SdError::Timeout.into());
         }

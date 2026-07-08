@@ -122,11 +122,21 @@ impl TimeSource for RtcTime {
         let date = (packed >> 24) as u8;
         let month = (packed >> 32) as u8;
         let year = (packed >> 48) as u8;
+        // Clamp every field to its valid range: an unset/halted DS1302 returns
+        // garbage BCD, and the masked decode can yield out-of-range values
+        // (e.g. month up to 25). Clamping keeps a corrupt clock from stamping an
+        // invalid FAT date rather than propagating it into on-card metadata.
+        let year = year.min(99);
+        let month = month.clamp(1, 12);
+        let date = date.clamp(1, 31);
+        let hour = hour.min(23);
+        let min = min.min(59);
+        let sec = sec.min(59);
         Timestamp {
             // year_since_1970 = 2000 + year - 1970 = year + 30.
-            year_since_1970: year.wrapping_add(30),
-            zero_indexed_month: month.saturating_sub(1),
-            zero_indexed_day: date.saturating_sub(1),
+            year_since_1970: year + 30,
+            zero_indexed_month: month - 1,
+            zero_indexed_day: date - 1,
             hours: hour,
             minutes: min,
             seconds: sec,
