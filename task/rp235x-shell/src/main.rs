@@ -126,7 +126,8 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd cat <name>         print a file from the FAT root directory\r\n\
   sd df                 FAT volume total/used/free space (from BPB + FSInfo)\r\n\
   sd write <name> <text>  create/truncate <name> in the root dir; write <text>\r\n\
-  sd rm <name>          delete <name> from the FAT root directory\r\n";
+  sd rm <name>          delete <name> from the FAT root directory\r\n\
+  sd bench [n]          measure raw-read + FS write/read speed (n KiB, default 128)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -1880,13 +1881,15 @@ impl Shell {
             }
             #[cfg(feature = "fat")]
             Some("rm") => self.fat_rm(a),
+            #[cfg(feature = "fat")]
+            Some("bench") => self.fat_bench(a),
             _ => {
                 self.out.put(
                     b"usage: sd init | read <block> | find <start> <count>",
                 );
                 #[cfg(feature = "fat")]
                 self.out
-                    .put(b" | ls | cat <name> | df | write <name> <text> | rm <name>");
+                    .put(b" | ls | cat <name> | df | write <name> <text> | rm <name> | bench [n]");
                 self.out.put(b"\r\n");
             }
         }
@@ -2111,6 +2114,166 @@ impl Shell {
         match root.delete_file_in_dir(name) {
             Ok(()) => self.out.put(b"removed\r\n"),
             Err(_) => self.out.put(b"sd rm: delete failed (not found?)\r\n"),
+        }
+    }
+
+    /// Print one bench line: "<bytes> B in <ms> ms = <KB/s> KB/s". KB/s is
+    /// bytes * 1000 / ms / 1024. A zero elapsed (the transfer finished inside
+    /// one 1 ms timer tick) can't yield a rate, so we say so and ask for a
+    /// bigger n rather than dividing by zero.
+    #[cfg(feature = "fat")]
+    fn bench_kbs(&mut self, label: &[u8], bytes: u32, ms: u32) {
+        self.out.put(label);
+        self.out.put_u32(bytes);
+        self.out.put(b" B in ");
+        self.out.put_u32(ms);
+        self.out.put(b" ms = ");
+        if ms == 0 {
+            self.out.put(b"too fast, raise n\r\n");
+            return;
+        }
+        let kbs = (bytes as u64 * 1000 / ms as u64 / 1024) as u32;
+        self.out.put_u32(kbs);
+        self.out.put(b" KB/s\r\n");
+    }
+
+    /// `sd bench [n]`: measure SD throughput three ways over `n` KiB (default
+    /// 128). All transfers use ONE reused 512-byte buffer -- never allocate the
+    /// full n KiB on the stack.
+    ///
+    ///   1. RAW READ (non-destructive): read n*2 consecutive 512-byte blocks
+    ///      from LBA 0 via the raw sdcard client. LBAs 0.. are the MBR/BPB/FAT
+    ///      region -- reading them never mutates the card. This is the bare
+    ///      block-device read rate, with no filesystem overhead.
+    ///   2. FS WRITE: create/truncate BENCH.TMP in the FAT root and write the
+    ///      512-byte buffer n*2 times. The timed region INCLUDES file.close(),
+    ///      which commits the directory entry + FAT, so the number is the true
+    ///      cost of persisting n KiB (data blocks + metadata flush).
+    ///   3. FS READ: reopen BENCH.TMP read-only and read it back to EOF.
+    ///
+    /// Then delete BENCH.TMP. On any embedded-sdmmc error the op is reported and
+    /// cleanup is still attempted. UNPROVEN on hardware -- numbers are only
+    /// meaningful when run on a real card.
+    #[cfg(feature = "fat")]
+    fn fat_bench(&mut self, n_arg: Option<&str>) {
+        use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
+
+        // n = KiB to transfer; each KiB is two 512-byte blocks/writes. Bound it:
+        // `total = n * 1024` must stay within u32 (overflow starts at n = 4 Mi),
+        // and a very large n would read past the card and run for minutes.
+        const MAX_BENCH_KIB: u32 = 4096;
+        let n: u32 = n_arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(128);
+        if n == 0 || n > MAX_BENCH_KIB {
+            self.out.put(b"sd bench: n must be 1..4096 (KiB)\r\n");
+            return;
+        }
+        let blocks = n * 2;
+        let total = n * 1024;
+        let mut buf = [0x5Au8; 512];
+
+        // 1. RAW READ from LBA 0 upward. Reads never mutate the card, so this is
+        //    always safe: small n stays in the MBR/BPB/FAT region, larger n
+        //    reads on into the data area -- still just reads.
+        let t0 = sys_get_timer().now;
+        for i in 0..blocks {
+            if self.sdcard.read_block(i, &mut buf).is_err() {
+                self.out.put(b"sd bench: raw read error at block ");
+                self.out.put_u32(i);
+                self.out.put(b"\r\n");
+                return;
+            }
+        }
+        let ms = (sys_get_timer().now - t0) as u32;
+        self.bench_kbs(b"raw read: ", total, ms);
+
+        // 2. FS WRITE: BENCH.TMP, n*2 writes of the reused 512-byte buffer.
+        //    close() is inside the timed region (it flushes FAT + dir entry).
+        let vm = VolumeManager::new(
+            fatfs::SdBlockDevice::new(Rp235xSdcard::from(SDCARD.get_task_id())),
+            Self::fat_time(),
+        );
+        let volume = match vm.open_volume(VolumeIdx(0)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.out.put(b"sd bench: open volume failed\r\n");
+                return;
+            }
+        };
+        let root = match volume.open_root_dir() {
+            Ok(d) => d,
+            Err(_) => {
+                self.out.put(b"sd bench: open root dir failed\r\n");
+                return;
+            }
+        };
+
+        let write_err = {
+            let file = match root
+                .open_file_in_dir("BENCH.TMP", Mode::ReadWriteCreateOrTruncate)
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    self.out.put(b"sd bench: open (write) failed\r\n");
+                    return;
+                }
+            };
+            let t0 = sys_get_timer().now;
+            let mut err = false;
+            for _ in 0..blocks {
+                if file.write(&buf).is_err() {
+                    err = true;
+                    break;
+                }
+            }
+            // Flush inside the timed span: close() commits the FAT + dir entry,
+            // so the rate reflects the true cost of persisting the file. It
+            // takes ownership, so it is called exactly once either way; a close
+            // failure after clean writes still counts as an error.
+            if file.close().is_err() {
+                err = true;
+            }
+            let ms = (sys_get_timer().now - t0) as u32;
+            if err {
+                self.out.put(b"sd bench: fs write error\r\n");
+            } else {
+                self.bench_kbs(b"fs write (incl close): ", total, ms);
+            }
+            err
+        };
+
+        // 3. FS READ back to EOF (skip if the write never produced a file).
+        if !write_err {
+            match root.open_file_in_dir("BENCH.TMP", Mode::ReadOnly) {
+                Ok(file) => {
+                    let t0 = sys_get_timer().now;
+                    let mut read = 0u32;
+                    let mut err = false;
+                    loop {
+                        match file.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(c) => read += c as u32,
+                            Err(_) => {
+                                err = true;
+                                break;
+                            }
+                        }
+                    }
+                    let ms = (sys_get_timer().now - t0) as u32;
+                    let _ = file.close();
+                    if err {
+                        self.out.put(b"sd bench: fs read error\r\n");
+                    } else {
+                        self.bench_kbs(b"fs read: ", read, ms);
+                    }
+                }
+                Err(_) => self.out.put(b"sd bench: open (read) failed\r\n"),
+            }
+        }
+
+        // 4. Cleanup -- always attempt, even after an earlier error.
+        match root.delete_file_in_dir("BENCH.TMP") {
+            Ok(()) => self.out.put(b"cleaned up\r\n"),
+            Err(_) => self.out.put(b"sd bench: cleanup delete failed\r\n"),
         }
     }
 
