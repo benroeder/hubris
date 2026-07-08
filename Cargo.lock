@@ -2575,6 +2575,7 @@ dependencies = [
 name = "drv-rp235x-pwm"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
  "counters",
  "drv-rp235x-pwm-api",
  "drv-rp235x-sys-api",

@@ -25,5 +25,11 @@ Interface(
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),
+        "sine": (
+            description: "Play a sine wave on channel A of `slice` at `freq_hz` (50..=5000) for `ms` via PWM-as-1-bit-DAC (DDS over a sine LUT), then stop (silence).",
+            args: { "slice": "u8", "freq_hz": "u32", "ms": "u32" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
     },
 )
