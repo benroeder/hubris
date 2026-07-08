@@ -32,8 +32,14 @@ Interface(
             idempotent: true,
         ),
         "audio_start": (
-            description: "Start a seamless-looping mono sine near `freq_hz` (50..=8000) on the audio jack (GP18 = slice 1 chan A), fed by a DMA ring paced by the slice-1 wrap. Non-blocking: returns immediately and the DMA loops with zero CPU. Pitch snaps to whole cycles across the sample buffer.",
+            description: "Start a seamless-looping sine near `freq_hz` (50..=8000) in BOTH ears of the audio jack (GP18 = slice 1 chan A = left, GP19 = chan B = right), fed by a DMA ring of stereo (u32) samples paced by the slice-1 wrap. Non-blocking: returns immediately and the DMA loops with zero CPU. Pitch snaps to whole cycles across the sample buffer.",
             args: { "freq_hz": "u32" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
+        "audio_stereo": (
+            description: "Start a seamless-looping stereo sine on the audio jack: `hz_left` (50..=8000) on GP18 (slice 1 chan A) and `hz_right` (50..=8000) on GP19 (chan B), fed by one DMA ring of u32 samples paced by the slice-1 wrap. Non-blocking. Each channel snaps to whole cycles across the sample buffer.",
+            args: { "hz_left": "u32", "hz_right": "u32" },
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),

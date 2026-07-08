@@ -89,9 +89,15 @@ task_slot!(SDCARD, sdcard);
 const LED_PIN: u8 = 25;
 /// Seengreat buzzer: GP18 = PWM slice 1 channel A. GP18 is also SPI0 SCK, so do
 /// not use `spi role` in the same session. The board's BUZZER_SW jumper must be
-/// on for the piezo to sound.
+/// on for the piezo to sound. GP18 is also the audio jack LEFT channel.
 const BUZZER_PIN: u8 = 18;
 const BUZZER_SLICE: u8 = 1;
+/// Audio jack LEFT channel: GP18 = PWM slice 1 channel A. Same pin as the buzzer
+/// (they share GP18); aliased here so the stereo audio path reads left/right.
+const AUDIO_LEFT_PIN: u8 = BUZZER_PIN;
+/// Audio jack RIGHT channel: GP19 = PWM slice 1 channel B. Used by the DMA-fed
+/// stereo `audio`/`audio2` commands (the buzzer/sine/tone paths use only GP18).
+const AUDIO_RIGHT_PIN: u8 = 19;
 
 const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
@@ -126,7 +132,8 @@ const HELP: &[u8] = b"commands:\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
   sine <hz> <ms>        play a sine (PWM-DAC) on the buzzer\r\n\
-  audio <hz> | stop     DMA sine on the jack (GP18, exact pitch, non-blocking)\r\n\
+  audio <hz> | stop     DMA sine in both ears (GP18/GP19, exact pitch, non-blocking)\r\n\
+  audio2 <hzL> <hzR>    DMA stereo sine: left tone on GP18, right on GP19\r\n\
   beep                  short 1 kHz beep\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
@@ -303,6 +310,7 @@ impl Shell {
             "buzzer" => self.cmd_buzzer(words.next(), words.next()),
             "sine" => self.cmd_sine(words.next(), words.next()),
             "audio" => self.cmd_audio(words.next()),
+            "audio2" => self.cmd_audio2(words.next(), words.next()),
             "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -502,11 +510,22 @@ impl Shell {
         });
     }
 
-    /// `audio <hz>` | `audio stop`: DMA-fed continuous sine on the audio jack
-    /// (GP18 = PWM slice 1 chan A). `audio <hz>` routes GP18 to PWM and starts a
-    /// seamless-looping, exact-pitch, non-blocking sine (the DMA ring is paced
-    /// by the slice-1 wrap, so the shell returns immediately and the tone plays
-    /// until `audio stop`). Unlike `sine`, this does not block and the pitch is
+    /// Route BOTH audio-jack pins to PWM (funcsel 4): GP18 = slice 1 chan A
+    /// (left), GP19 = slice 1 chan B (right). The DMA path drives both channels
+    /// via word writes to the CC register, so both pins must be function-
+    /// selected. Returns false if either GPIO routing failed. Shared by
+    /// `cmd_audio` and `cmd_audio2`.
+    fn route_audio_jack(&mut self) -> bool {
+        self.gpio.set_function(AUDIO_LEFT_PIN, 4).is_ok()
+            && self.gpio.set_function(AUDIO_RIGHT_PIN, 4).is_ok()
+    }
+
+    /// `audio <hz>` | `audio stop`: DMA-fed continuous sine on the audio jack,
+    /// the SAME tone in both ears (GP18 = slice 1 chan A = left, GP19 = chan B
+    /// = right). `audio <hz>` routes both pins to PWM and starts a seamless-
+    /// looping, exact-pitch, non-blocking sine (the DMA ring is paced by the
+    /// slice-1 wrap, so the shell returns immediately and the tone plays until
+    /// `audio stop`). Unlike `sine`, this does not block and the pitch is
     /// hardware-exact. `audio stop` aborts the DMA and silences the slice.
     ///
     /// Same pin/slice as `buzzer`/`sine`, so do not mix with `spi role`/`spi
@@ -527,8 +546,8 @@ impl Shell {
                     self.out.put(b"usage: audio <hz> | stop (hz 50-8000)\r\n");
                     return;
                 };
-                let ok =
-                    self.route_buzzer() && self.pwm.audio_start(freq).is_ok();
+                let ok = self.route_audio_jack()
+                    && self.pwm.audio_start(freq).is_ok();
                 self.out.put(if ok {
                     b"ok\r\n" as &[u8]
                 } else {
@@ -539,6 +558,27 @@ impl Shell {
                 self.out.put(b"usage: audio <hz> | stop (hz 50-8000)\r\n");
             }
         }
+    }
+
+    /// `audio2 <hzL> <hzR>`: DMA-fed TRUE STEREO sine on the audio jack -- an
+    /// independent tone per ear (GP18 = left, GP19 = right), both 50-8000 Hz.
+    /// Routes both pins to PWM and arms one DMA ring of stereo (u32) samples;
+    /// non-blocking and hardware-exact like `audio`. Stop with `audio stop`.
+    fn cmd_audio2(&mut self, left: Option<&str>, right: Option<&str>) {
+        let left = left.and_then(|s| s.parse::<u32>().ok());
+        let right = right.and_then(|s| s.parse::<u32>().ok());
+        let (Some(left), Some(right)) = (left, right) else {
+            self.out
+                .put(b"usage: audio2 <hzL> <hzR> (hz 50-8000 each)\r\n");
+            return;
+        };
+        let ok = self.route_audio_jack()
+            && self.pwm.audio_stereo(left, right).is_ok();
+        self.out.put(if ok {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"audio2 failed (hz 50-8000 each)\r\n"
+        });
     }
 
     /// `beep`: a default 1 kHz, 200 ms beep on the GP18 buzzer (slice 1).
