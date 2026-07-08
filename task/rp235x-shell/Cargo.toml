@@ -29,6 +29,7 @@ ws2812 = ["dep:drv-rp235x-ws2812-api"]
 ds1302 = ["dep:drv-rp235x-ds1302-api"]
 sdcard = ["dep:drv-rp235x-sdcard-api"]
 fat = ["sdcard", "dep:embedded-sdmmc"]
+datalog = ["fat", "ds1302", "ws2812"]
 
 [[bin]]
 name = "task-rp235x-shell"

@@ -1009,6 +1009,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-pi-pico-2-datalog"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "rp235x-pac",
+ "rp235x-romapi",
+ "rp235x-startup",
+ "rp235x-uart",
+]
+
+[[package]]
 name = "demo-pi-pico-2-rgb"
 version = "0.1.0"
 dependencies = [

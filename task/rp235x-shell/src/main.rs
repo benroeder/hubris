@@ -153,6 +153,9 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd bench [n]          measure raw-read + FS write/read speed (n KiB, default 128)\r\n\
   sd test [n]           data-integrity self-test: write/read/verify patterns (n KiB, default 64)\r\n\
   sd soak [secs]        sustained write/read/verify loop for secs seconds (default 10)\r\n";
+#[cfg(feature = "datalog")]
+const HELP_DATALOG: &[u8] =
+    b"  log <count> [secs]     log <count> RTC-stamped temps to LOG.CSV (RGB status)\r\n";
 
 struct Shell {
     usb: UsbCons,
@@ -190,6 +193,14 @@ struct Out {
     usb: UsbCons,
     buf: [u8; 256],
     len: usize,
+}
+
+/// Two zero-padded ASCII digits for a 0-99 value (clock fields). Shared by
+/// `Out::put_pad2` and cmd_log's CSV buffer writes so the digit formula lives
+/// in exactly one place.
+#[cfg(any(feature = "ds1302", feature = "fat", feature = "datalog"))]
+fn pad2(val: u8) -> [u8; 2] {
+    [b'0' + (val / 10) % 10, b'0' + val % 10]
 }
 
 impl Out {
@@ -237,7 +248,7 @@ impl Out {
     /// Two zero-padded decimal digits (clock fields + FAT `sd ls` dates, 0-99).
     #[cfg(any(feature = "ds1302", feature = "fat"))]
     fn put_pad2(&mut self, n: u8) {
-        self.put(&[b'0' + (n / 10) % 10, b'0' + n % 10]);
+        self.put(&pad2(n));
     }
 
     fn flush(&mut self) {
@@ -267,6 +278,8 @@ impl Shell {
                 self.out.put(HELP_SDCARD);
                 #[cfg(feature = "fat")]
                 self.out.put(HELP_FAT);
+                #[cfg(feature = "datalog")]
+                self.out.put(HELP_DATALOG);
             }
             "status" => self.cmd_status(),
             "ticks" => {
@@ -314,6 +327,8 @@ impl Shell {
             ),
             #[cfg(feature = "sdcard")]
             "sd" => self.cmd_sd(line, words.next(), words.next(), words.next()),
+            #[cfg(feature = "datalog")]
+            "log" => self.cmd_log(words.next(), words.next()),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -439,6 +454,22 @@ impl Shell {
     /// <SS> [weekday]` sets it. All fields are plain decimals; the driver does
     /// the BCD conversion. The packed u64 layout is byte0=sec, byte1=min,
     /// byte2=hour, byte3=date, byte4=month, byte5=weekday, byte6=year (0-99).
+    /// Read the DS1302 and unpack its packed word into clock fields, returned
+    /// as `(sec, min, hour, date, month, year)`. Shared by the `rtc` get
+    /// handler and cmd_log so the shift/mask layout lives in one place. No
+    /// range clamping -- callers clamp if they need to.
+    #[cfg(feature = "ds1302")]
+    fn rtc_now_fields(&self) -> (u8, u8, u8, u8, u8, u8) {
+        let packed = self.ds1302.now();
+        let sec = packed as u8;
+        let min = (packed >> 8) as u8;
+        let hour = (packed >> 16) as u8;
+        let date = (packed >> 24) as u8;
+        let month = (packed >> 32) as u8;
+        let year = (packed >> 48) as u8;
+        (sec, min, hour, date, month, year)
+    }
+
     #[cfg(feature = "ds1302")]
     fn cmd_rtc(
         &mut self,
@@ -453,13 +484,8 @@ impl Shell {
     ) {
         match sub {
             None | Some("get") => {
-                let packed = self.ds1302.now();
-                let sec = packed as u8;
-                let minute = (packed >> 8) as u8;
-                let hour = (packed >> 16) as u8;
-                let date = (packed >> 24) as u8;
-                let month = (packed >> 32) as u8;
-                let year = (packed >> 48) as u8;
+                let (sec, minute, hour, date, month, year) =
+                    self.rtc_now_fields();
                 // "20YY-MM-DD HH:MM:SS"
                 self.out.put(b"20");
                 self.out.put_pad2(year);
@@ -1214,13 +1240,24 @@ impl Shell {
         });
     }
 
-    fn cmd_temp(&mut self) {
+    /// Read the on-die temperature sensor and convert to milli-degrees C.
+    /// Read the die-temperature sensor: returns `(raw 12-bit sample, milli-C)`,
+    /// or `None` on an ADC error. T(C) = 27 - (V - 0.706 V)/1.721 mV, V =
+    /// raw * 3.3 / 4096 (datasheet sec 12.4.6), kept in milli-units to stay
+    /// integer. Single source shared by `temp` and the data logger.
+    fn read_die_temp(&self) -> Option<(u32, i64)> {
         match self.adc.read(TEMP_CHANNEL) {
             Ok(raw) => {
-                // T(C) = 27 - (V - 0.706 V)/1.721 mV, V = raw * 3.3 / 4096
-                // (datasheet sec 12.4.6), in milli-units to stay integer.
                 let uv = (raw as i64 * 3_300_000) / 4096;
-                let milli_c = 27_000 - ((uv - 706_000) * 1000) / 1721;
+                Some((raw as u32, 27_000 - ((uv - 706_000) * 1000) / 1721))
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn cmd_temp(&mut self) {
+        match self.read_die_temp() {
+            Some((raw, milli_c)) => {
                 self.out.put(b"die temp ");
                 if milli_c < 0 {
                     self.out.put(b"-");
@@ -1230,11 +1267,163 @@ impl Shell {
                 self.out.put(b".");
                 self.out.put_u64((m % 1000) / 100);
                 self.out.put(b" C (raw ");
-                self.out.put_u32(raw as u32);
+                self.out.put_u32(raw);
                 self.out.put(b")\r\n");
             }
-            Err(_) => self.out.put(b"adc error\r\n"),
+            None => self.out.put(b"adc error\r\n"),
         }
+    }
+
+    /// `log <count> [secs]`: capstone that COMPOSES four drivers -- ADC (die
+    /// temp), DS1302 (timestamp), SD/FAT (append to LOG.CSV), WS2812 (green =
+    /// sample logged, red = the temp read or the CSV append failed). It writes
+    /// one `20YY-MM-DD HH:MM:SS,<T>.<d>C` CSV row per sample and echoes it live.
+    /// UNPROVEN on hardware.
+    #[cfg(feature = "datalog")]
+    fn cmd_log(&mut self, count: Option<&str>, secs: Option<&str>) {
+        use embedded_sdmmc::Mode;
+
+        // count = samples (default 10, 1..1000); secs = interval (default 1,
+        // 1..60). Reject anything out of range with a usage message.
+        let count = match count {
+            None => 10u32,
+            Some(s) => match s.parse::<u32>() {
+                Ok(n) if (1..=1000).contains(&n) => n,
+                _ => {
+                    self.out.put(b"usage: log <count 1-1000> [secs 1-60]\r\n");
+                    return;
+                }
+            },
+        };
+        let secs = match secs {
+            None => 1u32,
+            Some(s) => match s.parse::<u32>() {
+                Ok(n) if (1..=60).contains(&n) => n,
+                _ => {
+                    self.out.put(b"usage: log <count 1-1000> [secs 1-60]\r\n");
+                    return;
+                }
+            },
+        };
+
+        // Write two zero-padded ASCII digits (clock field, 0-99) at line[pos..].
+        let put_two = |line: &mut [u8], pos: usize, val: u8| {
+            let d = pad2(val);
+            line[pos] = d[0];
+            line[pos + 1] = d[1];
+        };
+
+        let mut logged = 0u32;
+        for i in 0..count {
+            // 1. Die temp, reusing cmd_temp's exact integer conversion.
+            let (milli_c, adc_ok) = match self.read_die_temp() {
+                Some((_, mc)) => (mc, true),
+                None => (0, false),
+            };
+
+            // 2. Timestamp from the DS1302. Clamp each field to its valid range
+            // (mirrors fatfs::RtcTime) so a dead/unset clock still logs a
+            // valid-range time rather than garbage like 2065-00-00 45:85:85.
+            let (mut sec, mut minute, mut hour, mut date, mut month, mut year) =
+                self.rtc_now_fields();
+            year = year.min(99);
+            month = month.clamp(1, 12);
+            date = date.clamp(1, 31);
+            hour = hour.min(23);
+            minute = minute.min(59);
+            sec = sec.min(59);
+
+            // 3. Build "20YY-MM-DD HH:MM:SS,<T>.<d>C\r\n" in a stack buffer.
+            let mut line = [0u8; 48];
+            line[0] = b'2';
+            line[1] = b'0';
+            put_two(&mut line, 2, year);
+            line[4] = b'-';
+            put_two(&mut line, 5, month);
+            line[7] = b'-';
+            put_two(&mut line, 8, date);
+            line[10] = b' ';
+            put_two(&mut line, 11, hour);
+            line[13] = b':';
+            put_two(&mut line, 14, minute);
+            line[16] = b':';
+            put_two(&mut line, 17, sec);
+            line[19] = b',';
+            let mut len = 20usize;
+            if milli_c < 0 {
+                line[len] = b'-';
+                len += 1;
+            }
+            // Integer degrees (>= 0 after the sign), most-significant digit first.
+            let m = milli_c.unsigned_abs();
+            let whole = (m / 1000) as u32;
+            let mut digits = [0u8; 10];
+            let mut d = digits.len();
+            let mut w = whole;
+            if w == 0 {
+                d -= 1;
+                digits[d] = b'0';
+            }
+            while w > 0 {
+                d -= 1;
+                digits[d] = b'0' + (w % 10) as u8;
+                w /= 10;
+            }
+            for &g in &digits[d..] {
+                line[len] = g;
+                len += 1;
+            }
+            line[len] = b'.';
+            len += 1;
+            line[len] = b'0' + ((m % 1000) / 100) as u8; // one decimal
+            len += 1;
+            line[len] = b'C';
+            len += 1;
+            line[len] = b'\r';
+            len += 1;
+            line[len] = b'\n';
+            len += 1;
+
+            // 4. Append the row to LOG.CSV (create on first write).
+            let appended = self.with_root(b"log", |_, root| {
+                match root
+                    .open_file_in_dir("LOG.CSV", Mode::ReadWriteCreateOrAppend)
+                {
+                    Ok(f) => {
+                        let w = f.write(&line[..len]).is_ok();
+                        // close() flushes the directory entry + FAT; without it
+                        // the appended bytes would not be committed.
+                        f.close().is_ok() && w
+                    }
+                    Err(_) => false,
+                }
+            });
+
+            // 5. Status LED + counter. Success only if the ADC read AND the
+            // append both worked; any failure lights red.
+            let ok = adc_ok && appended == Some(true);
+            if ok {
+                logged += 1;
+            }
+            // Echo the CSV line so the sample is visible live.
+            self.out.put(&line[..len]);
+
+            // 6. Pulse the LED so each sample is a visible flash: 150 ms of
+            // colour (green ok / red fail), then dark for the rest of the
+            // interval. Skip the trailing dark wait after the last sample.
+            let _ = self.ws2812.set(if ok { 0x0020_0000 } else { 0x0000_2000 });
+            hl::sleep_for(150);
+            let _ = self.ws2812.set(0); // LED off
+            if i + 1 < count {
+                hl::sleep_for((secs as u64) * 1000 - 150);
+            }
+        }
+
+        self.out.put(b"log: ");
+        self.out.put_u32(logged);
+        self.out.put(b"/");
+        self.out.put_u32(count);
+        self.out.put(b" samples -> LOG.CSV\r\n");
     }
 
     fn cmd_adc(&mut self, verb: Option<&str>, ch: Option<&str>) {
