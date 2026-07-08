@@ -105,6 +105,9 @@ const MIC_CHANNEL: u8 = 2;
 /// The GPIO that ADC channel 2 taps (GP26 + channel). Put in analog mode before
 /// reading so the digital pad does not load the mic signal.
 const MIC_PIN: u8 = 28;
+/// Seengreat push buttons, silk-screened by GPIO. Each wires to GND, so with a
+/// pull-up the pin idles 1 (released) and reads 0 while pressed (active-low).
+const BUTTON_PINS: [u8; 2] = [20, 21];
 
 const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
@@ -136,6 +139,7 @@ const HELP: &[u8] = b"commands:\r\n\
   rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   mic [n]               sound level: peak-to-peak of n mic samples (GP28/ADC2)\r\n\
+  buttons [watch]       read (or watch 10s for edges) the buttons GP20/GP21\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
@@ -328,6 +332,7 @@ impl Shell {
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
             "mic" => self.cmd_mic(words.next()),
+            "buttons" => self.cmd_buttons(words.next()),
             "adc" => self.cmd_adc(words.next(), words.next()),
             #[cfg(feature = "cyw43")]
             "wifi" => self.cmd_wifi(words.next()),
@@ -1480,6 +1485,53 @@ impl Shell {
         self.out.put(b" n ");
         self.out.put_u32(got);
         self.out.put(b")\r\n");
+    }
+
+    /// `buttons`: read the two Seengreat push buttons (GP20, GP21). Each wires to
+    /// GND, so with a pull-up the pin idles 1 and reads 0 while pressed. Configure
+    /// input + pull-up (idempotent), then report each. Each button also lights an
+    /// on-board LED, so a press is visible on the board too.
+    fn cmd_buttons(&mut self, arg: Option<&str>) {
+        for &pin in BUTTON_PINS.iter() {
+            let _ = self.gpio.configure_input(pin);
+            let _ = self.gpio.set_pull(pin, drv_rp235x_gpio_api::PULL_UP);
+        }
+        if arg == Some("watch") {
+            // Watch ~10 s in a tight on-board loop, printing each button only when
+            // its state CHANGES (edge). Sampling on-device at ~kHz can't miss a
+            // normal press the way host polling does. 0 = pressed.
+            self.out.put(b"watching GP20/GP21 for 10s...\r\n");
+            let mut last = [1u8; 2];
+            let t0 = sys_get_timer().now;
+            while sys_get_timer().now - t0 < 10_000 {
+                for (i, &pin) in BUTTON_PINS.iter().enumerate() {
+                    let v = self.gpio.read(pin).unwrap_or(1);
+                    if v != last[i] {
+                        last[i] = v;
+                        self.out.put(b"GP");
+                        self.out.put_u32(pin as u32);
+                        self.out.put(if v == 0 {
+                            b" pressed\r\n" as &[u8]
+                        } else {
+                            b" released\r\n"
+                        });
+                    }
+                }
+            }
+            self.out.put(b"watch done\r\n");
+            return;
+        }
+        for &pin in BUTTON_PINS.iter() {
+            let pressed = self.gpio.read(pin).map(|v| v == 0).unwrap_or(false);
+            self.out.put(b"GP");
+            self.out.put_u32(pin as u32);
+            self.out.put(if pressed {
+                b" pressed   " as &[u8]
+            } else {
+                b" released  "
+            });
+        }
+        self.out.put(b"\r\n");
     }
 
     /// `log <count> [secs]`: capstone that COMPOSES four drivers -- ADC (die
