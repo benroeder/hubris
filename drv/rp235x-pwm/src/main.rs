@@ -160,6 +160,41 @@ const AUDIO_MIN_HZ: u32 = 50;
 /// Highest audio frequency accepted by `audio_start`, in Hz.
 const AUDIO_MAX_HZ: u32 = 8000;
 
+// --- Real-time mic -> jack passthrough (ADC free-run -> DMA -> PWM CC) ---
+//
+// The ADC free-runs on the mic channel (round-robin off, single channel),
+// pushing each 12-bit sample into its FIFO with a DREQ. DMA channel 0 is armed
+// to move one HALFWORD (u16) per DREQ from the fixed ADC FIFO register straight
+// into the slice-1 channel-A compare (GP18 = jack left). No ring, no CPU: the
+// ADC paces the DMA and the DMA paces the PWM duty. MONO -- only channel A is
+// fed; channel B (GP19 = right) stays parked at mid-scale and is silent.
+//
+// Carrier: slice 1 with DIV_INT=1, TOP=4095. The sample is 12-bit (0..=4095),
+// so a raw sample maps DIRECTLY and linearly to duty -- 2048 (the mic's mid-rail
+// DC bias) = 50% duty = silence, and the AC swing rides around it with no clip.
+// (TOP=1023 would clamp every sample >1023 to full duty and rail the output.)
+// Carrier rate = 150e6 / (1 * 4096) = 36.6 kHz, ultrasonic.
+
+/// ADC channel for the Seengreat mic: channel 2 = GP28.
+const MIC_ADC_CH: u8 = 2;
+/// ADC clock divider (DIV.INT). clk_adc = 48 MHz; sample period = 96 * (1 + INT)
+/// cycles, so INT=11 -> 96 * 12 = 1152 cycles -> ~41.7 kS/s.
+const MIC_DIV_INT: u16 = 11;
+/// DMA TREQ (dreq) select for the ADC FIFO (DREQ_ADC = 48): pace one transfer
+/// per ADC sample.
+const MIC_TREQ_ADC: u8 = 48;
+/// Counter wrap for the passthrough carrier: 12-bit, so a raw 0..=4095 ADC
+/// sample IS the channel-A compare value with no scaling.
+const MIC_CARRIER_TOP: u16 = 4095;
+/// Integer clock divider for the passthrough carrier: 150 MHz / (1 * 4096) =
+/// 36.6 kHz PWM carrier, ultrasonic.
+const MIC_CARRIER_DIV: u8 = 1;
+/// DMA CTRL data size: 1 = halfword (u16). One 12-bit ADC sample per transfer
+/// into channel A (low half of the CC register).
+const MIC_DATA_SIZE_HALFWORD: u8 = 1;
+/// ADC FIFO threshold: raise a DREQ once a single sample is present.
+const MIC_FIFO_THRESH: u8 = 1;
+
 /// Backing storage for the audio ring, sized to hold a whole 4096-byte
 /// naturally-aligned window regardless of where the linker places the static.
 ///
@@ -195,6 +230,7 @@ fn aligned_ring_ptr() -> *mut u32 {
 struct ServerImpl {
     pwm: rp235x_pac::PWM,
     dma: rp235x_pac::DMA,
+    adc: rp235x_pac::ADC,
 }
 
 impl ServerImpl {
@@ -489,6 +525,99 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         self.enable_slice(AUDIO_SLICE, false);
         Ok(())
     }
+
+    fn audio_mic_start(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<PwmError>> {
+        // Abort + drain any prior sine/audio DMA on ch0 before re-arming it for
+        // the passthrough (reconfiguring a BUSY channel is undefined on HW).
+        self.abort_audio_dma();
+
+        // Free-run the ADC on the mic channel. Per the datasheet the ADC must be
+        // enabled and started BEFORE the DMA is armed. Order: divider, then the
+        // FIFO (enable + DREQ + a 1-sample threshold), then CS (enable the
+        // converter, select the channel, and kick off continuous conversions).
+        self.adc
+            .div()
+            .write(|w| unsafe { w.int().bits(MIC_DIV_INT) });
+        self.adc.fcs().write(|w| unsafe {
+            w.en().bit(true);
+            w.dreq_en().bit(true);
+            w.thresh().bits(MIC_FIFO_THRESH);
+            w
+        });
+        // MODIFY (not write): keep the bits the adc_driver set at boot -- notably
+        // ts_en (temperature-sensor bias) and EN -- while selecting the mic
+        // channel and kicking off continuous conversions.
+        self.adc.cs().modify(|_, w| unsafe {
+            w.en().bit(true);
+            w.ainsel().bits(MIC_ADC_CH);
+            w.start_many().bit(true);
+            w
+        });
+
+        // Program slice 1 as the 12-bit carrier and park BOTH channels at
+        // mid-scale (silence) until the first sample lands. Only channel A
+        // (GP18/left) is DMA-fed; channel B (GP19/right) stays parked = silent.
+        self.program_slice(AUDIO_SLICE, MIC_CARRIER_DIV, MIC_CARRIER_TOP);
+        self.pwm.ch(AUDIO_SLICE).cc().modify(|_, w| unsafe {
+            w.a().bits(MIC_CARRIER_TOP / 2);
+            w.b().bits(MIC_CARRIER_TOP / 2);
+            w
+        });
+        self.enable_slice(AUDIO_SLICE, true);
+
+        // Arm DMA channel 0 to stream the ADC FIFO into the slice-1 channel-A
+        // compare, one HALFWORD (12-bit sample) per ADC DREQ. Read is the fixed
+        // FIFO register (no increment, no ring -- it is a streaming FIFO, not a
+        // buffer); write is the fixed CC register. A large finite reload runs for
+        // hours until audio_mic_stop aborts. Requires SECCFG_CH0.P cleared in the
+        // pre-kernel main (already done for the audio path this shares).
+        let read_addr = self.adc.fifo().as_ptr() as u32;
+        let write_addr = self.pwm.ch(AUDIO_SLICE).cc().as_ptr() as u32;
+        let ch = self.dma.ch(AUDIO_DMA_CH);
+        ch.ch_read_addr().write(|w| unsafe { w.bits(read_addr) });
+        ch.ch_write_addr().write(|w| unsafe { w.bits(write_addr) });
+        ch.ch_trans_count()
+            .write(|w| unsafe { w.count().bits(AUDIO_TRANS_COUNT) });
+        ch.ch_ctrl_trig().write(|w| unsafe {
+            w.en().bit(true);
+            w.data_size().bits(MIC_DATA_SIZE_HALFWORD);
+            w.incr_read().bit(false);
+            w.incr_write().bit(false);
+            w.ring_size().bits(0); // no ring: streaming from a FIFO
+            w.ring_sel().bit(false);
+            w.treq_sel().bits(MIC_TREQ_ADC);
+            w.chain_to().bits(AUDIO_DMA_CH as u8); // chain to self = no chain
+            w.high_priority().bit(false);
+            w
+        });
+        Ok(())
+    }
+
+    fn audio_mic_stop(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<PwmError>> {
+        // Abort + DRAIN the DMA channel, clear its EN, stop the ADC free-run, and
+        // silence the carrier. CRITICAL: only clear START_MANY -- leave the ADC
+        // ENABLED (and ts_en set). The adc_driver task enables the ADC once at
+        // boot and never re-enables it, so disabling it here would hang the next
+        // adc read/temp/mic (the driver spins on READY forever). Also stop the
+        // FIFO so it does not keep filling.
+        self.abort_audio_dma();
+        self.dma
+            .ch(AUDIO_DMA_CH)
+            .ch_ctrl_trig()
+            .write(|w| w.en().bit(false));
+        self.adc.cs().modify(|_, w| w.start_many().bit(false));
+        self.adc
+            .fcs()
+            .modify(|_, w| w.en().bit(false).dreq_en().bit(false));
+        self.enable_slice(AUDIO_SLICE, false);
+        Ok(())
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {
@@ -514,6 +643,7 @@ fn main() -> ! {
     let mut server = ServerImpl {
         pwm: p.PWM,
         dma: p.DMA,
+        adc: p.ADC,
     };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {

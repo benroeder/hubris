@@ -49,5 +49,17 @@ Interface(
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),
+        "audio_mic_start": (
+            description: "Real-time mic->jack passthrough: free-run the ADC on channel 2 (GP28) and DMA each 12-bit sample straight into the slice-1 chan-A compare (GP18 = jack left), zero CPU per sample. MONO: only chan A is fed; GP19 (right) stays parked mid-scale (silent). Non-blocking; runs until audio_mic_stop. Aborts any running audio/sine DMA on ch0 first.",
+            args: {},
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
+        "audio_mic_stop": (
+            description: "Stop the mic->jack passthrough: abort the DMA channel, stop the ADC free-run, and disable slice 1.",
+            args: {},
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
     },
 )
