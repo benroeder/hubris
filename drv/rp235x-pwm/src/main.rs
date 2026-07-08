@@ -96,25 +96,31 @@ const SINE_MAX_HZ: u32 = 5000;
 /// follow-up).
 const SINE_MAX_MS: u32 = 2000;
 
-// --- DMA-fed continuous audio (milestone 1: mono sine on the jack) ---
+// --- DMA-fed continuous audio (milestone 2: STEREO sine on the jack) ---
 //
 // Unlike `sine` (a busy-wait DDS that blocks the server and lands a few percent
 // flat), this path is the FIRST non-blocking, exact-pitch audio: a DMA ring
-// buffer of precomputed samples is streamed into the PWM slice-1 channel-A
-// compare, one sample per counter wrap. The DMA is paced entirely by the
-// hardware wrap (TREQ = PWM_WRAP1), so it consumes zero CPU and the sample rate
-// is exactly the wrap rate. The buffer holds a whole number of sine cycles, so
-// the ring loops seamlessly with no phase discontinuity.
+// buffer of precomputed samples is streamed into the PWM slice-1 CC register,
+// one sample per counter wrap. The DMA is paced entirely by the hardware wrap
+// (TREQ = PWM_WRAP1), so it consumes zero CPU and the sample rate is exactly
+// the wrap rate. The buffer holds a whole number of sine cycles, so the ring
+// loops seamlessly with no phase discontinuity.
+//
+// STEREO: each ring slot is now a u32 = `(right << 16) | left`, written whole
+// into the 32-bit CC register in ONE DMA transfer -- CC bits 0..15 = channel A
+// (GP18 = left), bits 16..31 = channel B (GP19 = right). `audio_start` fills
+// both halves with the same tone (both ears); `audio_stereo` fills each half
+// with its own frequency (true stereo).
 
-/// Samples in the live audio ring (the aligned window the DMA reads). 2048 u16
-/// = 4096 bytes, matching the ring wrap (`AUDIO_RING_SIZE`). Longer than the LUT
-/// so several whole sine cycles fit, keeping the loop-boundary pitch error
-/// small.
-const AUDIO_BUF_SAMPLES: usize = 2048;
-/// Ring size in bytes: 2048 u16 = 4096. The DMA read address wraps at this
+/// Samples in the live audio ring (the aligned window the DMA reads). Each
+/// sample is a u32 stereo pair, so 1024 u32 = 4096 bytes, matching the ring
+/// wrap (`AUDIO_RING_SIZE`). Longer than the LUT so several whole sine cycles
+/// fit, keeping the loop-boundary pitch error small.
+const AUDIO_BUF_SAMPLES: usize = 1024;
+/// Ring size in bytes: 1024 u32 = 4096. The DMA read address wraps at this
 /// power-of-two boundary, so the aligned window must start on a 4096-byte
 /// boundary (see `aligned_ring_ptr`).
-const AUDIO_RING_BYTES: usize = AUDIO_BUF_SAMPLES * 2;
+const AUDIO_RING_BYTES: usize = AUDIO_BUF_SAMPLES * 4;
 /// DMA read-address ring wrap, as log2 of the ring size in bytes (4096 -> 12).
 /// The read address wraps back to the window start every 4096 bytes, so the
 /// same samples replay forever.
@@ -126,17 +132,24 @@ const AUDIO_DIV_INT: u8 = 6;
 const AUDIO_TOP: u16 = 1023;
 /// Sample rate = one sample per wrap = clk_sys / (AUDIO_DIV_INT * (AUDIO_TOP+1))
 /// = 150e6 / (6 * 1024) = 24414 Hz. Both the pitch snap and the DMA pacing use
-/// this exact rate.
+/// this exact rate. Frequency resolution is AUDIO_SAMPLE_RATE / AUDIO_BUF_SAMPLES
+/// = 24414 / 1024 ~= 24 Hz -- the whole-cycle snap already quantizes to this,
+/// so the coarser step (vs the old 2048-sample buffer) is acceptable.
 const AUDIO_SAMPLE_RATE: u32 = 24414;
 /// DMA channel used for the audio ring.
 const AUDIO_DMA_CH: usize = 0;
-/// PWM slice that carries the audio (slice 1 chan A = GP18 = jack left).
+/// PWM slice that carries the audio (slice 1: chan A = GP18 = jack left,
+/// chan B = GP19 = jack right). A word write to the CC register drives both.
 const AUDIO_SLICE: usize = 1;
 /// DMA TREQ (dreq) select for the PWM slice-1 wrap: pace one transfer per wrap.
 const AUDIO_TREQ_PWM_WRAP1: u8 = 33;
-/// DMA CTRL data size: 1 = halfword (u16), matching the sample width and a
-/// 16-bit write into the low half (channel A) of the CC register.
-const AUDIO_DATA_SIZE_HALFWORD: u8 = 1;
+/// DMA CTRL data size: 2 = word (u32). Each transfer writes the full 32-bit CC
+/// register in one go: low half = channel A (left), high half = channel B
+/// (right). The read address auto-increments 4 bytes per transfer.
+const AUDIO_DATA_SIZE_WORD: u8 = 2;
+/// Bit position of channel B (right) in the packed u32 sample / the 32-bit CC
+/// register: A (left) in bits 0-15, B (right) in bits 16-31.
+const CH_B_SHIFT: u32 = 16;
 /// DMA NORMAL-mode transfer reload (28-bit max). ENDLESS mode with COUNT=0
 /// transferred nothing on HW, so a large finite reload is used: at
 /// `AUDIO_SAMPLE_RATE` this is ~3 h of continuous audio before the channel
@@ -159,22 +172,24 @@ const AUDIO_MAX_HZ: u32 = 8000;
 /// mis-measures (the region base is 32-aligned, not 4096-aligned). Instead we
 /// over-allocate by one extra ring and pick the first 4096-aligned window inside
 /// it at runtime (`aligned_ring_ptr`): 2x the ring guarantees a full aligned
-/// window fits after up to 4092 bytes of skip. The DMA reads are halfword (u16).
-/// Unit is ELEMENTS (u16 samples): two rings' worth, hence the 2x over-allocation.
+/// window fits after up to 4092 bytes of skip. The DMA reads are word (u32).
+/// Unit is ELEMENTS (u32 stereo samples): two rings' worth (2 * 1024 = 2048 u32
+/// = 8192 bytes, same store size as the old u16 version), hence the 2x
+/// over-allocation. The 4096-byte alignment requirement is unchanged.
 const AUDIO_STORE_LEN: usize = 2 * AUDIO_BUF_SAMPLES;
 
 /// Backing storage. The DMA engine (a bus master, not bound by the task MPU)
 /// reads the aligned window directly. Accessed only via raw pointers to avoid
 /// creating references to the `static mut` (`static_mut_refs`).
-static mut AUDIO_STORE: [u16; AUDIO_STORE_LEN] = [0; AUDIO_STORE_LEN];
+static mut AUDIO_STORE: [u32; AUDIO_STORE_LEN] = [0; AUDIO_STORE_LEN];
 
 /// Address of the first 4096-byte-aligned window inside `AUDIO_STORE`. This is
 /// the DMA read base and the fill target. Because the store is twice the ring
 /// size, a full 4096-byte window always fits at or after this address.
-fn aligned_ring_ptr() -> *mut u16 {
+fn aligned_ring_ptr() -> *mut u32 {
     let base = addr_of_mut!(AUDIO_STORE) as usize;
     let aligned = (base + (AUDIO_RING_BYTES - 1)) & !(AUDIO_RING_BYTES - 1);
-    aligned as *mut u16
+    aligned as *mut u32
 }
 
 struct ServerImpl {
@@ -207,6 +222,105 @@ impl ServerImpl {
             .chan_abort()
             .write(|w| unsafe { w.chan_abort().bits(1 << AUDIO_DMA_CH) });
         while self.dma.chan_abort().read().bits() & (1 << AUDIO_DMA_CH) != 0 {}
+    }
+
+    /// Snap a request to a whole number of sine cycles across the buffer so the
+    /// ring loops with no phase discontinuity. k = round(freq * samples /
+    /// sample_rate); the actual played frequency is k * sample_rate / samples.
+    /// k >= 1.
+    fn cycle_count(freq_hz: u32) -> u32 {
+        ((freq_hz as u64 * AUDIO_BUF_SAMPLES as u64
+            + AUDIO_SAMPLE_RATE as u64 / 2)
+            / AUDIO_SAMPLE_RATE as u64)
+            .max(1) as u32
+    }
+
+    /// Fill the aligned u32 ring window with a stereo sine pair: `k_left` whole
+    /// cycles on channel A (low half, GP18/left) and `k_right` whole cycles on
+    /// channel B (high half, GP19/right). For each slot, index the 256-entry
+    /// SINE_LUT so that k whole cycles span the AUDIO_BUF_SAMPLES-slot window.
+    /// The LUT is already scaled 0..=AUDIO_TOP, so its values are the compare
+    /// value directly. All arithmetic is u32-safe: i * k * 256 stays well under
+    /// u32::MAX (i < 1024, k <= ~336, so < 89M).
+    fn fill_ring(&self, k_left: u32, k_right: u32) {
+        let lut_len = SINE_LUT.len() as u32;
+        let ring = aligned_ring_ptr();
+        for i in 0..AUDIO_BUF_SAMPLES {
+            let idx_l = ((i as u32).wrapping_mul(k_left).wrapping_mul(lut_len)
+                / AUDIO_BUF_SAMPLES as u32)
+                % lut_len;
+            let idx_r =
+                ((i as u32).wrapping_mul(k_right).wrapping_mul(lut_len)
+                    / AUDIO_BUF_SAMPLES as u32)
+                    % lut_len;
+            let left = SINE_LUT[idx_l as usize] as u32;
+            let right = SINE_LUT[idx_r as usize] as u32;
+            let pair = (right << CH_B_SHIFT) | left;
+            // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE,
+            // which is 2x the ring size, so slots 0..AUDIO_BUF_SAMPLES are in
+            // bounds. Single-threaded server, no references taken, no aliasing.
+            unsafe {
+                ring.add(i).write_volatile(pair);
+            }
+        }
+    }
+
+    /// Shared arm path for `audio_start` and `audio_stereo`: abort any running
+    /// audio DMA, fill the ring with the two (possibly equal) tones, start the
+    /// carrier slice with both CC channels parked at mid-scale, and arm the DMA
+    /// for word (32-bit) writes into the full CC register.
+    fn arm_audio(&self, freq_left: u32, freq_right: u32) {
+        // Abort + drain any currently-running audio DMA before refilling the
+        // ring or re-arming. Reconfiguring or re-triggering a BUSY channel
+        // (e.g. back-to-back `audio <hz>` with no `stop`) is undefined on the
+        // RP2350 and can desync the read pointer or wedge the channel.
+        self.abort_audio_dma();
+
+        self.fill_ring(
+            Self::cycle_count(freq_left),
+            Self::cycle_count(freq_right),
+        );
+
+        // Program slice 1 as the carrier and park BOTH channels at mid-scale so
+        // both pins sit at the DC bias until the first DMA sample lands.
+        self.program_slice(AUDIO_SLICE, AUDIO_DIV_INT, AUDIO_TOP);
+        self.pwm.ch(AUDIO_SLICE).cc().modify(|_, w| unsafe {
+            w.a().bits(AUDIO_TOP / 2);
+            w.b().bits(AUDIO_TOP / 2);
+            w
+        });
+        self.enable_slice(AUDIO_SLICE, true);
+
+        // Configure DMA channel 0 to stream the ring into the slice-1 CC
+        // register, one WORD per PWM_WRAP1 dreq. A 32-bit write sets both
+        // channel A (low half) and channel B (high half). Read increments +
+        // wraps the ring (RING_SIZE); write is fixed at CC. NORMAL mode with a
+        // large finite reload loops for hours until audio_stop aborts. Requires
+        // SECCFG_CH0.P cleared in the pre-kernel main so this unprivileged task
+        // may program the channel.
+        let read_addr = aligned_ring_ptr() as u32;
+        let write_addr = self.pwm.ch(AUDIO_SLICE).cc().as_ptr() as u32;
+        let ch = self.dma.ch(AUDIO_DMA_CH);
+        ch.ch_read_addr().write(|w| unsafe { w.bits(read_addr) });
+        ch.ch_write_addr().write(|w| unsafe { w.bits(write_addr) });
+        // NORMAL mode with a large finite reload (AUDIO_TRANS_COUNT): ENDLESS
+        // mode with COUNT=0 started zero transfers on HW (CC stuck at the park
+        // value, BUSY=0), so a nonzero reload is what actually arms the
+        // sequence.
+        ch.ch_trans_count()
+            .write(|w| unsafe { w.count().bits(AUDIO_TRANS_COUNT) });
+        ch.ch_ctrl_trig().write(|w| unsafe {
+            w.en().bit(true);
+            w.data_size().bits(AUDIO_DATA_SIZE_WORD);
+            w.incr_read().bit(true);
+            w.incr_write().bit(false);
+            w.ring_size().bits(AUDIO_RING_SIZE);
+            w.ring_sel().bit(false); // ring on the READ address
+            w.treq_sel().bits(AUDIO_TREQ_PWM_WRAP1);
+            w.chain_to().bits(AUDIO_DMA_CH as u8); // chain to self = no chain
+            w.high_priority().bit(false);
+            w
+        });
     }
 }
 
@@ -339,77 +453,25 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         if !(AUDIO_MIN_HZ..=AUDIO_MAX_HZ).contains(&freq_hz) {
             return Err(PwmError::BadArg.into());
         }
-        // Abort + drain any currently-running audio DMA before refilling the ring
-        // or re-arming. Reconfiguring or re-triggering a BUSY channel (e.g.
-        // back-to-back `audio <hz>` with no `stop`) is undefined on the RP2350 and
-        // can desync the read pointer or wedge the channel.
-        self.abort_audio_dma();
+        // Same tone in both ears: arm with equal left/right frequencies. The
+        // shell reports the request, not the snapped value.
+        self.arm_audio(freq_hz, freq_hz);
+        Ok(())
+    }
 
-        // Snap the request to a whole number of sine cycles across the buffer so
-        // the ring loops with no phase discontinuity. k = round(freq * samples /
-        // sample_rate); the actual played frequency is k * sample_rate / samples
-        // (the shell reports the request, not the snapped value). k >= 1.
-        let k = ((freq_hz as u64 * AUDIO_BUF_SAMPLES as u64
-            + AUDIO_SAMPLE_RATE as u64 / 2)
-            / AUDIO_SAMPLE_RATE as u64)
-            .max(1) as u32;
-
-        // Fill the aligned ring window: for each slot, index the 256-entry
-        // SINE_LUT so that k whole cycles span the AUDIO_BUF_SAMPLES-slot window.
-        // The LUT is already scaled 0..=AUDIO_TOP, so its values are the
-        // channel-A compare directly. All arithmetic is done in u32 to avoid
-        // overflow (i * k * 256 stays well under u32::MAX for i < 2048, k <=
-        // ~670).
-        let lut_len = SINE_LUT.len() as u32;
-        let ring = aligned_ring_ptr();
-        for i in 0..AUDIO_BUF_SAMPLES {
-            let idx = ((i as u32).wrapping_mul(k).wrapping_mul(lut_len)
-                / AUDIO_BUF_SAMPLES as u32)
-                % lut_len;
-            // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE, which
-            // is 2x the ring size, so slots 0..AUDIO_BUF_SAMPLES are in bounds.
-            // Single-threaded server, no references taken, no aliasing.
-            unsafe {
-                ring.add(i).write_volatile(SINE_LUT[idx as usize]);
-            }
+    fn audio_stereo(
+        &mut self,
+        _: &RecvMessage,
+        hz_left: u32,
+        hz_right: u32,
+    ) -> Result<(), RequestError<PwmError>> {
+        if !(AUDIO_MIN_HZ..=AUDIO_MAX_HZ).contains(&hz_left)
+            || !(AUDIO_MIN_HZ..=AUDIO_MAX_HZ).contains(&hz_right)
+        {
+            return Err(PwmError::BadArg.into());
         }
-
-        // Program slice 1 as the carrier and park channel A at mid-scale so the
-        // pin sits at the DC bias until the first DMA sample lands.
-        self.program_slice(AUDIO_SLICE, AUDIO_DIV_INT, AUDIO_TOP);
-        self.pwm
-            .ch(AUDIO_SLICE)
-            .cc()
-            .modify(|_, w| unsafe { w.a().bits(AUDIO_TOP / 2) });
-        self.enable_slice(AUDIO_SLICE, true);
-
-        // Configure DMA channel 0 to stream the ring into the slice-1 CC low half
-        // (channel A), one halfword per PWM_WRAP1 dreq. Read increments + wraps
-        // the ring (RING_SIZE), write is fixed at CC, ENDLESS mode loops forever
-        // until audio_stop aborts. Requires SECCFG_CH0.P cleared in the pre-kernel
-        // main so this unprivileged task may program the channel.
-        let read_addr = ring as u32;
-        let write_addr = self.pwm.ch(AUDIO_SLICE).cc().as_ptr() as u32;
-        let ch = self.dma.ch(AUDIO_DMA_CH);
-        ch.ch_read_addr().write(|w| unsafe { w.bits(read_addr) });
-        ch.ch_write_addr().write(|w| unsafe { w.bits(write_addr) });
-        // NORMAL mode with a large finite reload (AUDIO_TRANS_COUNT): ENDLESS mode
-        // with COUNT=0 started zero transfers on HW (CC stuck at the park value,
-        // BUSY=0), so a nonzero reload is what actually arms the sequence.
-        ch.ch_trans_count()
-            .write(|w| unsafe { w.count().bits(AUDIO_TRANS_COUNT) });
-        ch.ch_ctrl_trig().write(|w| unsafe {
-            w.en().bit(true);
-            w.data_size().bits(AUDIO_DATA_SIZE_HALFWORD);
-            w.incr_read().bit(true);
-            w.incr_write().bit(false);
-            w.ring_size().bits(AUDIO_RING_SIZE);
-            w.ring_sel().bit(false); // ring on the READ address
-            w.treq_sel().bits(AUDIO_TREQ_PWM_WRAP1);
-            w.chain_to().bits(AUDIO_DMA_CH as u8); // chain to self = no chain
-            w.high_priority().bit(false);
-            w
-        });
+        // True stereo: independent tone per ear (GP18 = left, GP19 = right).
+        self.arm_audio(hz_left, hz_right);
         Ok(())
     }
 
