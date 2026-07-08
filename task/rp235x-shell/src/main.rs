@@ -98,6 +98,13 @@ const AUDIO_LEFT_PIN: u8 = BUZZER_PIN;
 /// Audio jack RIGHT channel: GP19 = PWM slice 1 channel B. Used by the DMA-fed
 /// stereo `audio`/`audio2` commands (the buzzer/sine/tone paths use only GP18).
 const AUDIO_RIGHT_PIN: u8 = 19;
+/// Seengreat microphone: ADC channel 2 = GP28 (needs the Mic_SW jumper on).
+/// Confirmed on HW -- GP28 biases mid-rail (~2050) and swings with sound, while
+/// GP27 (the wiki's claim) sits railed-high. The wiki table mislabels this pin.
+const MIC_CHANNEL: u8 = 2;
+/// The GPIO that ADC channel 2 taps (GP26 + channel). Put in analog mode before
+/// reading so the digital pad does not load the mic signal.
+const MIC_PIN: u8 = 28;
 
 const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
@@ -128,6 +135,7 @@ const HELP: &[u8] = b"commands:\r\n\
   flash write <hex-off> <hex..>  program bytes (within one 256B page)\r\n\
   rom <CC>              boot-ROM table lookup, e.g. rom FO\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
+  mic [n]               sound level: peak-to-peak of n mic samples (GP28/ADC2)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
@@ -319,6 +327,7 @@ impl Shell {
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
             "temp" => self.cmd_temp(),
+            "mic" => self.cmd_mic(words.next()),
             "adc" => self.cmd_adc(words.next(), words.next()),
             #[cfg(feature = "cyw43")]
             "wifi" => self.cmd_wifi(words.next()),
@@ -1427,6 +1436,50 @@ impl Shell {
             }
             None => self.out.put(b"adc error\r\n"),
         }
+    }
+
+    /// `mic [n]`: crude sound-level meter. Sample the Seengreat microphone (ADC
+    /// ch2 = GP28) `n` times in a tight loop and report the peak-to-peak swing
+    /// (max - min). The mic output sits on a DC bias; the AC swing is the
+    /// loudness, so silence reads a small pp (noise floor) and a clap/voice reads
+    /// a large one. Needs the board's Mic_SW jumper on. Blocks for the sample
+    /// window (a few ms), single IPC read per sample.
+    fn cmd_mic(&mut self, n: Option<&str>) {
+        let n = n
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(512)
+            .clamp(16, 8192);
+        // Put GP28 in analog mode so the digital pad does not load the mic (the
+        // ADC driver reads channels 0-3 "approximate" until this is done).
+        let _ = self.gpio.configure_analog(MIC_PIN);
+        let mut min = 4095u32;
+        let mut max = 0u32;
+        let mut got = 0u32;
+        for _ in 0..n {
+            if let Ok(v) = self.adc.read(MIC_CHANNEL) {
+                let v = v as u32;
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
+                got += 1;
+            }
+        }
+        if got == 0 {
+            self.out.put(b"adc error\r\n");
+            return;
+        }
+        self.out.put(b"mic pp=");
+        self.out.put_u32(max - min);
+        self.out.put(b" (min ");
+        self.out.put_u32(min);
+        self.out.put(b" max ");
+        self.out.put_u32(max);
+        self.out.put(b" n ");
+        self.out.put_u32(got);
+        self.out.put(b")\r\n");
     }
 
     /// `log <count> [secs]`: capstone that COMPOSES four drivers -- ADC (die

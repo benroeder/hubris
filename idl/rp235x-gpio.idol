@@ -18,6 +18,12 @@ Interface(
             reply: Result(ok: "()", err: CLike("GpioError")),
             idempotent: true,
         ),
+        "configure_analog": (
+            description: "Put a pin in analog mode for the ADC: pad output-disable (OD=1) AND input-disable (IE=0) so the digital pad neither drives nor loads the pin, and NULL funcsel. Needed for a clean read of ADC channels 0-3 (GPIO26-29).",
+            args: { "pin": "u8" },
+            reply: Result(ok: "()", err: CLike("GpioError")),
+            idempotent: true,
+        ),
         "set_high": (
             args: { "pin": "u8" },
             reply: Result(ok: "()", err: CLike("GpioError")),
