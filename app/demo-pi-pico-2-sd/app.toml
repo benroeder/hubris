@@ -123,8 +123,8 @@ start = true
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 49152, ram = 8192}
-stacksize = 4096
+max-sizes = {flash = 57344, ram = 12288}
+stacksize = 8192
 start = true
 features = ["sdcard", "fat", "ds1302"]
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302"]
