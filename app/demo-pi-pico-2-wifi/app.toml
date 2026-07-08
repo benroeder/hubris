@@ -105,7 +105,7 @@ extern-regions = ["rom", "xip"]
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 32768, ram = 4096}
+max-sizes = {flash = 40960, ram = 4096}
 stacksize = 2048
 start = true
 features = ["cyw43"]
