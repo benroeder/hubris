@@ -110,7 +110,11 @@ pub fn init_clocks(p: &Peripherals) -> u32 {
     SYS_CLK_HZ / 1000
 }
 
-/// Open ACCESSCTRL so *unprivileged* code can reach the WATCHDOG and TICKS
+/// Pre-kernel privileged peripheral setup for unprivileged tasks. Despite the
+/// `_for_reboot` name (its original sole purpose), this now also brings up the
+/// DMA block for the audio path (see the end of the body).
+///
+/// Opens ACCESSCTRL so *unprivileged* code can reach the WATCHDOG and TICKS
 /// blocks. The boot-ROM `reboot` API (datasheet sec 5.4.8.24) arms the reboot
 /// through watchdog scratch/trigger registers, and ROM code runs at the
 /// caller's privilege -- without this grant an unprivileged task calling it
@@ -134,4 +138,15 @@ pub fn open_accessctrl_for_reboot(p: &Peripherals) {
     // flash. Safe on this system because the whole image runs from SRAM
     // (LOAD_MAP boot) -- nothing fetches from flash at runtime.
     p.ACCESSCTRL.xip_qmi().write(|w| unsafe { w.bits(GRANT_SU) });
+    // DMA bring-up for the PWM audio path (a continuous ring-buffer DMA feeds
+    // the PWM compare register). Un-reset DMA, then clear SECCFG_CH0.P so an
+    // UNPRIVILEGED task may program channel 0: at reset P=1 makes the channel
+    // "controllable only from a Privileged context", so the task's writes to the
+    // channel CTRL/READ_ADDR/WRITE_ADDR/TRANS_COUNT registers bus-fault. Keep S=1
+    // (secure). No ACCESSCTRL grant is needed -- the DMA entry already defaults to
+    // secure-any-master; SECCFG was the real gate (pinpointed via humility).
+    // Harmless in images that never touch DMA (the block just sits idle).
+    p.RESETS.reset().modify(|_, w| w.dma().clear_bit());
+    while !p.RESETS.reset_done().read().dma().bit_is_set() {}
+    p.DMA.seccfg_ch0().modify(|_, w| w.p().clear_bit());
 }

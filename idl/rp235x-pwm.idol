@@ -31,5 +31,17 @@ Interface(
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),
+        "audio_start": (
+            description: "Start a seamless-looping mono sine near `freq_hz` (50..=8000) on the audio jack (GP18 = slice 1 chan A), fed by a DMA ring paced by the slice-1 wrap. Non-blocking: returns immediately and the DMA loops with zero CPU. Pitch snaps to whole cycles across the sample buffer.",
+            args: { "freq_hz": "u32" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
+        "audio_stop": (
+            description: "Stop the DMA-fed audio-jack sine: abort the DMA channel and disable slice 1.",
+            args: {},
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
     },
 )
