@@ -87,6 +87,11 @@ task_slot!(SDCARD, sdcard);
 
 /// Pico 2 onboard LED, the `led` command's target.
 const LED_PIN: u8 = 25;
+/// Seengreat buzzer: GP18 = PWM slice 1 channel A. GP18 is also SPI0 SCK, so do
+/// not use `spi role` in the same session. The board's BUZZER_SW jumper must be
+/// on for the piezo to sound.
+const BUZZER_PIN: u8 = 18;
+const BUZZER_SLICE: u8 = 1;
 
 const PROMPT: &[u8] = b"hubris> ";
 const HELP: &[u8] = b"commands:\r\n\
@@ -119,6 +124,8 @@ const HELP: &[u8] = b"commands:\r\n\
   temp                  die temperature (internal sensor via ADC)\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
+  buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
+  beep                  short 1 kHz beep\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
   push <size> <crc>     stream own flash image to a peer over UART\r\n\
@@ -291,6 +298,8 @@ impl Shell {
             #[cfg(feature = "mailbox")]
             "core1" => self.cmd_core1(words.next(), words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
+            "buzzer" => self.cmd_buzzer(words.next(), words.next()),
+            "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
             "spi" => self.cmd_spi(line, words.next()),
@@ -431,6 +440,43 @@ impl Shell {
         } else {
             b"error\r\n"
         });
+    }
+
+    /// `buzzer <hz> <ms>`: play a tone on the Seengreat piezo buzzer (GP18 =
+    /// PWM slice 1 channel A, funcsel 4). Routes GP18 to PWM, then calls the
+    /// PWM server's `tone` op which plays for `ms` and then silences the slice.
+    ///
+    /// GP18 is also SPI0 SCK, so this must not be run in the same session as
+    /// `spi role`/`spi bench` (which would reclaim the pin for SPI0). The buzzer
+    /// deliberately uses slice 1, while `led dim` uses slice 4, so they never
+    /// clash.
+    /// Route the buzzer pin to PWM (funcsel 4) and play `freq` Hz for `ms` ms on
+    /// its slice. Returns false if the GPIO routing or the PWM `tone` op failed.
+    fn play_tone(&mut self, freq: u32, ms: u32) -> bool {
+        self.gpio.set_function(BUZZER_PIN, 4).is_ok()
+            && self.pwm.tone(BUZZER_SLICE, freq, ms).is_ok()
+    }
+
+    fn cmd_buzzer(&mut self, freq: Option<&str>, ms: Option<&str>) {
+        let freq = freq.and_then(|s| s.parse::<u32>().ok());
+        let ms = ms.and_then(|s| s.parse::<u32>().ok());
+        let (Some(freq), Some(ms)) = (freq, ms) else {
+            self.out.put(b"usage: buzzer <hz> <ms> (hz 100-6000)\r\n");
+            return;
+        };
+        let ok = self.play_tone(freq, ms);
+        self.out.put(if ok {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"buzzer failed (hz 100-6000)\r\n"
+        });
+    }
+
+    /// `beep`: a default 1 kHz, 200 ms beep on the GP18 buzzer (slice 1).
+    fn cmd_beep(&mut self) {
+        let ok = self.play_tone(1000, 200);
+        self.out
+            .put(if ok { b"ok\r\n" as &[u8] } else { b"error\r\n" });
     }
 
     /// `rgb <r> <g> <b>`: set the WS2812 (NeoPixel) on GP22. Each channel is a

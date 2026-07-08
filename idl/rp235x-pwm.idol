@@ -19,5 +19,11 @@ Interface(
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),
+        "tone": (
+            description: "Play a square wave on channel A of `slice` at `freq_hz` (100..=6000) for `ms`, then stop (silence).",
+            args: { "slice": "u8", "freq_hz": "u32", "ms": "u32" },
+            reply: Result(ok: "()", err: CLike("PwmError")),
+            idempotent: true,
+        ),
     },
 )
