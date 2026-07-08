@@ -56,8 +56,10 @@ const FUNCSEL_SIO: u8 = 5;
 const INIT_CPSDVSR: u8 = 254;
 /// INIT-speed serial-clock-rate: divide-by-2 with CPSDVSR above.
 const INIT_SCR: u8 = 1;
-/// DATA-speed prescale: 150 MHz / 24 = ~6.25 MHz (SCR = 0).
-const DATA_CPSDVSR: u8 = 24;
+/// DATA-speed prescale: 150 MHz / 6 = 25 MHz (SCR = 0) -- the SD SPI-mode
+/// default-speed ceiling. The card is clocked at this rate only after the
+/// <400 kHz init handshake succeeds.
+const DATA_CPSDVSR: u8 = 6;
 /// DATA-speed serial-clock-rate.
 const DATA_SCR: u8 = 0;
 /// PL022 data-size select for 8-bit frames (DSS = N-1).
@@ -88,6 +90,9 @@ const WRITE_BUSY: u32 = 2_000_000;
 
 /// One 512-byte SD block.
 const BLOCK_LEN: usize = 512;
+/// PL022 TX/RX FIFO depth -- how many byte transfers can be kept in flight when
+/// pipelining a block transfer without overrunning the RX FIFO.
+const FIFO_DEPTH: usize = 8;
 /// SD data-start token that precedes a read data block.
 const TOKEN_START: u8 = 0xFE;
 /// Filler byte clocked out to read a byte in (MOSI held high).
@@ -146,6 +151,52 @@ impl ServerImpl {
     /// Clock in one byte (send 0xFF).
     fn read_byte(&self) -> u8 {
         self.xfer(FILLER)
+    }
+
+    /// Pipeline `n` byte transfers through the PL022's 8-deep FIFOs: keep the TX
+    /// FIFO fed while draining RX, so the SPI clocks continuously instead of
+    /// stalling a full poll-write-poll-read per byte. `tx_at(i)` supplies the
+    /// i-th outbound byte; `rx_at(i, b)` receives the i-th inbound byte (both
+    /// monomorphize away, so read and write share one FIFO invariant). Bytes in
+    /// flight are capped at the RX FIFO depth so RX never overruns. Bounded by
+    /// SPIN_LIMIT no-progress iterations (returns false) so a bus that stalls
+    /// mid-transfer errors instead of wedging the server, like `xfer`.
+    fn pipeline(
+        &self,
+        n: usize,
+        tx_at: impl Fn(usize) -> u8,
+        mut rx_at: impl FnMut(usize, u8),
+    ) -> bool {
+        let (mut tx, mut rx) = (0usize, 0usize);
+        let mut spins = 0u32;
+        while rx < n {
+            let before = rx;
+            while tx < n
+                && tx - rx < FIFO_DEPTH
+                && self.spi.sspsr().read().tnf().bit_is_set()
+            {
+                self.spi
+                    .sspdr()
+                    .write(|w| unsafe { w.data().bits(tx_at(tx) as u16) });
+                tx += 1;
+            }
+            while rx < tx && self.spi.sspsr().read().rne().bit_is_set() {
+                rx_at(rx, self.spi.sspdr().read().data().bits() as u8);
+                rx += 1;
+            }
+            // Only iterations that drain nothing count toward the bound, so a
+            // stalled bus (no RX progress) trips SPIN_LIMIT while normal
+            // in-flight latency just resets the counter.
+            if rx == before {
+                spins += 1;
+                if spins > SPIN_LIMIT {
+                    return false;
+                }
+            } else {
+                spins = 0;
+            }
+        }
+        true
     }
 
     /// Set the PL022 SPI clock divider. SSE must be cleared before touching the
@@ -350,10 +401,11 @@ impl idl::InOrderRp235xSdcardImpl for ServerImpl {
             return Err(SdError::Timeout.into());
         }
 
-        // Read the 512 data bytes, then discard the 2 CRC bytes.
+        // Read the 512 data bytes (FIFO-pipelined), then discard the 2 CRC.
         let mut buf = [0u8; BLOCK_LEN];
-        for b in buf.iter_mut() {
-            *b = self.read_byte();
+        if !self.pipeline(BLOCK_LEN, |_| FILLER, |i, b| buf[i] = b) {
+            self.cs_high();
+            return Err(SdError::Timeout.into());
         }
         self.read_byte();
         self.read_byte();
@@ -406,8 +458,9 @@ impl idl::InOrderRp235xSdcardImpl for ServerImpl {
         // dummy CRC bytes (SPI-mode CRC is off by default).
         self.xfer(FILLER);
         self.xfer(TOKEN_START);
-        for &b in buf.iter() {
-            self.xfer(b);
+        if !self.pipeline(BLOCK_LEN, |i| buf[i], |_, _| {}) {
+            self.cs_high();
+            return Err(SdError::Timeout.into());
         }
         self.xfer(FILLER);
         self.xfer(FILLER);
