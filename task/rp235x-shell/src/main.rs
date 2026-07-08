@@ -125,6 +125,7 @@ const HELP: &[u8] = b"commands:\r\n\
   adc read <ch>         raw 12-bit ADC read (0-3 = GPIO26-29, 4 = temp)\r\n\
   led dim <pct>         PWM-dim the LED (led on|off|blink returns it to GPIO)\r\n\
   buzzer <hz> <ms>      play a tone on the GP18 buzzer\r\n\
+  sine <hz> <ms>        play a sine (PWM-DAC) on the buzzer\r\n\
   beep                  short 1 kHz beep\r\n\
   update <size-hex> <crc32-hex>  receive image over USB; write flash; verify\r\n\
   uart-update <size> <crc>  receive image over UART from a peer push\r\n\
@@ -299,6 +300,7 @@ impl Shell {
             "core1" => self.cmd_core1(words.next(), words.next(), words.next()),
             "led" => self.cmd_led(words.next(), words.next()),
             "buzzer" => self.cmd_buzzer(words.next(), words.next()),
+            "sine" => self.cmd_sine(words.next(), words.next()),
             "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
@@ -450,11 +452,17 @@ impl Shell {
     /// `spi role`/`spi bench` (which would reclaim the pin for SPI0). The buzzer
     /// deliberately uses slice 1, while `led dim` uses slice 4, so they never
     /// clash.
-    /// Route the buzzer pin to PWM (funcsel 4) and play `freq` Hz for `ms` ms on
-    /// its slice. Returns false if the GPIO routing or the PWM `tone` op failed.
-    fn play_tone(&mut self, freq: u32, ms: u32) -> bool {
+    /// Route the buzzer pin to PWM (funcsel 4). Returns false if the GPIO
+    /// routing failed. Shared by `play_tone` and `cmd_sine` so the pin/funcsel
+    /// live in one place.
+    fn route_buzzer(&mut self) -> bool {
         self.gpio.set_function(BUZZER_PIN, 4).is_ok()
-            && self.pwm.tone(BUZZER_SLICE, freq, ms).is_ok()
+    }
+
+    /// Route the buzzer pin to PWM and play `freq` Hz for `ms` ms on its slice.
+    /// Returns false if the GPIO routing or the PWM `tone` op failed.
+    fn play_tone(&mut self, freq: u32, ms: u32) -> bool {
+        self.route_buzzer() && self.pwm.tone(BUZZER_SLICE, freq, ms).is_ok()
     }
 
     fn cmd_buzzer(&mut self, freq: Option<&str>, ms: Option<&str>) {
@@ -469,6 +477,26 @@ impl Shell {
             b"ok\r\n" as &[u8]
         } else {
             b"buzzer failed (hz 100-6000)\r\n"
+        });
+    }
+
+    /// `sine <hz> <ms>`: play a sine wave on the GP18 buzzer using the PWM
+    /// driver's `sine` op (PWM-as-1-bit-DAC via DDS over a LUT). Routes GP18 to
+    /// PWM (funcsel 4), same pin/slice as `buzzer`, then plays for `ms` and
+    /// silences. Compare against the square-wave `buzzer` by ear.
+    fn cmd_sine(&mut self, freq: Option<&str>, ms: Option<&str>) {
+        let freq = freq.and_then(|s| s.parse::<u32>().ok());
+        let ms = ms.and_then(|s| s.parse::<u32>().ok());
+        let (Some(freq), Some(ms)) = (freq, ms) else {
+            self.out.put(b"usage: sine <hz> <ms> (hz 50-5000)\r\n");
+            return;
+        };
+        let ok = self.route_buzzer()
+            && self.pwm.sine(BUZZER_SLICE, freq, ms).is_ok();
+        self.out.put(if ok {
+            b"ok\r\n" as &[u8]
+        } else {
+            b"sine failed (hz 50-5000)\r\n"
         });
     }
 

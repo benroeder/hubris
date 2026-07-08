@@ -24,6 +24,10 @@ use userlib::{RecvMessage, task_slot};
 
 task_slot!(SYS, sys);
 
+// 256-entry sine LUT (u16, scaled 0..=SINE_TOP with a half-scale DC offset),
+// generated on the host by build.rs. Pulled in as `SINE_LUT`.
+include!(concat!(env!("OUT_DIR"), "/sine_lut.rs"));
+
 /// The RP2350 has twelve PWM slices.
 const MAX_SLICE: u8 = 11;
 /// Counter wrap for a 1 kHz period at clk_sys/150 = 1 MHz.
@@ -43,6 +47,53 @@ const TONE_MIN_HZ: u32 = 100;
 const TONE_MAX_HZ: u32 = 6000;
 /// Longest tone duration accepted by `tone`, in ms (clamped, not rejected).
 const TONE_MAX_MS: u32 = 5000;
+
+// --- Sine (PWM-as-1-bit-DAC via DDS) ---
+//
+// The carrier is a fast, ultrasonic PWM whose DUTY we modulate at an audio
+// sample rate to trace a sine. A phase accumulator (DDS) indexes the sine LUT;
+// each sample writes a new channel-A compare value, and the RC of the load (or
+// the piezo's own mass) averages the 1-bit carrier back into an analog voltage.
+
+/// Peak duty compare value for sine samples: 10-bit resolution. MUST match
+/// `SINE_TOP` in build.rs (the LUT is scaled to this counter wrap).
+const SINE_TOP: u16 = 1023;
+/// Integer divider for the sine carrier: 150 MHz / (SINE_TOP + 1 = 1024) gives
+/// a ~146 kHz PWM carrier -- comfortably ultrasonic, so the carrier itself is
+/// inaudible and only the duty-modulated audio envelope is heard.
+const SINE_DIV_INT: u8 = 1;
+/// Audio sample rate of the DDS loop, in Hz. 20 kHz covers the 50..=5000 Hz
+/// tone range with headroom above Nyquist.
+const SAMPLE_RATE: u32 = 20_000;
+/// Approximate clk_sys cycles between samples at SAMPLE_RATE: 150 MHz / 20 kHz
+/// = 7500. The DDS loop paces each sample with `cortex_m::asm::delay`, a
+/// calibrated busy-wait of roughly this many CPU cycles. Because the per-sample
+/// LUT read plus PAC write (tens of cycles) is NOT subtracted, the true sample
+/// period is a little longer than SINE_CYCLES_PER_SAMPLE, so the effective
+/// sample rate is slightly below SAMPLE_RATE and the pitch is APPROXIMATE (a
+/// few percent flat, constant across frequency). This is deliberate: the
+/// RP2350 hardware microsecond TIMER is not usable here because its feeding
+/// TICKS tick generator is never enabled at boot (neither the ROM nor
+/// rp235x-startup turns it on), so TIMERAWL stays stuck at zero -- the same
+/// wedge the earlier DWT (CYCCNT) approach hit. An exact hardware-timed rate
+/// lands with the planned DMA-paced follow-up. `asm::delay` never wedges: it is
+/// a self-contained loop that does not depend on any counter peripheral.
+const SINE_CYCLES_PER_SAMPLE: u32 = 150_000_000 / SAMPLE_RATE;
+/// DDS phase accumulator right-shift to index SINE_LUT: 32 - log2(SINE_LUT_LEN
+/// = 256) = 24. Pairs with build.rs's SINE_LUT_LEN (change both together).
+const SINE_LUT_INDEX_SHIFT: u32 = 24;
+/// Lowest sine frequency accepted, in Hz.
+const SINE_MIN_HZ: u32 = 50;
+/// Highest sine frequency accepted, in Hz.
+const SINE_MAX_HZ: u32 = 5000;
+/// Longest sine duration accepted, in ms (clamped, not rejected). Bounded to
+/// 2000 because the DDS loop is a hard busy-wait: it monopolizes the
+/// single-threaded PWM server's CPU with no yield point for up to SINE_MAX_MS
+/// (unlike `tone`, which sleeps cooperatively). The busy-wait is required for
+/// accurate sub-ms sample pacing without DMA and is acceptable for the single
+/// synchronous shell client; the non-blocking fix is DMA-fed PWM (planned
+/// follow-up).
+const SINE_MAX_MS: u32 = 2000;
 
 struct ServerImpl {
     pwm: rp235x_pac::PWM,
@@ -133,6 +184,57 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         self.enable_slice(slice as usize, false);
         Ok(())
     }
+
+    fn sine(
+        &mut self,
+        _: &RecvMessage,
+        slice: u8,
+        freq_hz: u32,
+        ms: u32,
+    ) -> Result<(), RequestError<PwmError>> {
+        if slice > MAX_SLICE || !(SINE_MIN_HZ..=SINE_MAX_HZ).contains(&freq_hz)
+        {
+            return Err(PwmError::BadArg.into());
+        }
+
+        // Start the ultrasonic carrier. The DDS itself starts at mid-scale
+        // (phase 0 -> SINE_LUT[0], a mid-scale zero-crossing) and sample 0 is
+        // written on the first loop iteration, so there is no start transient
+        // and no separate park write is needed.
+        self.program_slice(slice as usize, SINE_DIV_INT, SINE_TOP);
+        self.enable_slice(slice as usize, true);
+
+        // DDS: a 32-bit phase accumulator; the top 8 bits index the 256-entry
+        // LUT. phase_inc = freq / sample_rate in Q32 fixed point. n is the
+        // number of samples for the requested (clamped) duration.
+        //
+        // Pacing: like `tone`, this blocks the single-threaded PWM server for
+        // the whole play duration (busy-wait DDS in-handler, up to SINE_MAX_MS).
+        // Fine while the shell is the only, strictly-synchronous PWM client; the
+        // non-blocking follow-up is to drive the samples via DMA. Each sample is
+        // paced by `cortex_m::asm::delay(SINE_CYCLES_PER_SAMPLE)`, a calibrated
+        // busy-wait that needs no counter peripheral, so it cannot wedge (unlike
+        // the DWT/TIMER approaches, whose counters never tick on this board).
+        // The pitch is APPROXIMATE (see SINE_CYCLES_PER_SAMPLE): the per-sample
+        // work is not subtracted, so the rate runs slightly below SAMPLE_RATE.
+        let ms = ms.clamp(1, SINE_MAX_MS);
+        let phase_inc = (((freq_hz as u64) << 32) / SAMPLE_RATE as u64) as u32;
+        let n = (ms as u64 * SAMPLE_RATE as u64 / 1000) as u32;
+        let mut phase: u32 = 0;
+        for _ in 0..n {
+            let idx = (phase >> SINE_LUT_INDEX_SHIFT) as usize;
+            self.pwm
+                .ch(slice as usize)
+                .cc()
+                .modify(|_, w| unsafe { w.a().bits(SINE_LUT[idx]) });
+            phase = phase.wrapping_add(phase_inc);
+            cortex_m::asm::delay(SINE_CYCLES_PER_SAMPLE);
+        }
+
+        // Silence: stop the counter so the carrier no longer drives the pin.
+        self.enable_slice(slice as usize, false);
+        Ok(())
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {
@@ -148,6 +250,10 @@ fn main() -> ! {
     let sys = Rp235xSys::from(SYS.get_task_id());
     sys.leave_reset(sys_api::PWM);
 
+    // The `sine` DDS loop paces samples with `cortex_m::asm::delay`, a
+    // self-contained busy-wait, so no cycle-counter or timer peripheral needs
+    // enabling here (the DWT/CYCCNT and RP2350 TIMER both stay stuck on this
+    // board and would wedge the loop).
     let p = unsafe { rp235x_pac::Peripherals::steal() };
     let mut server = ServerImpl { pwm: p.PWM };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
