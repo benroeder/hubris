@@ -16,7 +16,7 @@
 //! `RawFile` handles, reading through `VolumeManager::read` (which takes `&self`
 //! via interior mutability). The handles are released on `Drop`.
 
-use crate::decoder::ByteSource;
+use rp235x_audio_decode::ByteSource;
 use drv_rp235x_sdcard_api::Rp235xSdcard;
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Mode, RawDirectory, RawFile,

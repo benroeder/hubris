@@ -2584,8 +2584,8 @@ dependencies = [
  "embedded-sdmmc",
  "idol",
  "idol-runtime",
- "nanomp3",
  "num-traits",
+ "rp235x-audio-decode",
  "rp235x-pac",
  "userlib",
  "zerocopy 0.8.27",
@@ -5784,6 +5784,13 @@ dependencies = [
  "lpc55-pac",
  "lpc55-rot-startup",
  "unwrap-lite",
+]
+
+[[package]]
+name = "rp235x-audio-decode"
+version = "0.1.0"
+dependencies = [
+ "nanomp3",
 ]
 
 [[package]]

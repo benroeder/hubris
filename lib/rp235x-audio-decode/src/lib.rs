@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Streaming audio decoders for the PWM player.
+#![no_std]
+
+//! Streaming audio decoders for the RP2350 PWM player, decoupled from the task
+//! so the same no_std/no_alloc code can be tested on the host.
 //!
 //! Two small traits keep the player decoupled from both the byte transport and
 //! the container format:
@@ -232,7 +235,7 @@ impl<S: ByteSource> Decoder for WavDecoder<S> {
 /// `hdr_frame_samples`, i.e. per-channel). So the number of valid f32 in `pcm`
 /// after a frame is `samples_produced * channels`. For stereo, consecutive f32
 /// are L, R, L, R, ...; we emit them as interleaved L/R i16 (mono is duplicated).
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 pub struct Nanomp3Decoder<S: ByteSource> {
     dec: nanomp3::Decoder,
     src: S,
@@ -259,12 +262,12 @@ pub struct Nanomp3Decoder<S: ByteSource> {
 }
 
 /// Size of the compressed-MP3 sliding input window, in bytes.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_IN_LEN: usize = 4096;
 
 /// Minimum PCM scratch length required by `nanomp3::decode` (it panics on a
 /// smaller buffer). 2304 f32 = 1152 samples/channel * 2 channels.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_MAX_SAMPLES: usize = nanomp3::MAX_SAMPLES_PER_FRAME;
 
 /// Low-water mark for the input window: refill only once the resident
@@ -272,7 +275,7 @@ const MP3_MAX_SAMPLES: usize = nanomp3::MAX_SAMPLES_PER_FRAME;
 /// largest possible MPEG1 Layer III frame is 1441 bytes, so keeping at least 2
 /// KiB resident guarantees a whole frame is always available to `decode` while
 /// avoiding a memmove + read on each ~400-byte frame consumed.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_IN_LOWATER: usize = 2048;
 
 /// Bytes to KEEP when force-skipping an unsyncable full window. If a FULL input
@@ -281,10 +284,10 @@ const MP3_IN_LOWATER: usize = 2048;
 /// add nothing (no room), so we must drop bytes to make progress. We discard all
 /// but this many trailing bytes -- kept > the 1441-byte max frame so a real sync
 /// sitting near the window end survives to be confirmed against fresh data.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_RESYNC_KEEP: usize = 1536;
 
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 impl<S: ByteSource> Nanomp3Decoder<S> {
     /// Prime the input window and decode the first frame, capturing the format.
     /// `decode` returns `FrameInfo=None` while it skips junk / ID3 tags (still
@@ -471,7 +474,7 @@ impl<S: ByteSource> Nanomp3Decoder<S> {
     }
 }
 
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 impl<S: ByteSource> Decoder for Nanomp3Decoder<S> {
     fn sample_rate(&self) -> u32 {
         self.sample_rate
@@ -522,14 +525,14 @@ impl<S: ByteSource> Decoder for Nanomp3Decoder<S> {
 /// but this is a `no_alloc` target: boxing the large field -- clippy's usual fix
 /// -- is not available, and only one `AnyDecoder` is ever live at a time, so the
 /// size asymmetry is intentional and harmless here.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 #[allow(clippy::large_enum_variant)]
 pub enum AnyDecoder<S: ByteSource> {
     Wav(WavDecoder<S>),
     Mp3(Nanomp3Decoder<S>),
 }
 
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 impl<S: ByteSource> Decoder for AnyDecoder<S> {
     fn sample_rate(&self) -> u32 {
         match self {
@@ -563,7 +566,7 @@ impl<S: ByteSource> Decoder for AnyDecoder<S> {
 /// True if `name` (an 8.3 short name, ASCII) ends in the `.mp3` extension,
 /// compared case-insensitively (FAT short names are upper-cased, but be
 /// defensive). Used to route the file to the MP3 decoder instead of WAV.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 pub fn is_mp3_name(name: &[u8]) -> bool {
     let n = name.len();
     if n < 4 {

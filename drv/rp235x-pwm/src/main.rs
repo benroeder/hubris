@@ -26,7 +26,7 @@ use userlib::sys_get_timer;
 use userlib::{RecvMessage, task_slot};
 
 #[cfg(feature = "sdcard")]
-mod decoder;
+use rp235x_audio_decode as decoder;
 #[cfg(feature = "sdcard")]
 mod sd;
 
