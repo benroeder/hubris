@@ -193,8 +193,9 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd test [n]           data-integrity self-test: write/read/verify patterns (n KiB, default 64)\r\n\
   sd soak [secs]        sustained write/read/verify loop for secs seconds (default 10)\r\n\
   wavgen <name> [secs] [hz]  synthesize a 16-bit mono WAV on the SD (test audio)\r\n\
-  play <name>           stream a 16-bit PCM WAV from the SD root out the jack (blocks)\r\n\
-  mix <name>            WAV + 660Hz sine mixer; GP20 fades to WAV, GP21 to sine (blocks)\r\n";
+  sd upload <name> <sz-hex> <crc-hex>  receive a binary file over USB -> SD\r\n\
+  play <name>           stream a WAV or MP3 from the SD root out the jack (blocks)\r\n\
+  mix <name>            WAV/MP3 + 660Hz sine mixer; GP20 fades to file, GP21 to sine\r\n";
 #[cfg(feature = "datalog")]
 const HELP_DATALOG: &[u8] =
     b"  log <count> [secs]     log <count> RTC-stamped temps to LOG.CSV (RGB status)\r\n";
@@ -2109,13 +2110,7 @@ impl Shell {
             let Ok(n) = self.flash.read(base + off, &mut buf[..want]) else {
                 return 0;
             };
-            for &b in &buf[..n] {
-                crc ^= b as u32;
-                for _ in 0..8 {
-                    let mask = (crc & 1).wrapping_neg();
-                    crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-                }
-            }
+            crc = crc32_update(crc, &buf[..n]);
             off += n as u32;
         }
         !crc
@@ -2466,6 +2461,17 @@ impl Shell {
             #[cfg(feature = "fat")]
             Some("rm") => self.fat_rm(a),
             #[cfg(feature = "fat")]
+            Some("upload") => {
+                // "sd upload <NAME> <size-hex> <crc32-hex>": receive a binary
+                // file over USB (paged, CRC-verified) and write it to the SD.
+                let rest = subcommand_rest(line, "upload");
+                let mut it = rest.split_whitespace();
+                let name = it.next().unwrap_or("");
+                let size = it.next().unwrap_or("");
+                let crc = it.next().unwrap_or("");
+                self.sd_upload(name, size, crc);
+            }
+            #[cfg(feature = "fat")]
             Some("bench") => self.fat_bench(a),
             #[cfg(feature = "fat")]
             Some("test") => self.fat_test(a),
@@ -2693,6 +2699,82 @@ impl Shell {
             sh.out.put(b"wrote ");
             sh.out.put_u32(bytes.len() as u32);
             sh.out.put(b" bytes\r\n");
+        });
+    }
+
+    /// `sd upload <name> <size-hex> <crc32-hex>`: receive a binary file over the
+    /// USB console and write it to the SD root. Reuses the `update` protocol: we
+    /// print `GO`, then read `size` bytes in 256-byte pages (ACKing each with a
+    /// `.`), streaming them into the FAT file, and verify a running CRC32 at the
+    /// end. Lets the host push arbitrary files (e.g. an .mp3) to the card with no
+    /// card reader. The pwm/audio ops are untouched -- this is pure FAT write.
+    #[cfg(feature = "fat")]
+    fn sd_upload(&mut self, name: &str, size_s: &str, crc_s: &str) {
+        use embedded_sdmmc::Mode;
+        if name.is_empty() || name.len() > 12 {
+            self.out.put(
+                b"usage: sd upload <name(8.3)> <size-hex> <crc32-hex>\r\n",
+            );
+            return;
+        }
+        let (Ok(size), Ok(want_crc)) = (
+            u32::from_str_radix(size_s, 16),
+            u32::from_str_radix(crc_s, 16),
+        ) else {
+            self.out.put(b"sd upload: bad size/crc (hex)\r\n");
+            return;
+        };
+        self.with_root(b"sd upload", |sh, root| {
+            let file = match root
+                .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    sh.out.put(b"sd upload: open file failed\r\n");
+                    return;
+                }
+            };
+            // Signal the host we are ready to receive, then stream pages.
+            sh.out.put(b"GO\r\n");
+            sh.out.flush();
+            let mut crc: u32 = 0xffff_ffff;
+            let mut off: u32 = 0;
+            // Big page buffer in a static (not the 8 KiB stack), so large pages
+            // mean fewer per-page ACK round-trips = much faster MB-scale uploads.
+            // SAFETY: single-threaded shell task; this is the only live borrow.
+            let page = unsafe { &mut *core::ptr::addr_of_mut!(UPLOAD_PAGE) };
+            while off < size {
+                let want = (size - off).min(UPLOAD_PAGE_LEN as u32) as usize;
+                if sh.recv_bytes(Link::Usb, &mut page[..want]).is_err() {
+                    sh.out.put(b"\r\nsd upload: timeout waiting for data\r\n");
+                    let _ = file.close();
+                    return;
+                }
+                if file.write(&page[..want]).is_err() {
+                    sh.out.put(b"\r\nsd upload: write error\r\n");
+                    let _ = file.close();
+                    return;
+                }
+                crc = crc32_update(crc, &page[..want]);
+                off += want as u32;
+                sh.link_write(Link::Usb, b"."); // ACK the page
+            }
+            if file.close().is_err() {
+                sh.out.put(b"\r\nsd upload: flush/close error\r\n");
+                return;
+            }
+            let crc = !crc;
+            if crc == want_crc {
+                sh.out.put(b"\r\nsd upload OK: ");
+                sh.out.put_u32(size);
+                sh.out.put(b" bytes, crc verified\r\n");
+            } else {
+                sh.out.put(b"\r\nsd upload CRC MISMATCH: ");
+                sh.out.put_hex32(crc);
+                sh.out.put(b" != ");
+                sh.out.put_hex32(want_crc);
+                sh.out.put(b"\r\n");
+            }
         });
     }
 
@@ -3517,6 +3599,33 @@ enum Link {
 /// 16-bit additive checksum of a page, for per-page integrity over UART.
 fn page16(data: &[u8]) -> u16 {
     data.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16))
+}
+
+/// Page size for `sd upload`, in bytes -- one page received per ACK round-trip.
+/// 256 matches the device USB RX ring (drop-oldest on overflow), which bounds a
+/// safe in-flight page; larger pages need a bigger ring (a possible future
+/// speedup). Keep in sync with the host uploader's page size.
+#[cfg(feature = "fat")]
+const UPLOAD_PAGE_LEN: usize = 256;
+
+/// Receive buffer for `sd upload`, kept in a static rather than on the shell
+/// stack. The shell task is single-threaded, so the `&mut` taken in `sd_upload`
+/// is the only live reference.
+#[cfg(feature = "fat")]
+static mut UPLOAD_PAGE: [u8; UPLOAD_PAGE_LEN] = [0u8; UPLOAD_PAGE_LEN];
+
+/// Reflected CRC-32 (poly 0xedb88320) of `data`, folded into a running `crc`.
+/// Seed with 0xffff_ffff and finish with `!crc`. Shared by `flash_crc32` and the
+/// `sd upload` receiver so the two cannot diverge.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    crc
 }
 
 /// Parse and range-check the `<size-hex> <crc32-hex>` update arguments.
