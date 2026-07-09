@@ -8,7 +8,7 @@
 //! the container format:
 //!
 //! - `ByteSource` yields raw file bytes (the SD-backed source lives in `sd.rs`).
-//! - `Decoder` turns those bytes into a stream of mono i16 PCM samples.
+//! - `Decoder` turns those bytes into a stream of interleaved L/R i16 PCM.
 //!
 //! `WavDecoder` implements `Decoder` over a canonical 44-byte PCM WAV. It is
 //! `no_std`, allocation-free, and holds only a small fixed read buffer, so a
@@ -47,10 +47,10 @@ pub trait ByteSource {
 pub trait Decoder {
     /// Sample rate of the decoded stream, in Hz.
     fn sample_rate(&self) -> u32;
-    /// Channel count of the SOURCE stream (1 = mono, 2 = stereo). The decoder
-    /// always downmixes to mono in `next_pcm`; this reports what it read. Part
-    /// of the trait contract for future decoders; the player does not consume it
-    /// today (it only needs the sample rate), hence the allow.
+    /// Channel count of the SOURCE stream (1 = mono, 2 = stereo). `next_pcm`
+    /// always emits interleaved stereo (a mono source is duplicated); this
+    /// reports what was read. Part of the trait contract for future decoders; the
+    /// player does not consume it today (it only needs the rate), hence the allow.
     #[allow(dead_code)]
     fn channels(&self) -> u8;
     /// Fill `out` with the next PCM samples as INTERLEAVED L, R pairs (a mono
@@ -96,8 +96,8 @@ fn le_u32(b: &[u8]) -> u32 {
 
 /// Streaming decoder for a canonical 44-byte PCM WAV (the exact layout `wavgen`
 /// writes: RIFF/WAVE, one `fmt ` chunk of 16 bytes, PCM tag 1, 16-bit, mono or
-/// stereo, followed immediately by the `data` chunk). Downmixes stereo to mono
-/// by averaging the two channels so the player is always fed a mono stream.
+/// stereo, followed immediately by the `data` chunk). Emits interleaved L/R;
+/// a mono source is duplicated to both channels.
 pub struct WavDecoder<S: ByteSource> {
     src: S,
     sample_rate: u32,

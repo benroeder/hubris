@@ -34,10 +34,19 @@ use usbd_serial::{SerialPort, USB_CLASS_CDC};
 /// (drop-oldest on overflow).
 const RX_RING_LEN: usize = 512;
 
+/// The RX ring lives in a static (BSS), NOT in `ServerImpl`, because the server
+/// is a stack local in `main`; an 8 KiB inline array would blow the task stack.
+static mut USB_RX_RING: [u8; RX_RING_LEN] = [0; RX_RING_LEN];
+
+/// Borrow the RX ring. SAFETY: the usb task is single-threaded and the only
+/// accessors are `push`/`pop` (both `&mut self`), so this is the only live ref.
+fn rx_ring() -> &'static mut [u8; RX_RING_LEN] {
+    unsafe { &mut *core::ptr::addr_of_mut!(USB_RX_RING) }
+}
+
 struct ServerImpl {
     dev: UsbDevice<'static, UsbBus>,
     serial: SerialPort<'static, UsbBus>,
-    ring: [u8; RX_RING_LEN],
     head: usize,
     tail: usize,
 }
@@ -48,7 +57,7 @@ impl ServerImpl {
         if next == self.tail {
             self.tail = (self.tail + 1) % RX_RING_LEN;
         }
-        self.ring[self.head] = b;
+        rx_ring()[self.head] = b;
         self.head = next;
     }
 
@@ -56,7 +65,7 @@ impl ServerImpl {
         if self.tail == self.head {
             None
         } else {
-            let b = self.ring[self.tail];
+            let b = rx_ring()[self.tail];
             self.tail = (self.tail + 1) % RX_RING_LEN;
             Some(b)
         }
@@ -202,7 +211,6 @@ pub fn main() -> ! {
     let mut server = ServerImpl {
         dev,
         serial,
-        ring: [0u8; RX_RING_LEN],
         head: 0,
         tail: 0,
     };
