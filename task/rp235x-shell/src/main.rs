@@ -2158,18 +2158,26 @@ impl Shell {
     /// Fill `buf` from `link`, blocking with an idle timeout. Err on timeout.
     fn recv_bytes(&mut self, link: Link, buf: &mut [u8]) -> Result<(), ()> {
         let mut got = 0usize;
-        let mut idle = 0u32;
+        let mut last_progress = sys_get_timer().now;
         while got < buf.len() {
-            let n = self.link_read(link, &mut buf[got..]);
-            if n == 0 {
-                idle += 1;
-                if idle > 500 {
+            // Chunk to the lease limit: the usb/uart `read` lease is capped at
+            // 256 (idl max_len), and a longer slice FAULTS the caller.
+            let end = (got + LINK_READ_CHUNK).min(buf.len());
+            let n = self.link_read(link, &mut buf[got..end]);
+            if n > 0 {
+                got += n;
+                last_progress = sys_get_timer().now;
+            } else {
+                // BUSY-POLL, do not sleep: the device USB RX ring is small and
+                // drop-oldest, so a sleep mid-transfer lets the host flood +
+                // overflow it (dropped bytes -> the transfer never completes).
+                // The read IPC drains the ring far faster than USB fills it, so
+                // spinning keeps it near-empty. Time out via the kernel clock.
+                if sys_get_timer().now.wrapping_sub(last_progress)
+                    > RECV_TIMEOUT_MS
+                {
                     return Err(());
                 }
-                hl::sleep_for(10);
-            } else {
-                idle = 0;
-                got += n;
             }
         }
         Ok(())
@@ -2746,7 +2754,11 @@ impl Shell {
             while off < size {
                 let want = (size - off).min(UPLOAD_PAGE_LEN as u32) as usize;
                 if sh.recv_bytes(Link::Usb, &mut page[..want]).is_err() {
-                    sh.out.put(b"\r\nsd upload: timeout waiting for data\r\n");
+                    sh.out.put(b"\r\nsd upload: recv timeout at ");
+                    sh.out.put_u32(off);
+                    sh.out.put(b"/");
+                    sh.out.put_u32(size);
+                    sh.out.put(b"\r\n");
                     let _ = file.close();
                     return;
                 }
@@ -3601,12 +3613,22 @@ fn page16(data: &[u8]) -> u16 {
     data.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16))
 }
 
+/// Max bytes per `usb`/`uart` read call. The idl `read` leases are capped at 256
+/// (`max_len`), and handing a longer lease FAULTS the caller, so `recv_bytes`
+/// chunks its reads to this regardless of the caller's buffer size.
+const LINK_READ_CHUNK: usize = 256;
+
+/// Idle timeout for `recv_bytes`, in ms on the kernel clock. Bounds a stalled
+/// bulk receive (sd upload / firmware update); it busy-polls (no sleep) so a
+/// small device RX ring cannot overflow mid-transfer.
+const RECV_TIMEOUT_MS: u64 = 3000;
+
 /// Page size for `sd upload`, in bytes -- one page received per ACK round-trip.
-/// 256 matches the device USB RX ring (drop-oldest on overflow), which bounds a
-/// safe in-flight page; larger pages need a bigger ring (a possible future
-/// speedup). Keep in sync with the host uploader's page size.
+/// Larger = fewer round-trips = faster; `recv_bytes` chunks the reads to the
+/// lease limit, so the page size is independent of it. Keep in sync with the
+/// host uploader's page size.
 #[cfg(feature = "fat")]
-const UPLOAD_PAGE_LEN: usize = 256;
+const UPLOAD_PAGE_LEN: usize = 4096;
 
 /// Receive buffer for `sd upload`, kept in a static rather than on the shell
 /// stack. The shell task is single-threaded, so the `&mut` taken in `sd_upload`
