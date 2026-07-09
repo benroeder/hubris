@@ -136,7 +136,7 @@ start = true
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 65536, ram = 12288}
+max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
 features = ["sdcard", "fat", "ds1302", "ws2812", "datalog"]
