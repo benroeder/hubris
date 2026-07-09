@@ -3601,16 +3601,16 @@ fn page16(data: &[u8]) -> u16 {
     data.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16))
 }
 
-/// Page size for `sd upload`, in bytes. Large so each per-page ACK round-trip
-/// carries more data: the console is latency-bound, so fewer round-trips (vs a
-/// small page) is a big speedup for MB-scale files.
+/// Page size for `sd upload`, in bytes -- one page received per ACK round-trip.
+/// 256 matches the device USB RX ring (drop-oldest on overflow), which bounds a
+/// safe in-flight page; larger pages need a bigger ring (a possible future
+/// speedup). Keep in sync with the host uploader's page size.
 #[cfg(feature = "fat")]
 const UPLOAD_PAGE_LEN: usize = 256;
 
-/// Receive buffer for `sd upload`, in a static rather than on the 8 KiB shell
-/// stack (a 4 KiB stack page alongside the FAT VolumeManager risks overflow).
-/// The shell task is single-threaded, so the `&mut` taken in `sd_upload` is the
-/// only live reference.
+/// Receive buffer for `sd upload`, kept in a static rather than on the shell
+/// stack. The shell task is single-threaded, so the `&mut` taken in `sd_upload`
+/// is the only live reference.
 #[cfg(feature = "fat")]
 static mut UPLOAD_PAGE: [u8; UPLOAD_PAGE_LEN] = [0u8; UPLOAD_PAGE_LEN];
 

@@ -43,7 +43,7 @@ pub trait ByteSource {
 }
 
 /// A streaming PCM decoder: pulls bytes from an underlying `ByteSource` and
-/// yields mono i16 samples.
+/// yields interleaved L/R i16 samples.
 pub trait Decoder {
     /// Sample rate of the decoded stream, in Hz.
     fn sample_rate(&self) -> u32;
@@ -231,7 +231,7 @@ impl<S: ByteSource> Decoder for WavDecoder<S> {
 /// samples PER CHANNEL (minimp3's `mp3dec_decode_frame` returns
 /// `hdr_frame_samples`, i.e. per-channel). So the number of valid f32 in `pcm`
 /// after a frame is `samples_produced * channels`. For stereo, consecutive f32
-/// are L, R, L, R, ...; we average each L/R pair into one mono i16.
+/// are L, R, L, R, ...; we emit them as interleaved L/R i16 (mono is duplicated).
 #[cfg(feature = "sdcard")]
 pub struct Nanomp3Decoder<S: ByteSource> {
     dec: nanomp3::Decoder,
@@ -338,8 +338,23 @@ impl<S: ByteSource> Nanomp3Decoder<S> {
         // dropped. Sharing one local buffer here avoids a second resident copy.
         let mut pcm = [0.0f32; MP3_MAX_SAMPLES];
         loop {
+            // If the window drained without a frame yet -- e.g. a leading ID3v2
+            // tag (album art) larger than the 4 KiB window, which minimp3 skips
+            // by consuming the whole window with info == None -- refill and keep
+            // scanning rather than giving up. Only report Unsupported once the
+            // source is truly exhausted.
             if in_pos >= in_len {
-                return Err(DecodeError::Unsupported);
+                if io_done {
+                    return Err(DecodeError::Unsupported);
+                }
+                fill(
+                    &mut inbuf,
+                    &mut in_len,
+                    &mut in_pos,
+                    &mut io_done,
+                    &mut src,
+                );
+                continue;
             }
             let (consumed, info) = dec.decode(&inbuf[in_pos..in_len], &mut pcm);
             in_pos += consumed;
