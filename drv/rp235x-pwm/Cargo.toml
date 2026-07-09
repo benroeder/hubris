@@ -13,6 +13,7 @@ rp235x-pac = { workspace = true }
 
 drv-rp235x-pwm-api = { path = "../rp235x-pwm-api" }
 drv-rp235x-sys-api = { path = "../rp235x-sys-api" }
+drv-rp235x-gpio-api = { path = "../rp235x-gpio-api", optional = true }
 drv-rp235x-sdcard-api = { path = "../rp235x-sdcard-api", optional = true }
 embedded-sdmmc = { workspace = true, optional = true }
 counters = { path = "../../lib/counters" }
@@ -24,7 +25,7 @@ idol = { workspace = true }
 [features]
 # `sdcard` wires the streaming WAV player (`play_file`) to the SD block device
 # via embedded-sdmmc. Without it, `play_file` compiles but returns OpenFailed.
-sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc"]
+sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc", "dep:drv-rp235x-gpio-api"]
 
 [[bin]]
 name = "drv-rp235x-pwm"

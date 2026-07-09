@@ -193,7 +193,8 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd test [n]           data-integrity self-test: write/read/verify patterns (n KiB, default 64)\r\n\
   sd soak [secs]        sustained write/read/verify loop for secs seconds (default 10)\r\n\
   wavgen <name> [secs] [hz]  synthesize a 16-bit mono WAV on the SD (test audio)\r\n\
-  play <name>           stream a 16-bit PCM WAV from the SD root out the jack (blocks)\r\n";
+  play <name>           stream a 16-bit PCM WAV from the SD root out the jack (blocks)\r\n\
+  mix <name>            WAV + 660Hz sine mixer; GP20 fades to WAV, GP21 to sine (blocks)\r\n";
 #[cfg(feature = "datalog")]
 const HELP_DATALOG: &[u8] =
     b"  log <count> [secs]     log <count> RTC-stamped temps to LOG.CSV (RGB status)\r\n";
@@ -385,6 +386,8 @@ impl Shell {
             }
             #[cfg(feature = "fat")]
             "play" => self.cmd_play(words.next()),
+            #[cfg(feature = "fat")]
+            "mix" => self.cmd_mix(words.next()),
             "crash" => {
                 // Fault this task on purpose to test that jefe restarts the
                 // shell + re-attaches the USB console (and, on AMP, that core
@@ -2836,6 +2839,51 @@ impl Shell {
                     .put(b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n");
             }
             Err(_) => self.out.put(b"play: error\r\n"),
+        }
+    }
+
+    /// `mix <name>`: stream a WAV while a fixed 660 Hz sine is mixed in, with a
+    /// button-driven auto-crossfade (GP20 fades to the WAV, GP21 to the sine).
+    /// Mirrors `cmd_play` -- routes the jack, calls the blocking `play_mix` op,
+    /// and decodes the same packed rate/refills/underruns reply. BLOCKING: the
+    /// pwm task self-drives the mix (reading the buttons itself), so the shell
+    /// cannot send anything until the track finishes.
+    #[cfg(feature = "fat")]
+    fn cmd_mix(&mut self, name: Option<&str>) {
+        let Some(name) = name else {
+            self.out.put(b"usage: mix <name>\r\n");
+            return;
+        };
+        if name.len() > 12 {
+            self.out.put(b"mix: name too long (8.3 max)\r\n");
+            return;
+        }
+        if !self.route_audio_jack() {
+            self.out.put(b"mix: jack routing failed\r\n");
+            return;
+        }
+        match self.pwm.play_mix(name.as_bytes()) {
+            Ok(packed) => {
+                // Unpack: rate (low 16), underruns (16..23), refills (24..31).
+                let rate = packed & 0xffff;
+                let underruns = (packed >> 16) & 0xff;
+                let refills = (packed >> 24) & 0xff;
+                self.out.put(b"mixed (");
+                self.out.put_u32(rate);
+                self.out.put(b" Hz, ");
+                self.out.put_u32(refills);
+                self.out.put(b" refills, ");
+                self.out.put_u32(underruns);
+                self.out.put(b" underruns)\r\n");
+            }
+            Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
+                self.out.put(b"mix: open failed (no card/file?)\r\n");
+            }
+            Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
+                self.out
+                    .put(b"mix: not a supported WAV (PCM 16-bit mono/stereo)\r\n");
+            }
+            Err(_) => self.out.put(b"mix: error\r\n"),
         }
     }
 

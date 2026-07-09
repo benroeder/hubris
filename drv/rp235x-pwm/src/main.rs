@@ -29,11 +29,15 @@ mod decoder;
 mod sd;
 
 #[cfg(feature = "sdcard")]
+use drv_rp235x_gpio_api::Rp235xGpio;
+#[cfg(feature = "sdcard")]
 use drv_rp235x_sdcard_api::Rp235xSdcard;
 
 task_slot!(SYS, sys);
 #[cfg(feature = "sdcard")]
 task_slot!(SDCARD, sdcard);
+#[cfg(feature = "sdcard")]
+task_slot!(GPIO, gpio);
 
 // 256-entry sine LUT (u16, scaled 0..=SINE_TOP with a half-scale DC offset),
 // generated on the host by build.rs. Pulled in as `SINE_LUT`.
@@ -212,6 +216,53 @@ const PLAY_HALF_SAMPLES: usize = AUDIO_BUF_SAMPLES / 2;
 #[cfg(feature = "sdcard")]
 const PLAY_HALF_BYTES: u32 = (AUDIO_RING_BYTES / 2) as u32;
 
+// --- Controllable 2-source mixer (milestone 4: WAV + sine, button crossfade) ---
+//
+// Reuses the whole `play_file` DMA path (slice 1, DMA ch0, the aligned ring)
+// but fills the ring by BLENDING two sources per sample instead of copying one:
+//   A = the WAV file (WavDecoder -> i16, mapped to a centered 10-bit duty).
+//   B = a fixed 660 Hz DDS sine over SINE_LUT (distinct from the 440 Hz test
+//       file so the blend is audible), whose phase ALWAYS advances so a fade-in
+//       has no restart transient.
+// out = PLAY_MID + ((ga * wav_centered + gb * sine_centered) >> 8), clamped to
+// 0..=PLAY_TOP, packed into both CC halves. `ga`/`gb` are Q8 gains 0..=256.
+//
+// Auto-fade: the buttons pick a TARGET source; the gains ramp toward it one Q8
+// step PER SAMPLE (no per-half zipper). GP20 -> WAV (ga->256, gb->0); GP21 ->
+// sine (ga->0, gb->256). The linear crossfade dips slightly at the midpoint;
+// TODO equal-power (multiply by sqrt curves) if the dip is audible.
+
+/// Fixed sine frequency for source B, in Hz. 660 (an E5, a fifth above the
+/// 440 Hz TEST.WAV) so the two sources are clearly distinguishable by ear as
+/// the crossfade sweeps between them.
+#[cfg(feature = "sdcard")]
+const MIX_SINE_HZ: u32 = 660;
+/// Full Q8 gain (unity): a source at gain 256 contributes its whole centered
+/// amplitude. The `>> 8` in the mix undoes this scale.
+#[cfg(feature = "sdcard")]
+const MIX_GAIN_FULL: i32 = 256;
+/// Q8 fixed-point shift for the mix gains (256 = 1.0).
+#[cfg(feature = "sdcard")]
+const MIX_GAIN_SHIFT: i32 = 8;
+/// Gain ramp step per sample, in Q8 units. One step per sample means a full
+/// 0..=256 crossfade takes 256 samples (~12 ms at 22050 Hz) -- smooth and
+/// click-free.
+#[cfg(feature = "sdcard")]
+const MIX_RAMP_STEP: i32 = 1;
+/// Crossfade target selector: source A = the WAV file.
+#[cfg(feature = "sdcard")]
+const MIX_TARGET_WAV: u8 = 0;
+/// Crossfade target selector: source B = the fixed sine.
+#[cfg(feature = "sdcard")]
+const MIX_TARGET_SINE: u8 = 1;
+/// Seengreat push buttons: GP20 selects the WAV, GP21 selects the sine. Each
+/// wires to GND, so with a pull-up the pin idles 1 (released) and reads 0 while
+/// pressed (active-low) -- same wiring the shell's `buttons` command uses.
+#[cfg(feature = "sdcard")]
+const MIX_BTN_WAV: u8 = 20;
+#[cfg(feature = "sdcard")]
+const MIX_BTN_SINE: u8 = 21;
+
 // --- Real-time mic -> jack passthrough (ADC free-run -> DMA -> PWM CC) ---
 //
 // The ADC free-runs on the mic channel (round-robin off, single channel),
@@ -277,6 +328,28 @@ fn aligned_ring_ptr() -> *mut u32 {
     let base = addr_of_mut!(AUDIO_STORE) as usize;
     let aligned = (base + (AUDIO_RING_BYTES - 1)) & !(AUDIO_RING_BYTES - 1);
     aligned as *mut u32
+}
+
+/// Running state of the 2-source mixer, carried across `mix_fill` calls so the
+/// sine phase and gain ramps are continuous over the whole track (per-half
+/// refills must not reset either, or the sine would restart and the gains would
+/// step). `ga`/`gb` are the live Q8 gains; `target` is the button-selected
+/// source the gains ramp toward.
+#[cfg(feature = "sdcard")]
+struct MixState {
+    /// DDS phase accumulator for the fixed sine (source B); the top 8 bits index
+    /// SINE_LUT. Advances every sample regardless of gb, so a fade-in of the
+    /// sine has no phase discontinuity.
+    phase: u32,
+    /// Q32 phase increment per sample for MIX_SINE_HZ at the file's rate.
+    sine_inc: u32,
+    /// Live Q8 gain of source A (the WAV), 0..=MIX_GAIN_FULL.
+    ga: i32,
+    /// Live Q8 gain of source B (the sine), 0..=MIX_GAIN_FULL.
+    gb: i32,
+    /// Crossfade target: MIX_TARGET_WAV or MIX_TARGET_SINE. The gains ramp one
+    /// MIX_RAMP_STEP per sample toward (256, 0) or (0, 256) accordingly.
+    target: u8,
 }
 
 struct ServerImpl {
@@ -586,6 +659,159 @@ impl ServerImpl {
         self.enable_slice(AUDIO_SLICE, false);
         (underruns, refills)
     }
+
+    /// Fill one ring half by BLENDING the WAV (source A) with the fixed sine
+    /// (source B), advancing the sine phase and ramping the gains one Q8 step
+    /// per sample toward `state.target`. Mirrors `fill_half` (mid-scale silence
+    /// past decoder EOF, volatile writes through the aligned ring) but composes
+    /// two centered sources instead of copying one. Returns the number of real
+    /// WAV samples written (0 once the decoder is exhausted).
+    #[cfg(feature = "sdcard")]
+    fn mix_fill<D: decoder::Decoder>(
+        &self,
+        dec: &mut D,
+        half: usize,
+        state: &mut MixState,
+    ) -> usize {
+        let ring = aligned_ring_ptr();
+        let base = half * PLAY_HALF_SAMPLES;
+        let mut pcm = [0i16; PLAY_HALF_SAMPLES];
+        let got = dec.next_pcm(&mut pcm);
+        // Slots past `got` are silence (0 -> mid-scale for source A).
+        for slot in pcm.iter_mut().skip(got) {
+            *slot = 0;
+        }
+        let lut_len = SINE_LUT.len() as u32;
+        for (i, &sample) in pcm.iter().enumerate() {
+            // Source A: WAV sample -> 10-bit duty, then centered around mid.
+            let wav_duty = (((sample as i32) >> PLAY_SAMPLE_SHIFT) + PLAY_MID)
+                .clamp(0, PLAY_TOP as i32);
+            let wav_centered = wav_duty - PLAY_MID;
+
+            // Source B: fixed sine over the LUT, centered around mid. Advance the
+            // phase every sample so gb can fade in with no restart transient.
+            let idx = (state.phase >> SINE_LUT_INDEX_SHIFT) % lut_len;
+            let sine_centered = SINE_LUT[idx as usize] as i32 - PLAY_MID;
+            state.phase = state.phase.wrapping_add(state.sine_inc);
+
+            // Ramp the gains one step per sample toward the selected target.
+            // TODO equal-power: this is a LINEAR crossfade; multiply by sqrt
+            // curves if the midpoint dip proves audible.
+            let (ta, tb) = if state.target == MIX_TARGET_SINE {
+                (0, MIX_GAIN_FULL)
+            } else {
+                (MIX_GAIN_FULL, 0)
+            };
+            state.ga = ramp_toward(state.ga, ta);
+            state.gb = ramp_toward(state.gb, tb);
+
+            // Blend in the centered domain, rebias to mid, clamp, and pack both
+            // CC halves (mono: same duty to left and right).
+            let mixed = state.ga * wav_centered + state.gb * sine_centered;
+            let duty = (PLAY_MID + (mixed >> MIX_GAIN_SHIFT))
+                .clamp(0, PLAY_TOP as i32) as u32;
+            let pair = (duty << CH_B_SHIFT) | duty;
+            // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE (2x
+            // the ring), so base + i (< AUDIO_BUF_SAMPLES) is in bounds. Single-
+            // threaded server, no references taken.
+            unsafe {
+                ring.add(base + i).write_volatile(pair);
+            }
+        }
+        got
+    }
+
+    /// Blocking mix loop: the `play_loop` structure with `fill_half` swapped for
+    /// `mix_fill` and a once-per-refill button read that steers the crossfade.
+    /// Reads GP20/GP21 (already configured input + pull-up by the op) once per
+    /// half-refill -- ~129 reads over a 3 s track, negligible next to the SD
+    /// read. On a fresh press edge (active-low, 0 = pressed) GP20 targets the
+    /// WAV, GP21 targets the sine. Returns packed (underruns, refills).
+    #[cfg(feature = "sdcard")]
+    fn mix_loop<D: decoder::Decoder>(
+        &self,
+        dec: &mut D,
+        gpio: &Rp235xGpio,
+        state: &mut MixState,
+    ) -> (u32, u32) {
+        // Prime BOTH halves so the DMA has a full ring before it starts.
+        let mut eof = self.mix_fill(dec, 0, state) == 0;
+        eof &= self.mix_fill(dec, 1, state) == 0;
+
+        self.enable_slice(AUDIO_SLICE, true);
+        self.arm_player_dma();
+
+        let mut refills = 0u32;
+        let mut underruns = 0u32;
+
+        // Button edge state: 1 = released (idle with pull-up), 0 = pressed.
+        let mut last_wav = 1u8;
+        let mut last_sine = 1u8;
+
+        // Same refill-crossing scheme as play_loop; seed last_filled to the far
+        // half so the first refill waits for a real DMA crossing (both halves
+        // were just primed with mixed data).
+        let mut last_filled = self.dma_half() ^ 1;
+        while !eof {
+            let live = self.dma_half();
+            let far = live ^ 1;
+            if far != last_filled {
+                // Read the buttons ONCE per refill (not per poll). Active-low;
+                // act only on the release->press edge, like the shell's watch.
+                let wav = gpio.read(MIX_BTN_WAV).unwrap_or(1);
+                let sine = gpio.read(MIX_BTN_SINE).unwrap_or(1);
+                if wav == 0 && last_wav == 1 {
+                    state.target = MIX_TARGET_WAV;
+                }
+                if sine == 0 && last_sine == 1 {
+                    state.target = MIX_TARGET_SINE;
+                }
+                last_wav = wav;
+                last_sine = sine;
+
+                eof = self.mix_fill(dec, far, state) == 0;
+                last_filled = far;
+                refills += 1;
+                if self.dma_half() == far {
+                    underruns += 1;
+                }
+            }
+        }
+
+        // Drain one more lap so the silence tail plays out, then stop.
+        let start = self.dma_half();
+        let mut crossings = 0u32;
+        let mut prev = start;
+        while crossings < 2 {
+            let now = self.dma_half();
+            if now != prev {
+                crossings += 1;
+                prev = now;
+            }
+        }
+
+        self.abort_audio_dma();
+        self.dma
+            .ch(AUDIO_DMA_CH)
+            .ch_ctrl_trig()
+            .write(|w| w.en().bit(false));
+        self.enable_slice(AUDIO_SLICE, false);
+        (underruns, refills)
+    }
+}
+
+/// Move `gain` one MIX_RAMP_STEP toward `target`, without overshooting. Q8
+/// units; used per-sample by the mixer so a source crossfades in/out over
+/// MIX_GAIN_FULL samples with no step (zipper) artifact.
+#[cfg(feature = "sdcard")]
+fn ramp_toward(gain: i32, target: i32) -> i32 {
+    if gain < target {
+        (gain + MIX_RAMP_STEP).min(target)
+    } else if gain > target {
+        (gain - MIX_RAMP_STEP).max(target)
+    } else {
+        gain
+    }
 }
 
 impl idl::InOrderRp235xPwmImpl for ServerImpl {
@@ -893,6 +1119,67 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         // count in bits 16..23, refill count in bits 24..31 (both saturating).
         // rate <= 48000 fits in 16 bits. Lets the shell report objectively
         // whether the poll-refill ever lost the race, no extra IPC op.
+        Ok((refills.min(255) << 24) | (underruns.min(255) << 16) | (rate & 0xffff))
+    }
+
+    #[cfg(not(feature = "sdcard"))]
+    fn play_mix(
+        &mut self,
+        _: &RecvMessage,
+        _name: LenLimit<Leased<R, [u8]>, 12>,
+    ) -> Result<u32, RequestError<PwmError>> {
+        // No SD card in this build: the mixer is unavailable.
+        Err(PwmError::OpenFailed.into())
+    }
+
+    #[cfg(feature = "sdcard")]
+    fn play_mix(
+        &mut self,
+        _: &RecvMessage,
+        name: LenLimit<Leased<R, [u8]>, 12>,
+    ) -> Result<u32, RequestError<PwmError>> {
+        // Copy the 8.3 short name out of the lease into a local buffer.
+        let n = name.len().min(12);
+        let mut name_buf = [0u8; 12];
+        name.read_range(0..n, &mut name_buf[..n])
+            .map_err(|()| RequestError::went_away())?;
+
+        // Open the file and parse the WAV header (same as play_file).
+        let source = sd::SdFileSource::open(
+            Rp235xSdcard::from(SDCARD.get_task_id()),
+            &name_buf[..n],
+        )
+        .ok_or(PwmError::OpenFailed)?;
+        let mut dec = decoder::WavDecoder::new(source)
+            .map_err(|_| PwmError::BadWav)?;
+
+        // Clamp the file rate and program the slice divider to it.
+        let rate = decoder::Decoder::sample_rate(&dec)
+            .clamp(PLAY_MIN_RATE, PLAY_MAX_RATE);
+        self.abort_audio_dma();
+        self.program_player_slice(rate);
+
+        // Build the gpio client from the task slot and configure the two mixer
+        // buttons as inputs with pull-ups (idle high, active-low when pressed).
+        let gpio = Rp235xGpio::from(GPIO.get_task_id());
+        let _ = gpio.configure_input(MIX_BTN_WAV);
+        let _ = gpio.set_pull(MIX_BTN_WAV, drv_rp235x_gpio_api::PULL_UP);
+        let _ = gpio.configure_input(MIX_BTN_SINE);
+        let _ = gpio.set_pull(MIX_BTN_SINE, drv_rp235x_gpio_api::PULL_UP);
+
+        // Start on the WAV only (ga = full, gb = 0). The sine phase increment is
+        // for the CLAMPED rate so the mix and the DMA agree on the sample rate.
+        let mut state = MixState {
+            phase: 0,
+            sine_inc: (((MIX_SINE_HZ as u64) << 32) / rate as u64) as u32,
+            ga: MIX_GAIN_FULL,
+            gb: 0,
+            target: MIX_TARGET_WAV,
+        };
+
+        // Blocking: streams the whole track (mixing + reading the buttons per
+        // refill), then stops the DMA + carrier. Same packed reply as play_file.
+        let (underruns, refills) = self.mix_loop(&mut dec, &gpio, &mut state);
         Ok((refills.min(255) << 24) | (underruns.min(255) << 16) | (rate & 0xffff))
     }
 }
