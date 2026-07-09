@@ -21,6 +21,8 @@ use core::ptr::addr_of_mut;
 use drv_rp235x_pwm_api::PwmError;
 use drv_rp235x_sys_api::{self as sys_api, Rp235xSys};
 use idol_runtime::{Leased, LenLimit, R, RequestError};
+#[cfg(feature = "sdcard")]
+use userlib::sys_get_timer;
 use userlib::{RecvMessage, task_slot};
 
 #[cfg(feature = "sdcard")]
@@ -215,6 +217,19 @@ const PLAY_HALF_SAMPLES: usize = AUDIO_BUF_SAMPLES / 2;
 /// address to the half it is currently draining.
 #[cfg(feature = "sdcard")]
 const PLAY_HALF_BYTES: u32 = (AUDIO_RING_BYTES / 2) as u32;
+/// Stall timeout for the player poll loops, in ms. The loops make progress only
+/// on DMA ring-half crossings; if the read pointer does not cross for this long
+/// the channel has wedged, so the loop bails rather than spinning forever and
+/// hanging the pwm server (which has no other escape). 500 ms is ~10x a ring
+/// half even at the slowest supported rate (~43 ms at 8 kHz).
+#[cfg(feature = "sdcard")]
+const PLAY_STALL_MS: u64 = 500;
+/// Check the stall timeout only once every this many poll iterations (a
+/// power-of-two mask). The `sys_get_timer` kipc is far heavier than the
+/// register read the loop spins on, so calling it every iteration could itself
+/// eat the refill margin; amortize it. 256K polls is far below one ring half.
+#[cfg(feature = "sdcard")]
+const PLAY_STALL_POLL_MASK: u32 = 0x3ffff;
 
 // --- Controllable 2-source mixer (milestone 4: WAV + sine, button crossfade) ---
 //
@@ -328,6 +343,24 @@ fn aligned_ring_ptr() -> *mut u32 {
     let base = addr_of_mut!(AUDIO_STORE) as usize;
     let aligned = (base + (AUDIO_RING_BYTES - 1)) & !(AUDIO_RING_BYTES - 1);
     aligned as *mut u32
+}
+
+/// Pack the player diagnostics into the u32 IPC reply so the shell can report
+/// them without an extra op: rate in bits 0..15 (<= 48000 fits), underruns in
+/// 16..22, a truncated (SD read error) flag in bit 23, refills in 24..31.
+/// underruns/refills saturate. The truncated flag is what keeps a faulted read
+/// from being reported as a clean, complete playback.
+#[cfg(feature = "sdcard")]
+fn pack_play_reply(
+    rate: u32,
+    underruns: u32,
+    refills: u32,
+    truncated: u32,
+) -> u32 {
+    (refills.min(255) << 24)
+        | ((truncated & 1) << 23)
+        | (underruns.min(127) << 16)
+        | (rate & 0xffff)
 }
 
 /// Running state of the 2-source mixer, carried across `mix_fill` calls so the
@@ -507,9 +540,12 @@ impl ServerImpl {
             w
         });
         ch.top().write(|w| unsafe { w.top().bits(PLAY_TOP) });
+        // Park both channels at the SAME mid-scale the running samples use
+        // (PLAY_MID) so the pre-DMA silence value cannot drift from the silence
+        // value fill_half/mix_fill write.
         ch.cc().modify(|_, w| unsafe {
-            w.a().bits(PLAY_TOP / 2);
-            w.b().bits(PLAY_TOP / 2);
+            w.a().bits(PLAY_MID as u16);
+            w.b().bits(PLAY_MID as u16);
             w
         });
     }
@@ -531,7 +567,11 @@ impl ServerImpl {
     /// once the decoder is exhausted). Writes are volatile through the aligned
     /// ring pointer (the DMA is a bus master reading the same window).
     #[cfg(feature = "sdcard")]
-    fn fill_half<D: decoder::Decoder>(&self, dec: &mut D, half: usize) -> usize {
+    fn fill_half<D: decoder::Decoder>(
+        &self,
+        dec: &mut D,
+        half: usize,
+    ) -> usize {
         let ring = aligned_ring_ptr();
         let base = half * PLAY_HALF_SAMPLES;
         let mut pcm = [0i16; PLAY_HALF_SAMPLES];
@@ -589,6 +629,34 @@ impl ServerImpl {
         (off / PLAY_HALF_BYTES) as usize
     }
 
+    /// Spin until the DMA read pointer crosses `laps` ring-half boundaries, then
+    /// return. Bails early if no crossing happens for PLAY_STALL_MS (the channel
+    /// wedged) so a DMA fault cannot hang the server here. Shared by the player
+    /// and mixer EOF drain (both let the silence tail play out one lap = 2
+    /// crossings before stopping).
+    #[cfg(feature = "sdcard")]
+    fn drain_crossings(&self, laps: u32) {
+        let mut crossings = 0u32;
+        let mut prev = self.dma_half();
+        let mut last_progress = sys_get_timer().now;
+        let mut polls = 0u32;
+        while crossings < laps {
+            let now = self.dma_half();
+            if now != prev {
+                crossings += 1;
+                prev = now;
+                last_progress = sys_get_timer().now;
+            }
+            polls = polls.wrapping_add(1);
+            if polls & PLAY_STALL_POLL_MASK == 0
+                && sys_get_timer().now.wrapping_sub(last_progress)
+                    > PLAY_STALL_MS
+            {
+                break;
+            }
+        }
+    }
+
     /// Blocking play loop: prime both halves, arm the DMA, then repeatedly
     /// refill whichever half the DMA is NOT currently reading, pulling PCM from
     /// `dec`, until the decoder is exhausted. After EOF, let the DMA lap once
@@ -622,6 +690,8 @@ impl ServerImpl {
         // at the ring base (near half 0), so far = 1 = the just-primed upper
         // half -- refilling it now would drop the second primed chunk unplayed.
         let mut last_filled = self.dma_half() ^ 1;
+        let mut last_progress = sys_get_timer().now;
+        let mut polls = 0u32;
         while !eof {
             let live = self.dma_half();
             let far = live ^ 1;
@@ -634,22 +704,25 @@ impl ServerImpl {
                 if self.dma_half() == far {
                     underruns += 1;
                 }
+                last_progress = sys_get_timer().now;
+            }
+            // Stall escape: if the DMA read pointer stops crossing halves (a
+            // wedged channel), bail rather than spinning forever. Checked only
+            // every PLAY_STALL_POLL_MASK+1 polls so the kipc stays off the hot
+            // path.
+            polls = polls.wrapping_add(1);
+            if polls & PLAY_STALL_POLL_MASK == 0
+                && sys_get_timer().now.wrapping_sub(last_progress)
+                    > PLAY_STALL_MS
+            {
+                break;
             }
         }
 
         // EOF: the last real samples plus the silence tail are in the ring.
         // Let the DMA drain one more full lap so nothing is cut off, then stop.
         // Two half-crossings = one lap past the point EOF was detected.
-        let start = self.dma_half();
-        let mut crossings = 0u32;
-        let mut prev = start;
-        while crossings < 2 {
-            let now = self.dma_half();
-            if now != prev {
-                crossings += 1;
-                prev = now;
-            }
-        }
+        self.drain_crossings(2);
 
         self.abort_audio_dma();
         self.dma
@@ -752,6 +825,8 @@ impl ServerImpl {
         // half so the first refill waits for a real DMA crossing (both halves
         // were just primed with mixed data).
         let mut last_filled = self.dma_half() ^ 1;
+        let mut last_progress = sys_get_timer().now;
+        let mut polls = 0u32;
         while !eof {
             let live = self.dma_half();
             let far = live ^ 1;
@@ -775,20 +850,21 @@ impl ServerImpl {
                 if self.dma_half() == far {
                     underruns += 1;
                 }
+                last_progress = sys_get_timer().now;
+            }
+            // Stall escape, same as play_loop: bail if the DMA stops crossing
+            // halves, checked off the hot path.
+            polls = polls.wrapping_add(1);
+            if polls & PLAY_STALL_POLL_MASK == 0
+                && sys_get_timer().now.wrapping_sub(last_progress)
+                    > PLAY_STALL_MS
+            {
+                break;
             }
         }
 
         // Drain one more lap so the silence tail plays out, then stop.
-        let start = self.dma_half();
-        let mut crossings = 0u32;
-        let mut prev = start;
-        while crossings < 2 {
-            let now = self.dma_half();
-            if now != prev {
-                crossings += 1;
-                prev = now;
-            }
-        }
+        self.drain_crossings(2);
 
         self.abort_audio_dma();
         self.dma
@@ -1102,8 +1178,8 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        let mut dec = decoder::WavDecoder::new(source)
-            .map_err(|_| PwmError::BadWav)?;
+        let mut dec =
+            decoder::WavDecoder::new(source).map_err(|_| PwmError::BadWav)?;
 
         // Clamp the file rate to the player's supported range and program the
         // slice divider to it. The DMA path (ch0) is shared with the other audio
@@ -1115,11 +1191,8 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
 
         // Blocking: streams the whole track, then stops the DMA + carrier.
         let (underruns, refills) = self.play_loop(&mut dec);
-        // Pack diagnostics into the reply: rate in the low 16 bits, underrun
-        // count in bits 16..23, refill count in bits 24..31 (both saturating).
-        // rate <= 48000 fits in 16 bits. Lets the shell report objectively
-        // whether the poll-refill ever lost the race, no extra IPC op.
-        Ok((refills.min(255) << 24) | (underruns.min(255) << 16) | (rate & 0xffff))
+        let truncated = decoder::Decoder::had_error(&dec) as u32;
+        Ok(pack_play_reply(rate, underruns, refills, truncated))
     }
 
     #[cfg(not(feature = "sdcard"))]
@@ -1150,8 +1223,8 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        let mut dec = decoder::WavDecoder::new(source)
-            .map_err(|_| PwmError::BadWav)?;
+        let mut dec =
+            decoder::WavDecoder::new(source).map_err(|_| PwmError::BadWav)?;
 
         // Clamp the file rate and program the slice divider to it.
         let rate = decoder::Decoder::sample_rate(&dec)
@@ -1180,7 +1253,8 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         // Blocking: streams the whole track (mixing + reading the buttons per
         // refill), then stops the DMA + carrier. Same packed reply as play_file.
         let (underruns, refills) = self.mix_loop(&mut dec, &gpio, &mut state);
-        Ok((refills.min(255) << 24) | (underruns.min(255) << 16) | (rate & 0xffff))
+        let truncated = decoder::Decoder::had_error(&dec) as u32;
+        Ok(pack_play_reply(rate, underruns, refills, truncated))
     }
 }
 

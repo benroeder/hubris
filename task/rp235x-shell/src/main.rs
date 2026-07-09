@@ -2796,6 +2796,31 @@ impl Shell {
         });
     }
 
+    /// Decode + print the packed diagnostics reply shared by `play` and `mix`:
+    /// rate (0..15), underruns (16..22), a truncated-read flag (bit 23), refills
+    /// (24..31). `underruns == 0` means the refill stayed ahead of the DMA the
+    /// whole track; a set truncated flag means an SD read faulted mid-track, so
+    /// the playback was cut short (not a clean end).
+    #[cfg(feature = "fat")]
+    fn report_play_reply(&mut self, verb: &[u8], packed: u32) {
+        let rate = packed & 0xffff;
+        let underruns = (packed >> 16) & 0x7f;
+        let truncated = (packed >> 23) & 1;
+        let refills = (packed >> 24) & 0xff;
+        self.out.put(verb);
+        self.out.put(b" (");
+        self.out.put_u32(rate);
+        self.out.put(b" Hz, ");
+        self.out.put_u32(refills);
+        self.out.put(b" refills, ");
+        self.out.put_u32(underruns);
+        self.out.put(b" underruns)");
+        if truncated != 0 {
+            self.out.put(b" -- TRUNCATED: SD read error");
+        }
+        self.out.put(b"\r\n");
+    }
+
     /// `play <name>`: stream a 16-bit PCM WAV from the SD root out the audio
     /// jack. Routes GP18/GP19 to PWM, then calls the pwm server's `play_file`,
     /// which BLOCKS until the track ends (the pwm server serves no other IPC
@@ -2816,27 +2841,14 @@ impl Shell {
             return;
         }
         match self.pwm.play_file(name.as_bytes()) {
-            Ok(packed) => {
-                // Unpack the diagnostics: rate (low 16), underruns (16..23),
-                // refills (24..31). underruns == 0 => the refill stayed ahead
-                // of the DMA the whole track (no tearing).
-                let rate = packed & 0xffff;
-                let underruns = (packed >> 16) & 0xff;
-                let refills = (packed >> 24) & 0xff;
-                self.out.put(b"played (");
-                self.out.put_u32(rate);
-                self.out.put(b" Hz, ");
-                self.out.put_u32(refills);
-                self.out.put(b" refills, ");
-                self.out.put_u32(underruns);
-                self.out.put(b" underruns)\r\n");
-            }
+            Ok(packed) => self.report_play_reply(b"played", packed),
             Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
                 self.out.put(b"play: open failed (no card/file?)\r\n");
             }
             Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
-                self.out
-                    .put(b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n");
+                self.out.put(
+                    b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
+                );
             }
             Err(_) => self.out.put(b"play: error\r\n"),
         }
@@ -2863,25 +2875,14 @@ impl Shell {
             return;
         }
         match self.pwm.play_mix(name.as_bytes()) {
-            Ok(packed) => {
-                // Unpack: rate (low 16), underruns (16..23), refills (24..31).
-                let rate = packed & 0xffff;
-                let underruns = (packed >> 16) & 0xff;
-                let refills = (packed >> 24) & 0xff;
-                self.out.put(b"mixed (");
-                self.out.put_u32(rate);
-                self.out.put(b" Hz, ");
-                self.out.put_u32(refills);
-                self.out.put(b" refills, ");
-                self.out.put_u32(underruns);
-                self.out.put(b" underruns)\r\n");
-            }
+            Ok(packed) => self.report_play_reply(b"mixed", packed),
             Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
                 self.out.put(b"mix: open failed (no card/file?)\r\n");
             }
             Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
-                self.out
-                    .put(b"mix: not a supported WAV (PCM 16-bit mono/stereo)\r\n");
+                self.out.put(
+                    b"mix: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
+                );
             }
             Err(_) => self.out.put(b"mix: error\r\n"),
         }

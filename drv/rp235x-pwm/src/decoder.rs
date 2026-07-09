@@ -33,6 +33,13 @@ pub trait ByteSource {
     /// Read up to `out.len()` bytes into `out`. Returns the number of bytes
     /// read; 0 signals EOF.
     fn read(&mut self, out: &mut [u8]) -> usize;
+
+    /// True if a read ever failed with an IO error (as opposed to a clean EOF).
+    /// A 0-byte `read` is ambiguous between EOF and error; this disambiguates so
+    /// a truncated stream is not silently reported as complete.
+    fn had_error(&self) -> bool {
+        false
+    }
 }
 
 /// A streaming PCM decoder: pulls bytes from an underlying `ByteSource` and
@@ -49,6 +56,12 @@ pub trait Decoder {
     /// Fill `out` with the next mono i16 samples. Returns the count written; a
     /// return of 0 means the stream is exhausted.
     fn next_pcm(&mut self, out: &mut [i16]) -> usize;
+
+    /// True if the underlying byte source hit an IO error during decoding, i.e.
+    /// the stream ended because of a fault rather than reaching the end.
+    fn had_error(&self) -> bool {
+        false
+    }
 }
 
 /// Size of the decoder's internal file-read buffer, in bytes. One 512-byte SD
@@ -118,10 +131,7 @@ impl<S: ByteSource> WavDecoder<S> {
         let channels = le_u16(&hdr[22..24]);
         let sample_rate = le_u32(&hdr[24..28]);
         let bits = le_u16(&hdr[34..36]);
-        if fmt_tag != 1
-            || bits != 16
-            || !(channels == 1 || channels == 2)
-        {
+        if fmt_tag != 1 || bits != 16 || !(channels == 1 || channels == 2) {
             return Err(DecodeError::Unsupported);
         }
         if &hdr[36..40] != b"data" {
@@ -171,6 +181,10 @@ impl<S: ByteSource> Decoder for WavDecoder<S> {
 
     fn channels(&self) -> u8 {
         self.channels
+    }
+
+    fn had_error(&self) -> bool {
+        self.src.had_error()
     }
 
     fn next_pcm(&mut self, out: &mut [i16]) -> usize {
