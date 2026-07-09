@@ -16,6 +16,7 @@ drv-rp235x-sys-api = { path = "../rp235x-sys-api" }
 drv-rp235x-gpio-api = { path = "../rp235x-gpio-api", optional = true }
 drv-rp235x-sdcard-api = { path = "../rp235x-sdcard-api", optional = true }
 embedded-sdmmc = { workspace = true, optional = true }
+nanomp3 = { version = "0.1", optional = true }
 counters = { path = "../../lib/counters" }
 userlib = { path = "../../sys/userlib" }
 
@@ -23,9 +24,10 @@ userlib = { path = "../../sys/userlib" }
 idol = { workspace = true }
 
 [features]
-# `sdcard` wires the streaming WAV player (`play_file`) to the SD block device
-# via embedded-sdmmc. Without it, `play_file` compiles but returns OpenFailed.
-sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc", "dep:drv-rp235x-gpio-api"]
+# `sdcard` wires the streaming WAV/MP3 player (`play_file`) to the SD block
+# device via embedded-sdmmc. Pulls in `nanomp3` for MP3 playback behind the same
+# `Decoder` trait. Without it, `play_file` compiles but returns OpenFailed.
+sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc", "dep:drv-rp235x-gpio-api", "dep:nanomp3"]
 
 [[bin]]
 name = "drv-rp235x-pwm"

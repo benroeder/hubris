@@ -550,22 +550,27 @@ impl ServerImpl {
         });
     }
 
-    /// Map a signed 16-bit PCM sample to a packed u32 CC value: shift to 10-bit,
-    /// bias to mid-scale, clamp to 0..=PLAY_TOP, and duplicate into both the
-    /// channel-A (low) and channel-B (high) halves so both ears play the same
-    /// mono stream.
+    /// Map a signed 16-bit PCM sample to a 10-bit unsigned duty around mid-scale:
+    /// shift to 10-bit, bias to PLAY_MID, clamp to 0..=PLAY_TOP.
     #[cfg(feature = "sdcard")]
-    fn pcm_to_cc(sample: i16) -> u32 {
-        let duty = (((sample as i32) >> PLAY_SAMPLE_SHIFT) + PLAY_MID)
-            .clamp(0, PLAY_TOP as i32) as u32;
-        (duty << CH_B_SHIFT) | duty
+    fn sample_to_duty(sample: i16) -> u32 {
+        (((sample as i32) >> PLAY_SAMPLE_SHIFT) + PLAY_MID)
+            .clamp(0, PLAY_TOP as i32) as u32
+    }
+
+    /// Pack a stereo L/R pair into the u32 CC value: channel A (low 16 bits) =
+    /// left = GP18, channel B (high 16 bits) = right = GP19.
+    #[cfg(feature = "sdcard")]
+    fn stereo_to_cc(l: i16, r: i16) -> u32 {
+        (Self::sample_to_duty(r) << CH_B_SHIFT) | Self::sample_to_duty(l)
     }
 
     /// Fill one ring half (`half` = 0 = lower slots, 1 = upper slots) with
-    /// samples pulled from `dec`. Slots past what the decoder yields are filled
-    /// with mid-scale silence. Returns the number of real samples written (0
-    /// once the decoder is exhausted). Writes are volatile through the aligned
-    /// ring pointer (the DMA is a bus master reading the same window).
+    /// samples pulled from `dec`. The decoder yields INTERLEAVED L, R pairs (2
+    /// i16 per ring slot); slots past what it yields are filled with mid-scale
+    /// silence. Returns the i16 count written (0 once the decoder is exhausted).
+    /// Writes are volatile through the aligned ring pointer (the DMA is a bus
+    /// master reading the same window).
     #[cfg(feature = "sdcard")]
     fn fill_half<D: decoder::Decoder>(
         &self,
@@ -574,18 +579,21 @@ impl ServerImpl {
     ) -> usize {
         let ring = aligned_ring_ptr();
         let base = half * PLAY_HALF_SAMPLES;
-        let mut pcm = [0i16; PLAY_HALF_SAMPLES];
+        // 2 i16 (L, R) per ring slot.
+        let mut pcm = [0i16; PLAY_HALF_SAMPLES * 2];
         let got = dec.next_pcm(&mut pcm);
-        // Slots past `got` play mid-scale silence (the decoder is exhausted).
+        // Samples past `got` play mid-scale silence (the decoder is exhausted).
         for slot in pcm.iter_mut().skip(got) {
             *slot = 0;
         }
-        for (i, &sample) in pcm.iter().enumerate() {
+        for i in 0..PLAY_HALF_SAMPLES {
+            let l = pcm[2 * i];
+            let r = pcm[2 * i + 1];
             // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE (2x
             // the ring), so base + i (< AUDIO_BUF_SAMPLES) is in bounds. Single-
             // threaded server, no references taken.
             unsafe {
-                ring.add(base + i).write_volatile(Self::pcm_to_cc(sample));
+                ring.add(base + i).write_volatile(Self::stereo_to_cc(l, r));
             }
         }
         got
@@ -748,26 +756,27 @@ impl ServerImpl {
     ) -> usize {
         let ring = aligned_ring_ptr();
         let base = half * PLAY_HALF_SAMPLES;
-        let mut pcm = [0i16; PLAY_HALF_SAMPLES];
+        // 2 i16 (L, R) per ring slot -- source A is stereo.
+        let mut pcm = [0i16; PLAY_HALF_SAMPLES * 2];
         let got = dec.next_pcm(&mut pcm);
-        // Slots past `got` are silence (0 -> mid-scale for source A).
+        // Samples past `got` are silence (0 -> mid-scale for source A).
         for slot in pcm.iter_mut().skip(got) {
             *slot = 0;
         }
         let lut_len = SINE_LUT.len() as u32;
-        for (i, &sample) in pcm.iter().enumerate() {
-            // Source A: WAV sample -> 10-bit duty, then centered around mid.
-            let wav_duty = (((sample as i32) >> PLAY_SAMPLE_SHIFT) + PLAY_MID)
-                .clamp(0, PLAY_TOP as i32);
-            let wav_centered = wav_duty - PLAY_MID;
+        for i in 0..PLAY_HALF_SAMPLES {
+            // Source A: the WAV L/R pair, each -> 10-bit duty centered on mid.
+            let wav_l = Self::sample_to_duty(pcm[2 * i]) as i32 - PLAY_MID;
+            let wav_r = Self::sample_to_duty(pcm[2 * i + 1]) as i32 - PLAY_MID;
 
-            // Source B: fixed sine over the LUT, centered around mid. Advance the
-            // phase every sample so gb can fade in with no restart transient.
+            // Source B: the fixed sine over the LUT, centered around mid (mono,
+            // so applied to both channels). Advance the phase once per output
+            // frame so gb can fade in with no restart transient.
             let idx = (state.phase >> SINE_LUT_INDEX_SHIFT) % lut_len;
             let sine_centered = SINE_LUT[idx as usize] as i32 - PLAY_MID;
             state.phase = state.phase.wrapping_add(state.sine_inc);
 
-            // Ramp the gains one step per sample toward the selected target.
+            // Ramp the gains one step per output frame toward the target.
             // TODO equal-power: this is a LINEAR crossfade; multiply by sqrt
             // curves if the midpoint dip proves audible.
             let (ta, tb) = if state.target == MIX_TARGET_SINE {
@@ -778,12 +787,15 @@ impl ServerImpl {
             state.ga = ramp_toward(state.ga, ta);
             state.gb = ramp_toward(state.gb, tb);
 
-            // Blend in the centered domain, rebias to mid, clamp, and pack both
-            // CC halves (mono: same duty to left and right).
-            let mixed = state.ga * wav_centered + state.gb * sine_centered;
-            let duty = (PLAY_MID + (mixed >> MIX_GAIN_SHIFT))
+            // Blend each channel (WAV L or R) with the shared sine in the
+            // centered domain, rebias to mid, clamp, and pack L->A / R->B.
+            let mixed_l = state.ga * wav_l + state.gb * sine_centered;
+            let mixed_r = state.ga * wav_r + state.gb * sine_centered;
+            let duty_l = (PLAY_MID + (mixed_l >> MIX_GAIN_SHIFT))
                 .clamp(0, PLAY_TOP as i32) as u32;
-            let pair = (duty << CH_B_SHIFT) | duty;
+            let duty_r = (PLAY_MID + (mixed_r >> MIX_GAIN_SHIFT))
+                .clamp(0, PLAY_TOP as i32) as u32;
+            let pair = (duty_r << CH_B_SHIFT) | duty_l;
             // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE (2x
             // the ring), so base + i (< AUDIO_BUF_SAMPLES) is in bounds. Single-
             // threaded server, no references taken.
@@ -1159,7 +1171,12 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         Err(PwmError::OpenFailed.into())
     }
 
+    // `inline(never)`: the MP3 decoder holds ~20 KiB of buffers on the stack for
+    // the whole play loop. Inlining this (and play_mix) into `main`/`dispatch`
+    // would sum both decoders' frames into one; keeping each out-of-line means
+    // only the active op's frame is live at a time.
     #[cfg(feature = "sdcard")]
+    #[inline(never)]
     fn play_file(
         &mut self,
         _: &RecvMessage,
@@ -1178,8 +1195,19 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        let mut dec =
-            decoder::WavDecoder::new(source).map_err(|_| PwmError::BadWav)?;
+        // Route by file extension: ".mp3" -> nanomp3, everything else -> WAV.
+        // Both wrap in one enum so the generic play loop is unchanged.
+        let mut dec = if decoder::is_mp3_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Mp3(
+                decoder::Nanomp3Decoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        } else {
+            decoder::AnyDecoder::Wav(
+                decoder::WavDecoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        };
 
         // Clamp the file rate to the player's supported range and program the
         // slice divider to it. The DMA path (ch0) is shared with the other audio
@@ -1205,7 +1233,9 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         Err(PwmError::OpenFailed.into())
     }
 
+    // See play_file: kept out-of-line to bound the pwm task stack.
     #[cfg(feature = "sdcard")]
+    #[inline(never)]
     fn play_mix(
         &mut self,
         _: &RecvMessage,
@@ -1223,8 +1253,19 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        let mut dec =
-            decoder::WavDecoder::new(source).map_err(|_| PwmError::BadWav)?;
+        // Same extension routing as play_file: the mixer accepts an .mp3 as
+        // source A too (WAV stays the default for any other extension).
+        let mut dec = if decoder::is_mp3_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Mp3(
+                decoder::Nanomp3Decoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        } else {
+            decoder::AnyDecoder::Wav(
+                decoder::WavDecoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        };
 
         // Clamp the file rate and program the slice divider to it.
         let rate = decoder::Decoder::sample_rate(&dec)

@@ -87,8 +87,8 @@ task-slots = ["sys"]
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
 priority = 3
-max-sizes = {flash = 32768, ram = 32768}
-stacksize = 12288
+max-sizes = {flash = 40960, ram = 135168}
+stacksize = 122880
 uses = ["pwm", "dma", "adc"]
 start = true
 features = ["sdcard"]
