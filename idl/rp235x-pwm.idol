@@ -61,5 +61,21 @@ Interface(
             reply: Result(ok: "()", err: CLike("PwmError")),
             idempotent: true,
         ),
+        "play_file": (
+            description: "Stream a 16-bit PCM WAV from the FAT root of the SD card out the audio jack (GP18/GP19). Opens `name` (an 8.3 short name), reads the WAV header, programs slice 1 for the file's sample rate, and drives the same DMA ring as `audio` while poll-refilling it from the file until EOF. BLOCKING: this holds the pwm server for the whole track duration. Returns the detected sample rate on success. Shares slice 1 + DMA ch0 with the other audio paths (aborts ch0 first).",
+            args: {},
+            leases: {
+                "name": (type: "[u8]", read: true, max_len: Some(12)),
+            },
+            reply: Result(ok: "u32", err: CLike("PwmError")),
+        ),
+        "play_mix": (
+            description: "Like `play_file`, but mixes the WAV against a fixed 660 Hz DDS sine into the same DMA ring, with a button-driven auto-crossfade: GP20 fades to the WAV, GP21 fades to the sine (gains ramp 1 Q8 step per sample, click-free). The pwm task reads GP20/GP21 itself (configured input + pull-up), once per ring refill. BLOCKING for the whole track (the shell cannot send while the mix runs). Returns the same packed rate/refills/underruns word as `play_file`.",
+            args: {},
+            leases: {
+                "name": (type: "[u8]", read: true, max_len: Some(12)),
+            },
+            reply: Result(ok: "u32", err: CLike("PwmError")),
+        ),
     },
 )

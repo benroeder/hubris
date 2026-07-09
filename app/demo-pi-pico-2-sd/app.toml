@@ -86,12 +86,17 @@ task-slots = ["sys"]
 
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
-priority = 2
-max-sizes = {flash = 8192, ram = 16384}
-stacksize = 768
+priority = 3
+max-sizes = {flash = 32768, ram = 32768}
+stacksize = 12288
 uses = ["pwm", "dma", "adc"]
 start = true
-task-slots = ["sys"]
+features = ["sdcard"]
+# pwm_driver calls sdcard for `play_file`, so sdcard must be a strictly higher
+# priority (lower number) than pwm_driver to avoid a priority inversion. It also
+# calls gpio_driver to read the mixer buttons (GP20/GP21) during `play_mix`;
+# gpio_driver at priority 2 is likewise strictly higher than pwm_driver (3).
+task-slots = ["sys", "sdcard", {gpio = "gpio_driver"}]
 
 [tasks.flash_driver]
 name = "drv-rp235x-flash"
@@ -104,7 +109,7 @@ extern-regions = ["rom", "xip"]
 
 [tasks.sdcard]
 name = "drv-rp235x-sdcard"
-priority = 3
+priority = 2
 max-sizes = {flash = 8192, ram = 2048}
 stacksize = 1024
 uses = ["spi1", "io_bank0", "pads_bank0", "sio"]
@@ -123,7 +128,7 @@ start = true
 [tasks.shell]
 name = "task-rp235x-shell"
 priority = 4
-max-sizes = {flash = 57344, ram = 12288}
+max-sizes = {flash = 65536, ram = 12288}
 stacksize = 8192
 start = true
 features = ["sdcard", "fat", "ds1302"]
