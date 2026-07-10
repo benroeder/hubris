@@ -3556,18 +3556,19 @@ impl Shell {
                 return;
             }
         };
-        let rc = self.flash.reboot(bootsel);
-        if rc == 0 {
-            self.out.put(if bootsel != 0 {
-                b"rebooting to BOOTSEL...\r\n" as &[u8]
-            } else {
-                b"rebooting...\r\n"
-            });
+        self.out.put(if bootsel != 0 {
+            b"rebooting to BOOTSEL...\r\n" as &[u8]
         } else {
-            self.out.put(b"reboot failed, rc=");
-            self.out.put_hex32(rc);
-            self.out.put(b"\r\n");
-        }
+            b"rebooting...\r\n"
+        });
+        self.out.flush();
+        // If the watchdog fires this call never returns (the chip resets while
+        // the flash driver sleeps). Getting a reply at all means the reboot
+        // did NOT happen; the rc carries the stuck watchdog countdown.
+        let rc = self.flash.reboot(bootsel);
+        self.out.put(b"reboot FAILED (watchdog did not fire), rc=");
+        self.out.put_hex32(rc);
+        self.out.put(b"\r\n");
     }
 
     fn i2c_scan(&mut self) {

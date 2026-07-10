@@ -258,11 +258,18 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         // an immediate trigger can glitch clk_pow as the watchdog resets the
         // system clock generators and leave the chip wedged; the timer path
         // gives the clocks time to settle. LOAD counts down at the watchdog
-        // tick (~1 MHz, left running by the boot ROM); ~1 ms here.
+        // tick (~1 MHz, enabled by the privileged pre-kernel boot path in
+        // rp235x-startup -- the ROM does NOT leave it running on the RAM
+        // (LOAD_MAP) boot flavor, which once made this a silent no-op).
         wd.load().write(|w| unsafe { w.bits(1000) });
         wd.ctrl().write(|w| w.enable().set_bit());
-        // The reset lands within ~1 ms; this reply is best-effort.
-        Ok(0)
+        // The reset should land within ~1 ms. Do not report success blindly:
+        // if we are still executing well past the deadline, the countdown is
+        // not running (dead watchdog tick) -- return the live counter so the
+        // failure is visible at the shell instead of a silent no-op.
+        userlib::hl::sleep_for(10);
+        let stuck_time = wd.ctrl().read().time().bits();
+        Ok(0x8000_0000 | stuck_time as u32)
     }
 }
 
