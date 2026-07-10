@@ -194,8 +194,8 @@ const HELP_FAT: &[u8] = b"  sd ls                 list the FAT root directory (n
   sd soak [secs]        sustained write/read/verify loop for secs seconds (default 10)\r\n\
   wavgen <name> [secs] [hz]  synthesize a 16-bit mono WAV on the SD (test audio)\r\n\
   sd upload <name> <sz-hex> <crc-hex>  receive a binary file over USB -> SD\r\n\
-  play <name>           stream a WAV or MP3 from the SD root out the jack (blocks)\r\n\
-  mix <name>            WAV/MP3 + 660Hz sine mixer; GP20 fades to file, GP21 to sine\r\n";
+  play <name>           stream a WAV/MP3/FLAC (.FLA) from the SD root out the jack (blocks)\r\n\
+  mix <name>            WAV/MP3/FLAC + 660Hz sine mixer; GP20 fades to file, GP21 to sine\r\n";
 #[cfg(feature = "datalog")]
 const HELP_DATALOG: &[u8] =
     b"  log <count> [secs]     log <count> RTC-stamped temps to LOG.CSV (RGB status)\r\n";

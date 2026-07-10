@@ -129,18 +129,22 @@ const SINE_MAX_MS: u32 = 2000;
 // with its own frequency (true stereo).
 
 /// Samples in the live audio ring (the aligned window the DMA reads). Each
-/// sample is a u32 stereo pair, so 1024 u32 = 4096 bytes, matching the ring
+/// sample is a u32 stereo pair, so 4096 u32 = 16384 bytes, matching the ring
 /// wrap (`AUDIO_RING_SIZE`). Longer than the LUT so several whole sine cycles
-/// fit, keeping the loop-boundary pitch error small.
-const AUDIO_BUF_SAMPLES: usize = 1024;
-/// Ring size in bytes: 1024 u32 = 4096. The DMA read address wraps at this
-/// power-of-two boundary, so the aligned window must start on a 4096-byte
+/// fit, keeping the loop-boundary pitch error small. Sized so one ring HALF
+/// (2048 frames) is a ~46 ms refill budget even at 44.1 kHz: the burst of
+/// decoding one whole 4096-frame FLAC block (~25 ms) plus the SD read must
+/// fit inside one half's playtime, which 512- and 1024-frame halves both
+/// failed on-target (one underrun per FLAC block boundary).
+const AUDIO_BUF_SAMPLES: usize = 4096;
+/// Ring size in bytes: 4096 u32 = 16384. The DMA read address wraps at this
+/// power-of-two boundary, so the aligned window must start on a 16384-byte
 /// boundary (see `aligned_ring_ptr`).
 const AUDIO_RING_BYTES: usize = AUDIO_BUF_SAMPLES * 4;
-/// DMA read-address ring wrap, as log2 of the ring size in bytes (4096 -> 12).
-/// The read address wraps back to the window start every 4096 bytes, so the
+/// DMA read-address ring wrap, as log2 of the ring size in bytes (16384 -> 14).
+/// The read address wraps back to the window start every 16384 bytes, so the
 /// same samples replay forever.
-const AUDIO_RING_SIZE: u8 = 12;
+const AUDIO_RING_SIZE: u8 = 14;
 /// Integer clock divider for the audio carrier slice.
 const AUDIO_DIV_INT: u8 = 6;
 /// Counter wrap for the audio carrier: 10-bit-ish so LUT values (0..=1023) map
@@ -190,25 +194,113 @@ const AUDIO_MAX_HZ: u32 = 8000;
 /// clk_sys in Hz: the PWM count clock before the slice divider.
 #[cfg(feature = "sdcard")]
 const CLK_SYS_HZ: u32 = 150_000_000;
-/// Player carrier wrap: 10-bit, so a sample maps straight to the compare with
-/// no scaling (same as AUDIO_TOP). One sample plays per wrap.
+/// Ceiling on the player carrier wrap (TOP + 1): 12 bits. The wrap is chosen
+/// PER SAMPLE RATE by `PlayQuant::pick` -- as large as the rate allows (more
+/// wrap = more amplitude resolution), capped here. One sample plays per wrap,
+/// so `rate = clk_sys / (div * (top + 1))`: a 22.05 kHz file gets the full 12
+/// bits (TOP ~ 4030 with div 27/16), while 44.1/48 kHz get ~11.7 bits (the
+/// divider bottoms out at 1.0).
 #[cfg(feature = "sdcard")]
-const PLAY_TOP: u16 = AUDIO_TOP;
+const PLAY_MAX_TOP_P1: u32 = 4096;
 /// Lowest file sample rate the player accepts, in Hz (clamped, not rejected).
 #[cfg(feature = "sdcard")]
 const PLAY_MIN_RATE: u32 = 8_000;
 /// Highest file sample rate the player accepts, in Hz (clamped, not rejected).
-/// 48 kHz is the practical ceiling for a 10-bit wrap off a 150 MHz clock (the
-/// divider bottoms out near 1.0).
 #[cfg(feature = "sdcard")]
 const PLAY_MAX_RATE: u32 = 48_000;
-/// Right-shift turning a signed 16-bit sample into a 10-bit unsigned duty
-/// around mid-scale: `(s >> 6) + 512`. 16-bit - 10-bit = 6 bits.
+
+/// Per-play output quantizer: the carrier geometry picked for the file's
+/// sample rate plus the dither/noise-shaping state that converts each 16-bit
+/// sample to a duty.
+///
+/// Instead of a bare truncating shift (the old `(s >> 6) + 512`), samples are
+/// scaled by multiply (`(s + 32768) * (top+1) >> 16`, exact for any wrap) and
+/// quantized with TPDF dither plus first-order error feedback: the fractional
+/// remainder of each sample is carried into the next, so truncation error
+/// becomes decorrelated noise pushed toward the (ultrasonic) half-rate instead
+/// of harmonic distortion. State is per channel so L/R shape independently.
 #[cfg(feature = "sdcard")]
-const PLAY_SAMPLE_SHIFT: i32 = 6;
-/// Mid-scale duty (silence) for the 10-bit player carrier: PLAY_TOP / 2 + 1.
+struct PlayQuant {
+    /// Counts per wrap (TOP + 1) for this play.
+    top_plus_1: u32,
+    /// Mid-scale duty (silence, sample value 0).
+    mid: u32,
+    /// Error-feedback residuals in Q16 duty units, [left, right].
+    err: [i32; 2],
+    /// xorshift32 state for the TPDF dither.
+    rng: u32,
+}
+
 #[cfg(feature = "sdcard")]
-const PLAY_MID: i32 = 512;
+impl PlayQuant {
+    /// Picks the (divider Q4, TOP + 1) pair for `rate`: the largest wrap the
+    /// rate allows (capped at 12 bits), then the divider/wrap combination with
+    /// the smallest pitch error. Scanning a few divider candidates matters:
+    /// naively maxing TOP at 22.05 kHz forces div 26.58 -> 27/16 and lands
+    /// 1.6% flat, while (27/16, 4031) is 0.01% -- inaudible.
+    fn pick(rate: u32) -> (u32, u32) {
+        let clk16 = CLK_SYS_HZ as u64 * 16;
+        let r = rate as u64;
+        // Smallest divider (in Q4, >= 1.0) that keeps TOP+1 within the cap.
+        let q4_min = (clk16.div_ceil(r * PLAY_MAX_TOP_P1 as u64)).max(16);
+        let mut best = (q4_min, PLAY_MAX_TOP_P1, u64::MAX);
+        for q4 in q4_min..q4_min + 4 {
+            let denom = q4 * r;
+            let tp1 =
+                ((clk16 + denom / 2) / denom).clamp(2, PLAY_MAX_TOP_P1 as u64);
+            // Pitch-error metric: | clk*16 - q4 * (top+1) * rate |.
+            let err = clk16.abs_diff(q4 * tp1 * r);
+            if err < best.2 {
+                best = (q4, tp1 as u32, err);
+            }
+        }
+        (best.0 as u32, best.1)
+    }
+
+    fn new(top_plus_1: u32) -> Self {
+        Self {
+            top_plus_1,
+            mid: top_plus_1 / 2,
+            err: [0; 2],
+            rng: 0x1234_5678,
+        }
+    }
+
+    /// Two xorshift32 steps -> triangular (TPDF) dither of +/-1 LSB in Q16.
+    fn tpdf(&mut self) -> i32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let a = x & 0xffff;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let b = x & 0xffff;
+        self.rng = x;
+        a as i32 - b as i32
+    }
+
+    /// Quantize a CENTERED Q16 duty value (0 = silence) for channel `ch`
+    /// (0 = left, 1 = right): rebias to mid, add the carried error and dither,
+    /// floor to a duty, clamp, and carry the new (windup-bounded) residual.
+    fn duty_centered_q16(&mut self, centered: i64, ch: usize) -> u32 {
+        // Exact Q16 mid-scale: (top+1) * 32768.
+        let inp =
+            centered + ((self.top_plus_1 as i64) << 15) + self.err[ch] as i64;
+        let acc = inp + self.tpdf() as i64;
+        let q = (acc >> 16).clamp(0, self.top_plus_1 as i64 - 1);
+        // Residual vs the value actually emitted, bounded to +/-2 LSB so a
+        // clamped (clipping) stretch cannot wind the accumulator up.
+        self.err[ch] = (inp - (q << 16)).clamp(-(2 << 16), 2 << 16) as i32;
+        q as u32
+    }
+
+    /// Quantize one signed 16-bit PCM sample to a duty for channel `ch`.
+    fn duty(&mut self, sample: i16, ch: usize) -> u32 {
+        self.duty_centered_q16(sample as i64 * self.top_plus_1 as i64, ch)
+    }
+}
 /// Samples per ring HALF: the player refills one half while the DMA drains the
 /// other. AUDIO_BUF_SAMPLES (1024) u32 slots total, so 512 per half.
 #[cfg(feature = "sdcard")]
@@ -235,12 +327,13 @@ const PLAY_STALL_POLL_MASK: u32 = 0x3ffff;
 //
 // Reuses the whole `play_file` DMA path (slice 1, DMA ch0, the aligned ring)
 // but fills the ring by BLENDING two sources per sample instead of copying one:
-//   A = the WAV file (WavDecoder -> i16, mapped to a centered 10-bit duty).
+//   A = the file (decoder -> i16, lifted to a centered Q16 duty).
 //   B = a fixed 660 Hz DDS sine over SINE_LUT (distinct from the 440 Hz test
 //       file so the blend is audible), whose phase ALWAYS advances so a fade-in
 //       has no restart transient.
-// out = PLAY_MID + ((ga * wav_centered + gb * sine_centered) >> 8), clamped to
-// 0..=PLAY_TOP, packed into both CC halves. `ga`/`gb` are Q8 gains 0..=256.
+// out = PlayQuant::duty_centered_q16((ga * wav + gb * sine) >> 8) -- the blend
+// stays full-precision Q16 and is quantized ONCE (TPDF dither + noise shaping),
+// then packed into both CC halves. `ga`/`gb` are Q8 gains 0..=256.
 //
 // Auto-fade: the buttons pick a TARGET source; the gains ramp toward it one Q8
 // step PER SAMPLE (no per-half zipper). GP20 -> WAV (ga->256, gb->0); GP21 ->
@@ -517,19 +610,19 @@ impl ServerImpl {
         });
     }
 
-    /// Program slice 1's 8.4 fixed-point divider so one sample plays per wrap at
-    /// `rate` Hz: `rate = clk_sys / (div * (PLAY_TOP + 1))`, so `div = clk_sys /
-    /// (rate * (PLAY_TOP + 1))`. Computed in Q4 (times 16) to fill both the
-    /// 8-bit integer and 4-bit fractional fields, then clamped to the divider's
-    /// range (1.0 ..= 255.9375). Also sets TOP and parks both channels at
-    /// mid-scale, ready for the DMA's first sample.
+    /// Program slice 1 so one sample plays per wrap at `rate` Hz, using the
+    /// per-rate (divider, wrap) pair from `PlayQuant::pick` -- the wrap is as
+    /// large as the rate allows (up to 12 bits of duty resolution). The Q4
+    /// divider fills both the 8-bit integer and 4-bit fractional fields and is
+    /// clamped to the divider's range (1.0 ..= 255.9375). Also parks both
+    /// channels at mid-scale, ready for the DMA's first sample. Returns the
+    /// quantizer the fill paths must use (it owns the matching wrap and the
+    /// dither/noise-shaping state).
     #[cfg(feature = "sdcard")]
-    fn program_player_slice(&self, rate: u32) {
-        let period = (PLAY_TOP as u32 + 1) as u64; // counts per wrap
-        // div * 16, rounded: (clk_sys * 16 + half) / (rate * period).
-        let denom = rate as u64 * period;
-        let div_q4 =
-            ((CLK_SYS_HZ as u64 * 16 + denom / 2) / denom).clamp(16, 0xfff);
+    fn program_player_slice(&self, rate: u32) -> PlayQuant {
+        let (div_q4, top_plus_1) = PlayQuant::pick(rate);
+        let quant = PlayQuant::new(top_plus_1);
+        let div_q4 = div_q4.clamp(16, 0xfff);
         let div_int = (div_q4 >> 4) as u8;
         let div_frac = (div_q4 & 0xf) as u8;
 
@@ -539,30 +632,26 @@ impl ServerImpl {
             w.frac().bits(div_frac);
             w
         });
-        ch.top().write(|w| unsafe { w.top().bits(PLAY_TOP) });
-        // Park both channels at the SAME mid-scale the running samples use
-        // (PLAY_MID) so the pre-DMA silence value cannot drift from the silence
-        // value fill_half/mix_fill write.
+        ch.top()
+            .write(|w| unsafe { w.top().bits((top_plus_1 - 1) as u16) });
+        // Park both channels at the SAME mid-scale the running samples use so
+        // the pre-DMA silence value cannot drift from the silence value
+        // fill_half/mix_fill write.
         ch.cc().modify(|_, w| unsafe {
-            w.a().bits(PLAY_MID as u16);
-            w.b().bits(PLAY_MID as u16);
+            w.a().bits(quant.mid as u16);
+            w.b().bits(quant.mid as u16);
             w
         });
-    }
-
-    /// Map a signed 16-bit PCM sample to a 10-bit unsigned duty around mid-scale:
-    /// shift to 10-bit, bias to PLAY_MID, clamp to 0..=PLAY_TOP.
-    #[cfg(feature = "sdcard")]
-    fn sample_to_duty(sample: i16) -> u32 {
-        (((sample as i32) >> PLAY_SAMPLE_SHIFT) + PLAY_MID)
-            .clamp(0, PLAY_TOP as i32) as u32
+        quant
     }
 
     /// Pack a stereo L/R pair into the u32 CC value: channel A (low 16 bits) =
     /// left = GP18, channel B (high 16 bits) = right = GP19.
     #[cfg(feature = "sdcard")]
-    fn stereo_to_cc(l: i16, r: i16) -> u32 {
-        (Self::sample_to_duty(r) << CH_B_SHIFT) | Self::sample_to_duty(l)
+    fn stereo_to_cc(quant: &mut PlayQuant, l: i16, r: i16) -> u32 {
+        let dl = quant.duty(l, 0);
+        let dr = quant.duty(r, 1);
+        (dr << CH_B_SHIFT) | dl
     }
 
     /// Fill one ring half (`half` = 0 = lower slots, 1 = upper slots) with
@@ -576,6 +665,7 @@ impl ServerImpl {
         &self,
         dec: &mut D,
         half: usize,
+        quant: &mut PlayQuant,
     ) -> usize {
         let ring = aligned_ring_ptr();
         let base = half * PLAY_HALF_SAMPLES;
@@ -593,7 +683,8 @@ impl ServerImpl {
             // the ring), so base + i (< AUDIO_BUF_SAMPLES) is in bounds. Single-
             // threaded server, no references taken.
             unsafe {
-                ring.add(base + i).write_volatile(Self::stereo_to_cc(l, r));
+                ring.add(base + i)
+                    .write_volatile(Self::stereo_to_cc(quant, l, r));
             }
         }
         got
@@ -671,10 +762,14 @@ impl ServerImpl {
     /// more so the silence-filled tail plays out, then abort the channel and
     /// stop the carrier. Blocks the pwm server for the whole track.
     #[cfg(feature = "sdcard")]
-    fn play_loop<D: decoder::Decoder>(&self, dec: &mut D) -> (u32, u32) {
+    fn play_loop<D: decoder::Decoder>(
+        &self,
+        dec: &mut D,
+        quant: &mut PlayQuant,
+    ) -> (u32, u32) {
         // Prime BOTH halves so the DMA has a full ring before it starts.
-        let mut eof = self.fill_half(dec, 0) == 0;
-        eof &= self.fill_half(dec, 1) == 0;
+        let mut eof = self.fill_half(dec, 0, quant) == 0;
+        eof &= self.fill_half(dec, 1, quant) == 0;
 
         self.enable_slice(AUDIO_SLICE, true);
         self.arm_player_dma();
@@ -704,7 +799,7 @@ impl ServerImpl {
             let live = self.dma_half();
             let far = live ^ 1;
             if far != last_filled {
-                eof = self.fill_half(dec, far) == 0;
+                eof = self.fill_half(dec, far, quant) == 0;
                 last_filled = far;
                 refills += 1;
                 // If the DMA is now reading `far`, our refill did not finish
@@ -753,6 +848,7 @@ impl ServerImpl {
         dec: &mut D,
         half: usize,
         state: &mut MixState,
+        quant: &mut PlayQuant,
     ) -> usize {
         let ring = aligned_ring_ptr();
         let base = half * PLAY_HALF_SAMPLES;
@@ -764,16 +860,21 @@ impl ServerImpl {
             *slot = 0;
         }
         let lut_len = SINE_LUT.len() as u32;
+        let tp1 = quant.top_plus_1 as i64;
         for i in 0..PLAY_HALF_SAMPLES {
-            // Source A: the WAV L/R pair, each -> 10-bit duty centered on mid.
-            let wav_l = Self::sample_to_duty(pcm[2 * i]) as i32 - PLAY_MID;
-            let wav_r = Self::sample_to_duty(pcm[2 * i + 1]) as i32 - PLAY_MID;
+            // Source A: the file L/R pair as CENTERED Q16 duty (full precision;
+            // quantization happens once, after the blend).
+            let wav_l = pcm[2 * i] as i64 * tp1;
+            let wav_r = pcm[2 * i + 1] as i64 * tp1;
 
             // Source B: the fixed sine over the LUT, centered around mid (mono,
-            // so applied to both channels). Advance the phase once per output
-            // frame so gb can fade in with no restart transient.
+            // so applied to both channels). The LUT is Q10 (0..=1023 around
+            // 512); << 6 lifts it to the same Q16 domain. Advance the phase
+            // once per output frame so gb can fade in with no restart
+            // transient.
             let idx = (state.phase >> SINE_LUT_INDEX_SHIFT) % lut_len;
-            let sine_centered = SINE_LUT[idx as usize] as i32 - PLAY_MID;
+            let sine_centered =
+                ((SINE_LUT[idx as usize] as i64 - 512) * tp1) << 6;
             state.phase = state.phase.wrapping_add(state.sine_inc);
 
             // Ramp the gains one step per output frame toward the target.
@@ -787,14 +888,17 @@ impl ServerImpl {
             state.ga = ramp_toward(state.ga, ta);
             state.gb = ramp_toward(state.gb, tb);
 
-            // Blend each channel (WAV L or R) with the shared sine in the
-            // centered domain, rebias to mid, clamp, and pack L->A / R->B.
-            let mixed_l = state.ga * wav_l + state.gb * sine_centered;
-            let mixed_r = state.ga * wav_r + state.gb * sine_centered;
-            let duty_l = (PLAY_MID + (mixed_l >> MIX_GAIN_SHIFT))
-                .clamp(0, PLAY_TOP as i32) as u32;
-            let duty_r = (PLAY_MID + (mixed_r >> MIX_GAIN_SHIFT))
-                .clamp(0, PLAY_TOP as i32) as u32;
+            // Blend each channel (file L or R) with the shared sine in the
+            // centered Q16 domain, then quantize once (dither + noise shaping)
+            // and pack L->A / R->B.
+            let mixed_l = (state.ga as i64 * wav_l
+                + state.gb as i64 * sine_centered)
+                >> MIX_GAIN_SHIFT;
+            let mixed_r = (state.ga as i64 * wav_r
+                + state.gb as i64 * sine_centered)
+                >> MIX_GAIN_SHIFT;
+            let duty_l = quant.duty_centered_q16(mixed_l, 0);
+            let duty_r = quant.duty_centered_q16(mixed_r, 1);
             let pair = (duty_r << CH_B_SHIFT) | duty_l;
             // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE (2x
             // the ring), so base + i (< AUDIO_BUF_SAMPLES) is in bounds. Single-
@@ -818,10 +922,11 @@ impl ServerImpl {
         dec: &mut D,
         gpio: &Rp235xGpio,
         state: &mut MixState,
+        quant: &mut PlayQuant,
     ) -> (u32, u32) {
         // Prime BOTH halves so the DMA has a full ring before it starts.
-        let mut eof = self.mix_fill(dec, 0, state) == 0;
-        eof &= self.mix_fill(dec, 1, state) == 0;
+        let mut eof = self.mix_fill(dec, 0, state, quant) == 0;
+        eof &= self.mix_fill(dec, 1, state, quant) == 0;
 
         self.enable_slice(AUDIO_SLICE, true);
         self.arm_player_dma();
@@ -856,7 +961,7 @@ impl ServerImpl {
                 last_wav = wav;
                 last_sine = sine;
 
-                eof = self.mix_fill(dec, far, state) == 0;
+                eof = self.mix_fill(dec, far, state, quant) == 0;
                 last_filled = far;
                 refills += 1;
                 if self.dma_half() == far {
@@ -1221,10 +1326,10 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         let rate = decoder::Decoder::sample_rate(&dec)
             .clamp(PLAY_MIN_RATE, PLAY_MAX_RATE);
         self.abort_audio_dma();
-        self.program_player_slice(rate);
+        let mut quant = self.program_player_slice(rate);
 
         // Blocking: streams the whole track, then stops the DMA + carrier.
-        let (underruns, refills) = self.play_loop(&mut dec);
+        let (underruns, refills) = self.play_loop(&mut dec, &mut quant);
         let truncated = decoder::Decoder::had_error(&dec) as u32;
         Ok(pack_play_reply(rate, underruns, refills, truncated))
     }
@@ -1282,7 +1387,7 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
         let rate = decoder::Decoder::sample_rate(&dec)
             .clamp(PLAY_MIN_RATE, PLAY_MAX_RATE);
         self.abort_audio_dma();
-        self.program_player_slice(rate);
+        let mut quant = self.program_player_slice(rate);
 
         // Build the gpio client from the task slot and configure the two mixer
         // buttons as inputs with pull-ups (idle high, active-low when pressed).
@@ -1304,7 +1409,8 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
 
         // Blocking: streams the whole track (mixing + reading the buttons per
         // refill), then stops the DMA + carrier. Same packed reply as play_file.
-        let (underruns, refills) = self.mix_loop(&mut dec, &gpio, &mut state);
+        let (underruns, refills) =
+            self.mix_loop(&mut dec, &gpio, &mut state, &mut quant);
         let truncated = decoder::Decoder::had_error(&dec) as u32;
         Ok(pack_play_reply(rate, underruns, refills, truncated))
     }
