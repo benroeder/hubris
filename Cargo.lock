@@ -717,6 +717,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd7cc57abe963c6d3b9d8be5b06ba7c8957a930305ca90304f24ef040aa6f961"
 
 [[package]]
+name = "claxon-nostd"
+version = "0.4.3"
+source = "git+https://github.com/benroeder/claxon?rev=140bb916f5d7f3029fdce9d8bb2a584fbee23964#140bb916f5d7f3029fdce9d8bb2a584fbee23964"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5790,6 +5795,7 @@ dependencies = [
 name = "rp235x-audio-decode"
 version = "0.1.0"
 dependencies = [
+ "claxon-nostd",
  "nanomp3",
 ]
 

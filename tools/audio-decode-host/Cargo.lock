@@ -6,9 +6,21 @@ version = 4
 name = "audio-decode-host"
 version = "0.1.0"
 dependencies = [
+ "claxon",
  "hound",
  "rp235x-audio-decode",
 ]
+
+[[package]]
+name = "claxon"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
+
+[[package]]
+name = "claxon-nostd"
+version = "0.4.3"
+source = "git+https://github.com/benroeder/claxon?rev=140bb916f5d7f3029fdce9d8bb2a584fbee23964#140bb916f5d7f3029fdce9d8bb2a584fbee23964"
 
 [[package]]
 name = "hound"
@@ -26,5 +38,6 @@ checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
 name = "rp235x-audio-decode"
 version = "0.1.0"
 dependencies = [
+ "claxon-nostd",
  "nanomp3",
 ]

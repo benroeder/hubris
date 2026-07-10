@@ -16,7 +16,7 @@ drv-rp235x-sys-api = { path = "../rp235x-sys-api" }
 drv-rp235x-gpio-api = { path = "../rp235x-gpio-api", optional = true }
 drv-rp235x-sdcard-api = { path = "../rp235x-sdcard-api", optional = true }
 embedded-sdmmc = { workspace = true, optional = true }
-rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3"], optional = true }
+rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3", "flac"], optional = true }
 counters = { path = "../../lib/counters" }
 userlib = { path = "../../sys/userlib" }
 

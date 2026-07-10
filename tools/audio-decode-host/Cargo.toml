@@ -10,5 +10,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3"] }
+rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3", "flac"] }
 hound = "3"
+claxon = "0.4.3"

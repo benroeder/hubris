@@ -11,9 +11,14 @@ edition = "2024"
 default = []
 # MP3 decode via the pure-Rust no_std nanomp3 crate.
 mp3 = ["dep:nanomp3"]
+# FLAC decode via our no_std/no_alloc fork of claxon.
+flac = ["dep:claxon-nostd"]
 
 [dependencies]
 nanomp3 = { version = "0.1", optional = true }
+# no_std/no_alloc FLAC decoder: our fork of ruuda/claxon, git-pinned so the
+# device build is reproducible (a path dep would leak an absolute local path).
+claxon-nostd = { git = "https://github.com/benroeder/claxon", rev = "140bb916f5d7f3029fdce9d8bb2a584fbee23964", optional = true }
 
 [lib]
 test = false

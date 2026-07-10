@@ -1195,9 +1195,15 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        // Route by file extension: ".mp3" -> nanomp3, everything else -> WAV.
-        // Both wrap in one enum so the generic play loop is unchanged.
-        let mut dec = if decoder::is_mp3_name(&name_buf[..n]) {
+        // Route by file extension: ".fla" (8.3 for .flac) -> claxon-nostd,
+        // ".mp3" -> nanomp3, everything else -> WAV. All wrap in one enum so the
+        // generic play loop is unchanged.
+        let mut dec = if decoder::is_flac_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Flac(
+                decoder::FlacDecoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        } else if decoder::is_mp3_name(&name_buf[..n]) {
             decoder::AnyDecoder::Mp3(
                 decoder::Nanomp3Decoder::new(source)
                     .map_err(|_| PwmError::BadWav)?,
@@ -1253,9 +1259,14 @@ impl idl::InOrderRp235xPwmImpl for ServerImpl {
             &name_buf[..n],
         )
         .ok_or(PwmError::OpenFailed)?;
-        // Same extension routing as play_file: the mixer accepts an .mp3 as
-        // source A too (WAV stays the default for any other extension).
-        let mut dec = if decoder::is_mp3_name(&name_buf[..n]) {
+        // Same extension routing as play_file: the mixer accepts an .flac or
+        // .mp3 as source A too (WAV stays the default for any other extension).
+        let mut dec = if decoder::is_flac_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Flac(
+                decoder::FlacDecoder::new(source)
+                    .map_err(|_| PwmError::BadWav)?,
+            )
+        } else if decoder::is_mp3_name(&name_buf[..n]) {
             decoder::AnyDecoder::Mp3(
                 decoder::Nanomp3Decoder::new(source)
                     .map_err(|_| PwmError::BadWav)?,
