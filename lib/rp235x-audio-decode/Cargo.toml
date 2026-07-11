@@ -18,7 +18,7 @@ flac = ["dep:claxon-nostd"]
 nanomp3 = { version = "0.1", optional = true }
 # no_std/no_alloc FLAC decoder: our fork of ruuda/claxon, git-pinned so the
 # device build is reproducible (a path dep would leak an absolute local path).
-claxon-nostd = { git = "https://github.com/benroeder/claxon", rev = "140bb916f5d7f3029fdce9d8bb2a584fbee23964", optional = true }
+claxon-nostd = { git = "https://github.com/benroeder/claxon", rev = "afde6325b3ff3a3bff432349ed605a8538cd35d0", optional = true }
 
 [lib]
 test = false
