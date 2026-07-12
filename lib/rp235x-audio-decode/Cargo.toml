@@ -1,0 +1,29 @@
+[package]
+name = "rp235x-audio-decode"
+version = "0.1.0"
+edition = "2024"
+
+# Streaming audio decoders (WAV always; MP3 via nanomp3) behind a Decoder trait,
+# decoupled from the pwm task so the SAME no_std/no_alloc code can be exercised
+# on the host (see tools/audio-decode-host) as well as on the device.
+
+[features]
+default = []
+# MP3 decode via the pure-Rust no_std nanomp3 crate.
+mp3 = ["dep:nanomp3"]
+# FLAC decode via our no_std/no_alloc fork of claxon.
+flac = ["dep:claxon-nostd"]
+
+[dependencies]
+nanomp3 = { version = "0.1", optional = true }
+# no_std/no_alloc FLAC decoder: our fork of ruuda/claxon, git-pinned so the
+# device build is reproducible (a path dep would leak an absolute local path).
+claxon-nostd = { git = "https://github.com/benroeder/claxon", rev = "afde6325b3ff3a3bff432349ed605a8538cd35d0", optional = true }
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

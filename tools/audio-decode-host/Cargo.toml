@@ -1,0 +1,15 @@
+# Standalone host tool (its own [workspace] so it is NOT part of the no_std
+# Hubris workspace). Decodes a WAV/MP3/FLAC on the Mac using the SAME
+# rp235x-audio-decode code that runs on the device, so codec bugs are caught in
+# a fast host loop instead of a reflash+upload+play cycle.
+[workspace]
+
+[package]
+name = "audio-decode-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3", "flac"] }
+hound = "3"
+claxon = "0.4.3"

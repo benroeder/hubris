@@ -149,4 +149,18 @@ pub fn open_accessctrl_for_reboot(p: &Peripherals) {
     p.RESETS.reset().modify(|_, w| w.dma().clear_bit());
     while !p.RESETS.reset_done().read().dma().bit_is_set() {}
     p.DMA.seccfg_ch0().modify(|_, w| w.p().clear_bit());
+
+    // Watchdog tick generator. The flash driver's `reboot` arms the watchdog
+    // *timer* (LOAD counts down at the watchdog tick), which silently never
+    // fires if the tick generator is not running -- the arming code used to
+    // assume the boot ROM left it enabled, which does not hold on this RAM
+    // (LOAD_MAP) boot path, making `reboot` a no-op that still reported
+    // success. Enable it here, once, from privileged boot: clk_ref is the
+    // 12 MHz XOSC, so 12 cycles per tick gives the 1 MHz tick the ~1 ms
+    // watchdog LOAD in the flash driver expects.
+    let wd_tick = p.TICKS.tickwatchdog();
+    wd_tick
+        .cycles()
+        .write(|w| unsafe { w.proc0_cycles().bits(12) });
+    wd_tick.ctrl().write(|w| w.enable().set_bit());
 }

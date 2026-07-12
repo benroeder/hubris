@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Streaming audio decoders for the PWM player.
+#![no_std]
+
+//! Streaming audio decoders for the RP2350 PWM player, decoupled from the task
+//! so the same no_std/no_alloc code can be tested on the host.
 //!
 //! Two small traits keep the player decoupled from both the byte transport and
 //! the container format:
@@ -63,6 +66,14 @@ pub trait Decoder {
     fn had_error(&self) -> bool {
         false
     }
+
+    /// Opportunistically do pending decode work NOW, so the next `next_pcm`
+    /// call is (closer to) a pure copy. A real-time player calls this from its
+    /// idle wait so bursty work (e.g. decoding a whole FLAC block, a multi-
+    /// tens-of-ms CPU spike) lands in slack time instead of on the refill
+    /// deadline path. Must be cheap when there is nothing to do; the default
+    /// does nothing.
+    fn prefetch(&mut self) {}
 }
 
 /// Size of the decoder's internal file-read buffer, in bytes. One 512-byte SD
@@ -232,7 +243,7 @@ impl<S: ByteSource> Decoder for WavDecoder<S> {
 /// `hdr_frame_samples`, i.e. per-channel). So the number of valid f32 in `pcm`
 /// after a frame is `samples_produced * channels`. For stereo, consecutive f32
 /// are L, R, L, R, ...; we emit them as interleaved L/R i16 (mono is duplicated).
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 pub struct Nanomp3Decoder<S: ByteSource> {
     dec: nanomp3::Decoder,
     src: S,
@@ -259,12 +270,12 @@ pub struct Nanomp3Decoder<S: ByteSource> {
 }
 
 /// Size of the compressed-MP3 sliding input window, in bytes.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_IN_LEN: usize = 4096;
 
 /// Minimum PCM scratch length required by `nanomp3::decode` (it panics on a
 /// smaller buffer). 2304 f32 = 1152 samples/channel * 2 channels.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_MAX_SAMPLES: usize = nanomp3::MAX_SAMPLES_PER_FRAME;
 
 /// Low-water mark for the input window: refill only once the resident
@@ -272,7 +283,7 @@ const MP3_MAX_SAMPLES: usize = nanomp3::MAX_SAMPLES_PER_FRAME;
 /// largest possible MPEG1 Layer III frame is 1441 bytes, so keeping at least 2
 /// KiB resident guarantees a whole frame is always available to `decode` while
 /// avoiding a memmove + read on each ~400-byte frame consumed.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_IN_LOWATER: usize = 2048;
 
 /// Bytes to KEEP when force-skipping an unsyncable full window. If a FULL input
@@ -281,10 +292,10 @@ const MP3_IN_LOWATER: usize = 2048;
 /// add nothing (no room), so we must drop bytes to make progress. We discard all
 /// but this many trailing bytes -- kept > the 1441-byte max frame so a real sync
 /// sitting near the window end survives to be confirmed against fresh data.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 const MP3_RESYNC_KEEP: usize = 1536;
 
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 impl<S: ByteSource> Nanomp3Decoder<S> {
     /// Prime the input window and decode the first frame, capturing the format.
     /// `decode` returns `FrameInfo=None` while it skips junk / ID3 tags (still
@@ -471,7 +482,7 @@ impl<S: ByteSource> Nanomp3Decoder<S> {
     }
 }
 
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 impl<S: ByteSource> Decoder for Nanomp3Decoder<S> {
     fn sample_rate(&self) -> u32 {
         self.sample_rate
@@ -513,6 +524,243 @@ impl<S: ByteSource> Decoder for Nanomp3Decoder<S> {
     }
 }
 
+/// Adapts a `ByteSource` (0 = EOF) to the fork's `ByteReader` (`Result<usize>`).
+///
+/// A clean end-of-stream is a 0-byte read, which the FLAC frame reader treats as
+/// EOF at a frame boundary and as an `IoError` mid-frame; either way a genuine
+/// source fault also surfaces to us as a decode error, which we record.
+#[cfg(feature = "flac")]
+struct ByteSourceReader<S: ByteSource> {
+    src: S,
+}
+
+#[cfg(feature = "flac")]
+impl<S: ByteSource> claxon_nostd::input::ByteReader for ByteSourceReader<S> {
+    fn read(&mut self, out: &mut [u8]) -> claxon_nostd::Result<usize> {
+        Ok(self.src.read(out))
+    }
+}
+
+/// Largest channel count and per-channel block size the FLAC decoder will
+/// accept. These bound the fixed planar decode buffer below (the no_alloc cap
+/// lives here in the caller, exactly as the fork's `read_next_or_eof` expects).
+/// 4608 is the FLAC "subset" maximum block size; only mono/stereo are decoded.
+#[cfg(feature = "flac")]
+const FLAC_MAX_CHANNELS: usize = 2;
+/// Maximum per-channel block size (samples) the FLAC decoder will accept.
+#[cfg(feature = "flac")]
+const FLAC_MAX_BLOCK: usize = 4608;
+/// Size of the planar decode buffer (all channels of one block).
+#[cfg(feature = "flac")]
+const FLAC_MAX_SAMPLES: usize = FLAC_MAX_BLOCK * FLAC_MAX_CHANNELS;
+
+/// Streaming FLAC decoder built on the no_std/no_alloc `claxon-nostd` fork.
+///
+/// Owns the fork's `FlacReader` (over a `ByteSourceReader` adapter) plus one
+/// fixed planar decode buffer. Each call to `decode_next_block` decodes a whole
+/// FLAC block into that buffer (channel 0's samples, then channel 1's); `next_pcm`
+/// then walks it emitting interleaved L/R i16 across as many calls as needed.
+/// FLAC samples are `bits_per_sample`-bit integers, rescaled to 16-bit by a fixed
+/// shift (identical to the reference conversion), so a 16-bit stream is bit-exact.
+#[cfg(feature = "flac")]
+pub struct FlacDecoder<S: ByteSource> {
+    reader: claxon_nostd::FlacReader<ByteSourceReader<S>>,
+    /// Planar decode buffer: `[ch0 samples ..., ch1 samples ...]`.
+    buffer: [i32; FLAC_MAX_SAMPLES],
+    /// Per-channel samples in the current block (0 before the first decode).
+    block_size: usize,
+    /// Per-channel read cursor into the current block, in `0..block_size`.
+    pos: usize,
+    sample_rate: u32,
+    channels: u8,
+    /// `bits_per_sample - 16`: >0 shifts right to 16-bit, <0 shifts left.
+    /// Refreshed from each block's (frame-header) bits_per_sample, which is
+    /// authoritative for that block and may differ from the streaminfo value.
+    shift: i32,
+    /// Set if a block failed to decode (a source fault or a corrupt stream),
+    /// as opposed to reaching a clean end of stream.
+    had_error: bool,
+    /// Set once the stream has ended (cleanly or via error); stops further reads.
+    done: bool,
+}
+
+#[cfg(feature = "flac")]
+impl<S: ByteSource> FlacDecoder<S> {
+    /// Read the FLAC header + metadata and capture the stream format. Returns
+    /// `Unsupported` for >2 channels or a max block size beyond the fixed buffer,
+    /// `BadMagic` for a malformed stream, and `Truncated` for a short stream.
+    ///
+    /// `inline(never)`: the decoder struct embeds a ~36 KiB decode buffer, so
+    /// keeping construction out-of-line bounds the caller's stack.
+    #[inline(never)]
+    pub fn new(src: S) -> Result<Self, DecodeError> {
+        let adapter = ByteSourceReader { src };
+
+        // A small scratch is enough to walk and discard the metadata blocks; we
+        // do not surface tags yet (the fork supports a streaming callback for
+        // that when a "now playing" display needs it).
+        let mut scratch = [0u8; 256];
+        let reader = claxon_nostd::FlacReader::new_with_metadata(
+            adapter,
+            &mut scratch,
+            |_| {},
+        )
+        .map_err(flac_err)?;
+
+        let info = reader.streaminfo();
+        if info.channels == 0 || info.channels as usize > FLAC_MAX_CHANNELS {
+            return Err(DecodeError::Unsupported);
+        }
+        if info.max_block_size as usize > FLAC_MAX_BLOCK {
+            return Err(DecodeError::Unsupported);
+        }
+
+        Ok(Self {
+            reader,
+            buffer: [0i32; FLAC_MAX_SAMPLES],
+            block_size: 0,
+            pos: 0,
+            sample_rate: info.sample_rate,
+            channels: info.channels as u8,
+            shift: info.bits_per_sample as i32 - 16,
+            had_error: false,
+            done: false,
+        })
+    }
+
+    /// Decode the next FLAC block into `self.buffer`. Returns true on a block,
+    /// false at a clean end of stream or on a decode error (which sets flags).
+    fn decode_next_block(&mut self) -> bool {
+        if self.done {
+            return false;
+        }
+        let mut frames = self.reader.blocks();
+        match frames.read_next_or_eof(&mut self.buffer) {
+            Ok(Some(block)) => {
+                self.block_size = block.duration() as usize;
+                self.channels = block.channels() as u8;
+                // The frame header's bits_per_sample is authoritative for this
+                // block; rescale to 16-bit accordingly rather than assuming the
+                // streaminfo value.
+                self.shift = block.bits_per_sample() as i32 - 16;
+                self.pos = 0;
+                if self.block_size == 0 {
+                    self.done = true;
+                    false
+                } else {
+                    true
+                }
+            }
+            Ok(None) => {
+                self.done = true;
+                false
+            }
+            Err(_) => {
+                self.had_error = true;
+                self.done = true;
+                false
+            }
+        }
+    }
+
+    /// Rescale one FLAC sample (`bits_per_sample`-bit signed) to 16-bit.
+    fn scale(&self, v: i32) -> i16 {
+        let s = if self.shift > 0 {
+            v >> self.shift
+        } else {
+            v << (-self.shift)
+        };
+        s as i16
+    }
+}
+
+#[cfg(feature = "flac")]
+impl<S: ByteSource> Decoder for FlacDecoder<S> {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    fn had_error(&self) -> bool {
+        // Either a decode error, or a fault reported by the byte source that the
+        // fork saw as a bare 0-byte read (which it treats as clean EOF). Consult
+        // the source directly so a mid-stream fault is not mistaken for the end
+        // of the track, matching WavDecoder/Nanomp3Decoder.
+        self.had_error || self.reader.get_ref().src.had_error()
+    }
+
+    fn prefetch(&mut self) {
+        // Decoding one FLAC block is a bursty multi-tens-of-ms spike (LPC over
+        // 4096 frames plus the SD read of the compressed frame). If the current
+        // block is fully consumed, decode the next one NOW -- the player calls
+        // this from its idle wait, so the burst lands in slack time and the
+        // deadline-path next_pcm becomes a pure copy + rescale. No-op (one
+        // compare) while samples remain or after end of stream.
+        if self.pos >= self.block_size {
+            self.decode_next_block();
+        }
+    }
+
+    fn next_pcm(&mut self, out: &mut [i16]) -> usize {
+        // Fill `out` with INTERLEAVED L, R i16 pairs; a mono block is duplicated
+        // to both channels. The block is stored planar, so the right channel of
+        // sample `pos` lives at `block_size + pos`.
+        let mut count = 0;
+        while count + 1 < out.len() {
+            if self.pos >= self.block_size && !self.decode_next_block() {
+                break;
+            }
+            let (l, r) = if self.channels == 2 {
+                let l = self.buffer[self.pos];
+                let r = self.buffer[self.block_size + self.pos];
+                (self.scale(l), self.scale(r))
+            } else {
+                let s = self.scale(self.buffer[self.pos]);
+                (s, s)
+            };
+            self.pos += 1;
+            out[count] = l;
+            out[count + 1] = r;
+            count += 2;
+        }
+        count
+    }
+}
+
+/// Maps a fork decode error onto the crate's `DecodeError`.
+#[cfg(feature = "flac")]
+fn flac_err(e: claxon_nostd::Error) -> DecodeError {
+    match e {
+        // A read failure or an unexpected end of the byte source.
+        claxon_nostd::Error::IoError => DecodeError::Truncated,
+        // A currently unsupported FLAC feature (e.g. unencoded-binary residuals).
+        claxon_nostd::Error::Unsupported(_) => DecodeError::Unsupported,
+        // An ill-formed stream (bad magic, bad header, ...).
+        claxon_nostd::Error::FormatError(_) => DecodeError::BadMagic,
+    }
+}
+
+/// True if `name` (a FAT 8.3 short name, ASCII) has the FLAC extension.
+///
+/// FAT 8.3 extensions are at most three characters, so a `CLIP.FLAC` file is
+/// stored with a short name ending in `.FLA` (e.g. `CLIP~1.FLA`). Match that
+/// truncated extension case-insensitively so the SD path routes it correctly.
+#[cfg(feature = "flac")]
+pub fn is_flac_name(name: &[u8]) -> bool {
+    let n = name.len();
+    if n < 4 {
+        return false;
+    }
+    let ext = &name[n - 4..];
+    ext[0] == b'.'
+        && ext[1].eq_ignore_ascii_case(&b'F')
+        && ext[2].eq_ignore_ascii_case(&b'L')
+        && ext[3].eq_ignore_ascii_case(&b'A')
+}
+
 /// Static (no `dyn`, no alloc) dispatch over the supported container formats.
 /// The player is generic over `Decoder`, so wrapping the two concrete decoders
 /// in one enum lets `play_file` / `play_mix` pick a format at open time by file
@@ -522,40 +770,70 @@ impl<S: ByteSource> Decoder for Nanomp3Decoder<S> {
 /// but this is a `no_alloc` target: boxing the large field -- clippy's usual fix
 /// -- is not available, and only one `AnyDecoder` is ever live at a time, so the
 /// size asymmetry is intentional and harmless here.
-#[cfg(feature = "sdcard")]
+#[cfg(any(feature = "mp3", feature = "flac"))]
 #[allow(clippy::large_enum_variant)]
 pub enum AnyDecoder<S: ByteSource> {
+    /// A canonical 16-bit PCM WAV.
     Wav(WavDecoder<S>),
+    /// An MP3 stream (via `nanomp3`).
+    #[cfg(feature = "mp3")]
     Mp3(Nanomp3Decoder<S>),
+    /// A FLAC stream (via the `claxon-nostd` fork).
+    #[cfg(feature = "flac")]
+    Flac(FlacDecoder<S>),
 }
 
-#[cfg(feature = "sdcard")]
+#[cfg(any(feature = "mp3", feature = "flac"))]
 impl<S: ByteSource> Decoder for AnyDecoder<S> {
     fn sample_rate(&self) -> u32 {
         match self {
             AnyDecoder::Wav(d) => d.sample_rate(),
+            #[cfg(feature = "mp3")]
             AnyDecoder::Mp3(d) => d.sample_rate(),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.sample_rate(),
         }
     }
 
     fn channels(&self) -> u8 {
         match self {
             AnyDecoder::Wav(d) => d.channels(),
+            #[cfg(feature = "mp3")]
             AnyDecoder::Mp3(d) => d.channels(),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.channels(),
         }
     }
 
     fn had_error(&self) -> bool {
         match self {
             AnyDecoder::Wav(d) => d.had_error(),
+            #[cfg(feature = "mp3")]
             AnyDecoder::Mp3(d) => d.had_error(),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.had_error(),
+        }
+    }
+
+    fn prefetch(&mut self) {
+        // Without this dispatch the trait's default no-op would swallow the
+        // FLAC decoder's idle-time block prefetch.
+        match self {
+            AnyDecoder::Wav(d) => d.prefetch(),
+            #[cfg(feature = "mp3")]
+            AnyDecoder::Mp3(d) => d.prefetch(),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.prefetch(),
         }
     }
 
     fn next_pcm(&mut self, out: &mut [i16]) -> usize {
         match self {
             AnyDecoder::Wav(d) => d.next_pcm(out),
+            #[cfg(feature = "mp3")]
             AnyDecoder::Mp3(d) => d.next_pcm(out),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.next_pcm(out),
         }
     }
 }
@@ -563,7 +841,7 @@ impl<S: ByteSource> Decoder for AnyDecoder<S> {
 /// True if `name` (an 8.3 short name, ASCII) ends in the `.mp3` extension,
 /// compared case-insensitively (FAT short names are upper-cased, but be
 /// defensive). Used to route the file to the MP3 decoder instead of WAV.
-#[cfg(feature = "sdcard")]
+#[cfg(feature = "mp3")]
 pub fn is_mp3_name(name: &[u8]) -> bool {
     let n = name.len();
     if n < 4 {
