@@ -20,7 +20,7 @@ checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
 [[package]]
 name = "claxon-nostd"
 version = "0.4.3"
-source = "git+https://github.com/benroeder/claxon?rev=140bb916f5d7f3029fdce9d8bb2a584fbee23964#140bb916f5d7f3029fdce9d8bb2a584fbee23964"
+source = "git+https://github.com/benroeder/claxon?rev=afde6325b3ff3a3bff432349ed605a8538cd35d0#afde6325b3ff3a3bff432349ed605a8538cd35d0"
 
 [[package]]
 name = "hound"
