@@ -66,6 +66,14 @@ pub trait Decoder {
     fn had_error(&self) -> bool {
         false
     }
+
+    /// Opportunistically do pending decode work NOW, so the next `next_pcm`
+    /// call is (closer to) a pure copy. A real-time player calls this from its
+    /// idle wait so bursty work (e.g. decoding a whole FLAC block, a multi-
+    /// tens-of-ms CPU spike) lands in slack time instead of on the refill
+    /// deadline path. Must be cheap when there is nothing to do; the default
+    /// does nothing.
+    fn prefetch(&mut self) {}
 }
 
 /// Size of the decoder's internal file-read buffer, in bytes. One 512-byte SD
@@ -684,6 +692,18 @@ impl<S: ByteSource> Decoder for FlacDecoder<S> {
         self.had_error || self.reader.get_ref().src.had_error()
     }
 
+    fn prefetch(&mut self) {
+        // Decoding one FLAC block is a bursty multi-tens-of-ms spike (LPC over
+        // 4096 frames plus the SD read of the compressed frame). If the current
+        // block is fully consumed, decode the next one NOW -- the player calls
+        // this from its idle wait, so the burst lands in slack time and the
+        // deadline-path next_pcm becomes a pure copy + rescale. No-op (one
+        // compare) while samples remain or after end of stream.
+        if self.pos >= self.block_size {
+            self.decode_next_block();
+        }
+    }
+
     fn next_pcm(&mut self, out: &mut [i16]) -> usize {
         // Fill `out` with INTERLEAVED L, R i16 pairs; a mono block is duplicated
         // to both channels. The block is stored planar, so the right channel of
@@ -792,6 +812,18 @@ impl<S: ByteSource> Decoder for AnyDecoder<S> {
             AnyDecoder::Mp3(d) => d.had_error(),
             #[cfg(feature = "flac")]
             AnyDecoder::Flac(d) => d.had_error(),
+        }
+    }
+
+    fn prefetch(&mut self) {
+        // Without this dispatch the trait's default no-op would swallow the
+        // FLAC decoder's idle-time block prefetch.
+        match self {
+            AnyDecoder::Wav(d) => d.prefetch(),
+            #[cfg(feature = "mp3")]
+            AnyDecoder::Mp3(d) => d.prefetch(),
+            #[cfg(feature = "flac")]
+            AnyDecoder::Flac(d) => d.prefetch(),
         }
     }
 

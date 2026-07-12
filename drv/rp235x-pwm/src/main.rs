@@ -131,11 +131,12 @@ const SINE_MAX_MS: u32 = 2000;
 /// Samples in the live audio ring (the aligned window the DMA reads). Each
 /// sample is a u32 stereo pair, so 4096 u32 = 16384 bytes, matching the ring
 /// wrap (`AUDIO_RING_SIZE`). Longer than the LUT so several whole sine cycles
-/// fit, keeping the loop-boundary pitch error small. Sized so one ring HALF
-/// (2048 frames) is a ~46 ms refill budget even at 44.1 kHz: the burst of
-/// decoding one whole 4096-frame FLAC block (~25 ms) plus the SD read must
-/// fit inside one half's playtime, which 512- and 1024-frame halves both
-/// failed on-target (one underrun per FLAC block boundary).
+/// fit, keeping the loop-boundary pitch error small. One ring HALF (2048
+/// frames) is a ~46 ms refill budget at 44.1 kHz. Whole-FLAC-block decode
+/// bursts (~25 ms typical, worse in dense passages -- a full 6.5 min track
+/// lost ~1% of refills at this size) are kept OFF the refill deadline path by
+/// `Decoder::prefetch`, which the play/mix loops call during their idle spin,
+/// so a refill is normally just copy + quantize.
 const AUDIO_BUF_SAMPLES: usize = 4096;
 /// Ring size in bytes: 4096 u32 = 16384. The DMA read address wraps at this
 /// power-of-two boundary, so the aligned window must start on a 16384-byte
@@ -301,19 +302,29 @@ impl PlayQuant {
         self.duty_centered_q16(sample as i64 * self.top_plus_1 as i64, ch)
     }
 }
-/// Samples per ring HALF: the player refills one half while the DMA drains the
-/// other. AUDIO_BUF_SAMPLES (1024) u32 slots total, so 512 per half.
+/// Number of equal CHUNKS the ring is managed in by the player/mixer refill
+/// loops (the DMA itself just laps the whole ring). Finer than halves so the
+/// producer can bank several chunks of slack ahead of the DMA read pointer:
+/// a whole-FLAC-block prefetch burst (decode + SD reads; measured 60-70 ms in
+/// dense 44.1 kHz stereo passages) then only delays a few SMALL copy refills,
+/// which catch back up within a chunk or two, instead of blowing the single
+/// large deadline a half-sized refill had (measured: 56 underruns over a
+/// 6.5 min 44.1 kHz stereo track with 2 halves; 38 with prefetch alone).
+/// 8 chunks x 512 frames banks up to 7 chunks = ~81 ms of slack at 44.1 kHz.
 #[cfg(feature = "sdcard")]
-const PLAY_HALF_SAMPLES: usize = AUDIO_BUF_SAMPLES / 2;
-/// Ring byte span of one half (512 u32 = 2048 bytes). Used to map the DMA read
-/// address to the half it is currently draining.
+const PLAY_CHUNKS: usize = 8;
+/// Frames (u32 stereo pairs) per ring chunk.
 #[cfg(feature = "sdcard")]
-const PLAY_HALF_BYTES: u32 = (AUDIO_RING_BYTES / 2) as u32;
+const PLAY_CHUNK_SAMPLES: usize = AUDIO_BUF_SAMPLES / PLAY_CHUNKS;
+/// Ring byte span of one chunk. Used to map the DMA read address to the chunk
+/// it is currently draining.
+#[cfg(feature = "sdcard")]
+const PLAY_CHUNK_BYTES: u32 = (AUDIO_RING_BYTES / PLAY_CHUNKS) as u32;
 /// Stall timeout for the player poll loops, in ms. The loops make progress only
-/// on DMA ring-half crossings; if the read pointer does not cross for this long
-/// the channel has wedged, so the loop bails rather than spinning forever and
-/// hanging the pwm server (which has no other escape). 500 ms is ~10x a ring
-/// half even at the slowest supported rate (~43 ms at 8 kHz).
+/// on DMA ring-chunk crossings; if the read pointer does not cross for this
+/// long the channel has wedged, so the loop bails rather than spinning forever
+/// and hanging the pwm server (which has no other escape). 500 ms is many ring
+/// chunks even at the slowest supported rate (~64 ms/chunk at 8 kHz).
 #[cfg(feature = "sdcard")]
 const PLAY_STALL_MS: u64 = 500;
 /// Check the stall timeout only once every this many poll iterations (a
@@ -636,7 +647,7 @@ impl ServerImpl {
             .write(|w| unsafe { w.top().bits((top_plus_1 - 1) as u16) });
         // Park both channels at the SAME mid-scale the running samples use so
         // the pre-DMA silence value cannot drift from the silence value
-        // fill_half/mix_fill write.
+        // fill_chunk/mix_fill write.
         ch.cc().modify(|_, w| unsafe {
             w.a().bits(quant.mid as u16);
             w.b().bits(quant.mid as u16);
@@ -654,29 +665,29 @@ impl ServerImpl {
         (dr << CH_B_SHIFT) | dl
     }
 
-    /// Fill one ring half (`half` = 0 = lower slots, 1 = upper slots) with
-    /// samples pulled from `dec`. The decoder yields INTERLEAVED L, R pairs (2
-    /// i16 per ring slot); slots past what it yields are filled with mid-scale
-    /// silence. Returns the i16 count written (0 once the decoder is exhausted).
+    /// Fill one ring chunk (`chunk` in `0..PLAY_CHUNKS`) with samples pulled
+    /// from `dec`. The decoder yields INTERLEAVED L, R pairs (2 i16 per ring
+    /// slot); slots past what it yields are filled with mid-scale silence.
+    /// Returns the i16 count written (0 once the decoder is exhausted).
     /// Writes are volatile through the aligned ring pointer (the DMA is a bus
     /// master reading the same window).
     #[cfg(feature = "sdcard")]
-    fn fill_half<D: decoder::Decoder>(
+    fn fill_chunk<D: decoder::Decoder>(
         &self,
         dec: &mut D,
-        half: usize,
+        chunk: usize,
         quant: &mut PlayQuant,
     ) -> usize {
         let ring = aligned_ring_ptr();
-        let base = half * PLAY_HALF_SAMPLES;
+        let base = chunk * PLAY_CHUNK_SAMPLES;
         // 2 i16 (L, R) per ring slot.
-        let mut pcm = [0i16; PLAY_HALF_SAMPLES * 2];
+        let mut pcm = [0i16; PLAY_CHUNK_SAMPLES * 2];
         let got = dec.next_pcm(&mut pcm);
         // Samples past `got` play mid-scale silence (the decoder is exhausted).
         for slot in pcm.iter_mut().skip(got) {
             *slot = 0;
         }
-        for i in 0..PLAY_HALF_SAMPLES {
+        for i in 0..PLAY_CHUNK_SAMPLES {
             let l = pcm[2 * i];
             let r = pcm[2 * i + 1];
             // SAFETY: `ring` is the 4096-aligned window inside AUDIO_STORE (2x
@@ -717,30 +728,30 @@ impl ServerImpl {
         });
     }
 
-    /// Which ring half the DMA is currently reading (0 = lower, 1 = upper),
-    /// derived from the channel's live read address relative to the ring base
-    /// and wrapped to the 4096-byte window.
+    /// Which ring chunk the DMA is currently reading (0..PLAY_CHUNKS), derived
+    /// from the channel's live read address relative to the ring base and
+    /// wrapped to the ring window.
     #[cfg(feature = "sdcard")]
-    fn dma_half(&self) -> usize {
+    fn dma_chunk(&self) -> usize {
         let base = aligned_ring_ptr() as u32;
         let addr = self.dma.ch(AUDIO_DMA_CH).ch_read_addr().read().bits();
         let off = addr.wrapping_sub(base) & (AUDIO_RING_BYTES as u32 - 1);
-        (off / PLAY_HALF_BYTES) as usize
+        (off / PLAY_CHUNK_BYTES) as usize
     }
 
-    /// Spin until the DMA read pointer crosses `laps` ring-half boundaries, then
-    /// return. Bails early if no crossing happens for PLAY_STALL_MS (the channel
-    /// wedged) so a DMA fault cannot hang the server here. Shared by the player
-    /// and mixer EOF drain (both let the silence tail play out one lap = 2
-    /// crossings before stopping).
+    /// Spin until the DMA read pointer crosses `crossings` ring-chunk
+    /// boundaries, then return. Bails early if no crossing happens for
+    /// PLAY_STALL_MS (the channel wedged) so a DMA fault cannot hang the server
+    /// here. Shared by the player and mixer EOF drain (both let the tail play
+    /// out one full lap = PLAY_CHUNKS crossings before stopping).
     #[cfg(feature = "sdcard")]
     fn drain_crossings(&self, laps: u32) {
         let mut crossings = 0u32;
-        let mut prev = self.dma_half();
+        let mut prev = self.dma_chunk();
         let mut last_progress = sys_get_timer().now;
         let mut polls = 0u32;
         while crossings < laps {
-            let now = self.dma_half();
+            let now = self.dma_chunk();
             if now != prev {
                 crossings += 1;
                 prev = now;
@@ -756,63 +767,67 @@ impl ServerImpl {
         }
     }
 
-    /// Blocking play loop: prime both halves, arm the DMA, then repeatedly
-    /// refill whichever half the DMA is NOT currently reading, pulling PCM from
-    /// `dec`, until the decoder is exhausted. After EOF, let the DMA lap once
-    /// more so the silence-filled tail plays out, then abort the channel and
-    /// stop the carrier. Blocks the pwm server for the whole track.
+    /// Blocking play loop: prime the whole ring, arm the DMA, then keep the
+    /// producer exactly one ring-lap behind the DMA read pointer, refilling
+    /// each chunk as the DMA finishes it, until the decoder is exhausted.
+    /// The producer banks up to PLAY_CHUNKS-1 chunks of slack, so a bursty
+    /// `prefetch` (whole-FLAC-block decode + SD reads) delays only small copy
+    /// refills that catch back up, never the audio. After EOF, let the DMA lap
+    /// once more so the silence-filled tail plays out, then abort the channel
+    /// and stop the carrier. Blocks the pwm server for the whole track.
     #[cfg(feature = "sdcard")]
     fn play_loop<D: decoder::Decoder>(
         &self,
         dec: &mut D,
         quant: &mut PlayQuant,
     ) -> (u32, u32) {
-        // Prime BOTH halves so the DMA has a full ring before it starts.
-        let mut eof = self.fill_half(dec, 0, quant) == 0;
-        eof &= self.fill_half(dec, 1, quant) == 0;
+        // Prime the WHOLE ring so the DMA starts with maximum slack banked.
+        let mut eof = false;
+        for chunk in 0..PLAY_CHUNKS {
+            eof = self.fill_chunk(dec, chunk, quant) == 0;
+        }
 
         self.enable_slice(AUDIO_SLICE, true);
         self.arm_player_dma();
 
-        // Instrumentation for the refill-vs-DMA race: `refills` counts how many
-        // half-refills we did; `underruns` counts refills that lost the race --
-        // i.e. the DMA had ALREADY advanced into the half we just wrote by the
-        // time the (blocking SD read + convert) finished. underruns == 0 means
-        // the refill always stayed a full half ahead of the read pointer.
+        // Instrumentation for the refill-vs-DMA race: `refills` counts chunk
+        // refills; `underruns` counts refills that lost the race -- the DMA
+        // was already reading the chunk we just wrote (it played stale data).
         let mut refills = 0u32;
         let mut underruns = 0u32;
 
-        // Refill the far half whenever the DMA crosses into a new half. Track
-        // the last half we refilled so a single visit does not refill twice
-        // (the read address dwells in one half for PLAY_HALF_SAMPLES wraps).
-        //
-        // Seed `last_filled` to the CURRENT far half so the first refill waits
-        // for a real crossing: both halves were just primed with fresh file
-        // data, so the far half must NOT be clobbered until the DMA actually
-        // leaves the near half and starts draining it. At arm time the DMA sits
-        // at the ring base (near half 0), so far = 1 = the just-primed upper
-        // half -- refilling it now would drop the second primed chunk unplayed.
-        let mut last_filled = self.dma_half() ^ 1;
+        // `next_fill` is the next chunk to refill, trailing the DMA by one
+        // full lap: every chunk the DMA has finished gets refilled with fresh
+        // data before the DMA comes around again. At arm time the DMA sits at
+        // chunk 0 with the whole ring freshly primed, so the producer starts
+        // AT the read pointer and waits for it to move.
+        let mut next_fill = 0usize;
         let mut last_progress = sys_get_timer().now;
         let mut polls = 0u32;
         while !eof {
-            let live = self.dma_half();
-            let far = live ^ 1;
-            if far != last_filled {
-                eof = self.fill_half(dec, far, quant) == 0;
-                last_filled = far;
+            if next_fill != self.dma_chunk() {
+                // The DMA has left `next_fill` (it holds played, stale data):
+                // refill it. After a long prefetch burst several chunks may be
+                // pending; this branch runs back-to-back until caught up.
+                eof = self.fill_chunk(dec, next_fill, quant) == 0;
                 refills += 1;
-                // If the DMA is now reading `far`, our refill did not finish
-                // before the read pointer crossed into it -> margin exhausted.
-                if self.dma_half() == far {
+                // If the DMA has lapped into the chunk we JUST wrote, the
+                // producer fell a whole ring behind -> stale data was played.
+                if self.dma_chunk() == next_fill {
                     underruns += 1;
                 }
+                next_fill = (next_fill + 1) % PLAY_CHUNKS;
                 last_progress = sys_get_timer().now;
+                continue;
             }
-            // Stall escape: if the DMA read pointer stops crossing halves (a
-            // wedged channel), bail rather than spinning forever. Checked only
-            // every PLAY_STALL_POLL_MASK+1 polls so the kipc stays off the hot
-            // path.
+            // Caught up: spend the idle slack pre-decoding the decoder's next
+            // block (e.g. a whole FLAC block, a bursty multi-tens-of-ms spike)
+            // so refills stay pure copy + quantize. One compare when there is
+            // nothing to do.
+            dec.prefetch();
+            // Stall escape: if the DMA read pointer stops moving (a wedged
+            // channel), bail rather than spinning forever. Checked only every
+            // PLAY_STALL_POLL_MASK+1 polls so the kipc stays off the hot path.
             polls = polls.wrapping_add(1);
             if polls & PLAY_STALL_POLL_MASK == 0
                 && sys_get_timer().now.wrapping_sub(last_progress)
@@ -824,8 +839,7 @@ impl ServerImpl {
 
         // EOF: the last real samples plus the silence tail are in the ring.
         // Let the DMA drain one more full lap so nothing is cut off, then stop.
-        // Two half-crossings = one lap past the point EOF was detected.
-        self.drain_crossings(2);
+        self.drain_crossings(PLAY_CHUNKS as u32);
 
         self.abort_audio_dma();
         self.dma
@@ -838,7 +852,7 @@ impl ServerImpl {
 
     /// Fill one ring half by BLENDING the WAV (source A) with the fixed sine
     /// (source B), advancing the sine phase and ramping the gains one Q8 step
-    /// per sample toward `state.target`. Mirrors `fill_half` (mid-scale silence
+    /// per sample toward `state.target`. Mirrors `fill_chunk` (mid-scale silence
     /// past decoder EOF, volatile writes through the aligned ring) but composes
     /// two centered sources instead of copying one. Returns the number of real
     /// WAV samples written (0 once the decoder is exhausted).
@@ -846,14 +860,14 @@ impl ServerImpl {
     fn mix_fill<D: decoder::Decoder>(
         &self,
         dec: &mut D,
-        half: usize,
+        chunk: usize,
         state: &mut MixState,
         quant: &mut PlayQuant,
     ) -> usize {
         let ring = aligned_ring_ptr();
-        let base = half * PLAY_HALF_SAMPLES;
+        let base = chunk * PLAY_CHUNK_SAMPLES;
         // 2 i16 (L, R) per ring slot -- source A is stereo.
-        let mut pcm = [0i16; PLAY_HALF_SAMPLES * 2];
+        let mut pcm = [0i16; PLAY_CHUNK_SAMPLES * 2];
         let got = dec.next_pcm(&mut pcm);
         // Samples past `got` are silence (0 -> mid-scale for source A).
         for slot in pcm.iter_mut().skip(got) {
@@ -861,7 +875,7 @@ impl ServerImpl {
         }
         let lut_len = SINE_LUT.len() as u32;
         let tp1 = quant.top_plus_1 as i64;
-        for i in 0..PLAY_HALF_SAMPLES {
+        for i in 0..PLAY_CHUNK_SAMPLES {
             // Source A: the file L/R pair as CENTERED Q16 duty (full precision;
             // quantization happens once, after the blend).
             let wav_l = pcm[2 * i] as i64 * tp1;
@@ -910,12 +924,13 @@ impl ServerImpl {
         got
     }
 
-    /// Blocking mix loop: the `play_loop` structure with `fill_half` swapped for
+    /// Blocking mix loop: the `play_loop` structure with `fill_chunk` swapped for
     /// `mix_fill` and a once-per-refill button read that steers the crossfade.
     /// Reads GP20/GP21 (already configured input + pull-up by the op) once per
-    /// half-refill -- ~129 reads over a 3 s track, negligible next to the SD
-    /// read. On a fresh press edge (active-low, 0 = pressed) GP20 targets the
-    /// WAV, GP21 targets the sine. Returns packed (underruns, refills).
+    /// chunk refill (one gpio IPC per ~12-23 ms of audio), negligible next to
+    /// the SD read. On a fresh press edge (active-low, 0 = pressed) GP20
+    /// targets the WAV, GP21 targets the sine. Returns packed
+    /// (underruns, refills).
     #[cfg(feature = "sdcard")]
     fn mix_loop<D: decoder::Decoder>(
         &self,
@@ -924,9 +939,11 @@ impl ServerImpl {
         state: &mut MixState,
         quant: &mut PlayQuant,
     ) -> (u32, u32) {
-        // Prime BOTH halves so the DMA has a full ring before it starts.
-        let mut eof = self.mix_fill(dec, 0, state, quant) == 0;
-        eof &= self.mix_fill(dec, 1, state, quant) == 0;
+        // Prime the WHOLE ring so the DMA starts with maximum slack banked.
+        let mut eof = false;
+        for chunk in 0..PLAY_CHUNKS {
+            eof = self.mix_fill(dec, chunk, state, quant) == 0;
+        }
 
         self.enable_slice(AUDIO_SLICE, true);
         self.arm_player_dma();
@@ -938,16 +955,12 @@ impl ServerImpl {
         let mut last_wav = 1u8;
         let mut last_sine = 1u8;
 
-        // Same refill-crossing scheme as play_loop; seed last_filled to the far
-        // half so the first refill waits for a real DMA crossing (both halves
-        // were just primed with mixed data).
-        let mut last_filled = self.dma_half() ^ 1;
+        // Same one-lap-behind chunk scheme as play_loop.
+        let mut next_fill = 0usize;
         let mut last_progress = sys_get_timer().now;
         let mut polls = 0u32;
         while !eof {
-            let live = self.dma_half();
-            let far = live ^ 1;
-            if far != last_filled {
+            if next_fill != self.dma_chunk() {
                 // Read the buttons ONCE per refill (not per poll). Active-low;
                 // act only on the release->press edge, like the shell's watch.
                 let wav = gpio.read(MIX_BTN_WAV).unwrap_or(1);
@@ -961,16 +974,19 @@ impl ServerImpl {
                 last_wav = wav;
                 last_sine = sine;
 
-                eof = self.mix_fill(dec, far, state, quant) == 0;
-                last_filled = far;
+                eof = self.mix_fill(dec, next_fill, state, quant) == 0;
                 refills += 1;
-                if self.dma_half() == far {
+                if self.dma_chunk() == next_fill {
                     underruns += 1;
                 }
+                next_fill = (next_fill + 1) % PLAY_CHUNKS;
                 last_progress = sys_get_timer().now;
+                continue;
             }
-            // Stall escape, same as play_loop: bail if the DMA stops crossing
-            // halves, checked off the hot path.
+            // Idle slack: pre-decode the next block, same as play_loop.
+            dec.prefetch();
+            // Stall escape, same as play_loop: bail if the DMA stops moving,
+            // checked off the hot path.
             polls = polls.wrapping_add(1);
             if polls & PLAY_STALL_POLL_MASK == 0
                 && sys_get_timer().now.wrapping_sub(last_progress)
@@ -981,7 +997,7 @@ impl ServerImpl {
         }
 
         // Drain one more lap so the silence tail plays out, then stop.
-        self.drain_crossings(2);
+        self.drain_crossings(PLAY_CHUNKS as u32);
 
         self.abort_audio_dma();
         self.dma
