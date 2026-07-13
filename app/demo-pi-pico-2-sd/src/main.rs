@@ -49,17 +49,20 @@ pub static RP235X_IMAGE_DEF_ARM_RAM: [u32; 13] = [
     0x0100_0406,
     0xffff_fe90, // entry 0: storage start, relative to the load-map item
     0x2000_0000, // entry 0: runtime start (SRAM, absolute)
-    // Copy size (192 KiB). MUST be strictly less than the enclosing
+    // Copy size (252 KiB). MUST be strictly less than the enclosing
     // partition/window size: the bootrom rejects the block if
-    // from_storage + size >= window_end (varm_blocks.c). Our A/B partitions
-    // are 256 KiB, so copying the full 256 KiB fails the check -- it only
-    // worked as a single image because the window was the whole 4 MB flash.
+    // from_storage + size >= window_end (varm_blocks.c), so with 256 KiB A/B
+    // partitions the copy must stay under 256 KiB; 252 KiB satisfies that
+    // while covering (almost) the whole 256 KiB SRAM code window.
     // CRITICAL: this size is the exact flash->SRAM copy length. If the image
     // exceeds it, the tail is silently NOT copied -- a task's .rodata/.text
-    // near the top of SRAM reads garbage (e.g. a patched task-slot -> boot
-    // fault "used bogus task index"). Single-core S-Link image (no AMP core-1
-    // blob embedded), so copy 192 KiB, still under the 256 KiB partition.
-    0x0003_0000, // entry 0: size in bytes (192 KiB)
+    // near the top of SRAM reads ZEROS with no fault. This bit for real: at
+    // 192 KiB, a 203 KiB image booted with the shell's .rodata never loaded
+    // (every command "unknown", every message NULs) and cost a long remote
+    // debug session. xtask caps the image at the 256 KiB flash window, so
+    // 252 KiB covers any image xtask will produce, minus a 4 KiB margin for
+    // the partition-window check.
+    0x0003_f000, // entry 0: size in bytes (252 KiB)
     // VERSION item (type 0x48, 2 words, no rollback rows): the boot ROM uses
     // this to choose between A/B partitions -- the higher version boots. The
     // second word ((major << 16) | minor) is stamped by build.rs from
@@ -1127,21 +1130,12 @@ fn main() -> ! {
             .modify(|_, w| unsafe { w.funcsel().bits(3) });
     }
 
-    // SPI0 pins for the board-to-board link (funcsel 1): GP16 = RX (data in),
-    // GP17 = CSn, GP18 = SCK, GP19 = TX (data out). Push-pull, no pulls. The
-    // SPI driver defaults to internal loopback (ignores these pads) until a
-    // `spi role` command switches it to a real controller/peripheral.
-    for pin in [16usize, 17, 18, 19] {
-        p.PADS_BANK0.gpio(pin).modify(|_, w| {
-            w.od().clear_bit();
-            w.iso().clear_bit();
-            w.ie().set_bit()
-        });
-        p.IO_BANK0
-            .gpio(pin)
-            .gpio_ctrl()
-            .modify(|_, w| unsafe { w.funcsel().bits(1) });
-    }
+    // NOTE: this image does NOT pre-mux GP16-19 to SPI0. The old board-to-board
+    // SPI demo (drv-rp235x-spi) is not in this image; the ethernet task muxes
+    // exactly the SPI0 pins it owns (GP2/GP3/GP16 + GP17 as SIO chip-select)
+    // itself. Pre-muxing GP18/GP19 here put the SPI clock and MOSI on the
+    // AUDIO JACK / BUZZER pins -- audible as a buzz at the ethernet poll
+    // cadence (caught by ear at bring-up).
 
     // Bring up XOSC + PLL_SYS to a known 150 MHz and get the accurate tick
     // divisor. Runs here (privileged, pre-kernel) because CLOCKS/PLL are

@@ -31,7 +31,10 @@ use drv_rp235x_pwm_api::Rp235xPwm;
 use drv_rp235x_sdcard_api::Rp235xSdcard;
 #[cfg(feature = "slink")]
 use drv_rp235x_slink_api::Rp235xSlink;
+#[cfg(feature = "spibus")]
 use drv_rp235x_spi_api::Rp235xSpi;
+#[cfg(feature = "eth")]
+use task_rp235x_net_api::Rp235xNet;
 #[cfg(feature = "ws2812")]
 use drv_rp235x_ws2812_api::Rp235xWs2812;
 
@@ -67,7 +70,10 @@ use userlib::{hl, sys_get_timer, task_slot};
 task_slot!(USB, usb);
 task_slot!(GPIO, gpio_driver);
 task_slot!(UART, uart_driver);
+#[cfg(feature = "spibus")]
 task_slot!(SPI, spi_driver);
+#[cfg(feature = "eth")]
+task_slot!(NET, net);
 task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
@@ -131,11 +137,6 @@ const HELP: &[u8] = b"commands:\r\n\
   uart recv             drain UART0 RX buffer\r\n\
   uart bench [n]        time sending n bytes (default 4096); reports B/s\r\n\
   uart rxbench          count RX bytes over 3s (run while peer benches)\r\n\
-  spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
-  spi role controller|peripheral   set bus role for board-to-board (GP16-19)\r\n\
-  spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
-  spi recv              peripheral: show bytes clocked in by the controller\r\n\
-  spi bench [n]         controller: time clocking n bytes; reports B/s\r\n\
   i2c scan              probe all 7-bit addresses\r\n\
   i2c read <addr> <n>   read n bytes, e.g. i2c read 42 8\r\n\
   i2c write <addr> <hex..>\r\n\
@@ -165,6 +166,16 @@ const HELP: &[u8] = b"commands:\r\n\
 
 // Per-driver help lines, printed only when that driver's feature is enabled so
 // `help` never advertises a command the build doesn't have.
+#[cfg(feature = "mailbox")]
+#[cfg(feature = "spibus")]
+const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
+  spi role controller|peripheral   set bus role for board-to-board (GP16-19)\r\n\
+  spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
+  spi recv              peripheral: show bytes clocked in by the controller\r\n\
+  spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
+#[cfg(feature = "eth")]
+const HELP_ETH: &[u8] =
+    b"  eth                   ethernet status: link, DHCP state, IPv4 address\r\n";
 #[cfg(feature = "mailbox")]
 const HELP_MAILBOX: &[u8] =
     b"  core1 <n>|stress|speed|bulk <len> <it>   AMP cross-core mailbox + bulk xfer\r\n";
@@ -204,7 +215,10 @@ struct Shell {
     usb: UsbCons,
     gpio: Rp235xGpio,
     uart: Rp235xUart,
+    #[cfg(feature = "spibus")]
     spi: Rp235xSpi,
+    #[cfg(feature = "eth")]
+    net: Rp235xNet,
     i2c: Rp235xI2c,
     flash: Rp235xFlash,
     adc: Rp235xAdc,
@@ -309,6 +323,10 @@ impl Shell {
         match cmd {
             "help" => {
                 self.out.put(HELP);
+                #[cfg(feature = "spibus")]
+                self.out.put(HELP_SPIBUS);
+                #[cfg(feature = "eth")]
+                self.out.put(HELP_ETH);
                 #[cfg(feature = "mailbox")]
                 self.out.put(HELP_MAILBOX);
                 #[cfg(feature = "slink")]
@@ -342,7 +360,10 @@ impl Shell {
             "beep" => self.cmd_beep(),
             "gpio" => self.cmd_gpio(words.next(), words.next(), words.next()),
             "uart" => self.cmd_uart(line, words.next()),
+            #[cfg(feature = "spibus")]
             "spi" => self.cmd_spi(line, words.next()),
+            #[cfg(feature = "eth")]
+            "eth" => self.cmd_eth(),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -429,14 +450,17 @@ impl Shell {
         });
 
         // SPI: 3 bytes through the PL022 internal loopback.
-        let tx = [0xA5u8, 0x5A, 0x3C];
-        let mut srx = [0u8; 3];
-        let _ = self.spi.exchange(&tx, &mut srx);
-        self.out.put(if srx == tx {
-            b"spi:  loopback OK\r\n" as &[u8]
-        } else {
-            b"spi:  loopback FAILED\r\n"
-        });
+        #[cfg(feature = "spibus")]
+        {
+            let tx = [0xA5u8, 0x5A, 0x3C];
+            let mut srx = [0u8; 3];
+            let _ = self.spi.exchange(&tx, &mut srx);
+            self.out.put(if srx == tx {
+                b"spi:  loopback OK\r\n" as &[u8]
+            } else {
+                b"spi:  loopback FAILED\r\n"
+            });
+        }
 
         // I2C: full bus scan.
         self.i2c_scan();
@@ -1066,20 +1090,23 @@ impl Shell {
         );
 
         // SPI: exchange through loopback (or the real bus if role=controller).
-        let mut rx = [0u8; 256];
-        let t0 = sys_get_timer().now;
-        let mut sent = 0u32;
-        while sent < N {
-            let c = (N - sent).min(256) as usize;
-            self.spi.exchange(&buf[..c], &mut rx[..c]);
-            sent += c as u32;
+        #[cfg(feature = "spibus")]
+        {
+            let mut rx = [0u8; 256];
+            let t0 = sys_get_timer().now;
+            let mut sent = 0u32;
+            while sent < N {
+                let c = (N - sent).min(256) as usize;
+                self.spi.exchange(&buf[..c], &mut rx[..c]);
+                sent += c as u32;
+            }
+            self.bench_report(
+                b"  spi:   ",
+                N,
+                (sys_get_timer().now - t0) as u32,
+                187500,
+            );
         }
-        self.bench_report(
-            b"  spi:   ",
-            N,
-            (sys_get_timer().now - t0) as u32,
-            187500,
-        );
 
         // I2C: needs a target; bench it only if an address was given.
         match addr.and_then(|a| u8::from_str_radix(a, 16).ok()) {
@@ -1141,6 +1168,7 @@ impl Shell {
         self.out.put(b" theoretical)\r\n");
     }
 
+    #[cfg(feature = "spibus")]
     fn cmd_spi(&mut self, line: &str, verb: Option<&str>) {
         match verb {
             Some("xfer") => {
@@ -1231,6 +1259,39 @@ impl Shell {
                 .out
                 .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
         }
+    }
+
+    /// `eth`: link / DHCP / address status from the net task.
+    #[cfg(feature = "eth")]
+    fn cmd_eth(&mut self) {
+        let s = self.net.status();
+        self.out.put(b"eth:  link ");
+        self.out.put(if s & task_rp235x_net_api::STATUS_LINK_UP != 0 {
+            b"UP" as &[u8]
+        } else {
+            b"DOWN"
+        });
+        let bound = s & task_rp235x_net_api::STATUS_BOUND != 0;
+        let static_ip = s & task_rp235x_net_api::STATUS_STATIC != 0;
+        if bound || static_ip {
+            let ip = task_rp235x_net_api::status_ip(s);
+            self.out.put(if bound {
+                b", dhcp BOUND, ip " as &[u8]
+            } else {
+                b", static, ip "
+            });
+            for (i, o) in ip.iter().enumerate() {
+                if i > 0 {
+                    self.out.put(b".");
+                }
+                self.out.put_u32(*o as u32);
+            }
+            self.out.put(b"/");
+            self.out.put_u32(task_rp235x_net_api::status_prefix(s) as u32);
+        } else {
+            self.out.put(b", dhcp searching");
+        }
+        self.out.put(b"\r\n");
     }
 
     fn cmd_i2c(
@@ -3692,7 +3753,10 @@ pub fn main() -> ! {
         usb: UsbCons::from(USB.get_task_id()),
         gpio: Rp235xGpio::from(GPIO.get_task_id()),
         uart: Rp235xUart::from(UART.get_task_id()),
+        #[cfg(feature = "spibus")]
         spi: Rp235xSpi::from(SPI.get_task_id()),
+        #[cfg(feature = "eth")]
+        net: Rp235xNet::from(NET.get_task_id()),
         i2c: Rp235xI2c::from(I2C.get_task_id()),
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
