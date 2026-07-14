@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Client API for the RP2350 minimal network task (ENC28J60 + smoltcp).
+//! Client API for the RP2350 minimal network task (W5500 MACRAW + smoltcp).
 
 #![no_std]
 

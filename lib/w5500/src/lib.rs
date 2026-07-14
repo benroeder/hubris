@@ -30,13 +30,13 @@ use embedded_hal::spi::{Operation, SpiDevice};
 /// caller-side buffer sizing used by the net task.
 pub const MTU: usize = 1514;
 
-/// Outcome of a `transmit()` call, for diagnostics/observability. Shaped like
-/// the ENC28J60 driver's report so the net task's ringbuf is unchanged.
+/// Outcome of a `transmit()` call, for diagnostics/observability.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct TxReport {
     /// The frame was accepted and SEND completed (SENDOK).
     pub ok: bool,
-    /// Always 1 for the W5500 (it does its own ret/backoff); kept for parity.
+    /// Always 1: the W5500 does its own retransmit/backoff. Reserved so the
+    /// caller's TX ringbuf entry has an attempt slot if TX retries are added.
     pub attempts: u8,
     /// Final `Sn_IR` snapshot (SENDOK / TIMEOUT bits) for debugging.
     pub eir: u8,
@@ -71,6 +71,8 @@ const SN_RX_WR: u16 = 0x002A; // write pointer, 2 bytes
 const MR_RST: u8 = 0x80; // software reset
 const SN_MR_MACRAW: u8 = 0x04;
 const SN_MR_MF: u8 = 0x80; // MAC filter: accept own-MAC + broadcast only
+const SN_MR_MMB: u8 = 0x20; // block multicast (unused by an IPv4 unicast host)
+const SN_MR_MIP6B: u8 = 0x10; // block IPv6 (this host is IPv4-only)
 const CMD_OPEN: u8 = 0x01;
 const CMD_SEND: u8 = 0x20;
 const CMD_RECV: u8 = 0x40;
@@ -143,9 +145,15 @@ where
             self.write_u8(bsb, SN_TXBUF_SIZE, 0);
         }
 
-        // Open socket 0 in MACRAW with the MAC filter on (own-MAC + broadcast),
-        // then wait for it to report SOCK_MACRAW.
-        self.write_u8(BSB_S0_REG, SN_MR, SN_MR_MACRAW | SN_MR_MF);
+        // Open socket 0 in MACRAW filtering to what an IPv4 unicast host needs:
+        // MAC filter (own-MAC + broadcast) plus multicast and IPv6 blocking, so
+        // the RX buffer is not churned by IPv6 ND/multicast we would only
+        // discard in smoltcp anyway. Then wait for it to report SOCK_MACRAW.
+        self.write_u8(
+            BSB_S0_REG,
+            SN_MR,
+            SN_MR_MACRAW | SN_MR_MF | SN_MR_MMB | SN_MR_MIP6B,
+        );
         self.write_u8(BSB_S0_REG, SN_CR, CMD_OPEN);
         for _ in 0..SPIN_LIMIT {
             if self.read_u8(BSB_S0_REG, SN_SR) == SR_MACRAW {
@@ -165,11 +173,20 @@ where
         self.read_u8(BSB_COMMON, PHYCFGR) & PHY_LINK != 0
     }
 
+    /// True if socket 0 is still in MACRAW (`Sn_SR == SOCK_MACRAW`). A `false`
+    /// here is an unambiguous "the receiver is broken" signal -- the socket
+    /// fell out of raw mode -- which the caller's watchdog uses to decide a
+    /// hardware reset (as opposed to mere RX silence, which may just be a quiet
+    /// network).
+    pub fn in_macraw(&mut self) -> bool {
+        self.read_u8(BSB_S0_REG, SN_SR) == SR_MACRAW
+    }
+
     /// Receive one Ethernet frame into `buf`, or `None` if the RX buffer is
     /// empty. Each MACRAW packet in the buffer is `[u16 len][frame]` where `len`
     /// counts the 2-byte header itself.
     pub fn receive(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let rsr = self.read_u16(BSB_S0_REG, SN_RX_RSR);
+        let rsr = self.read_u16_stable(BSB_S0_REG, SN_RX_RSR);
         if rsr < 2 {
             return None;
         }
@@ -183,20 +200,25 @@ where
         // the chip says is buffered. Anything else means the pointers are out
         // of sync: flush the buffer (RX_RD = RX_WR) and resync via RECV.
         if plen < 2 || plen > rsr {
-            let wr = self.read_u16(BSB_S0_REG, SN_RX_WR);
+            let wr = self.read_u16_stable(BSB_S0_REG, SN_RX_WR);
             self.write_u16(BSB_S0_REG, SN_RX_RD, wr);
             self.write_u8(BSB_S0_REG, SN_CR, CMD_RECV);
             return None;
         }
 
         let frame_len = (plen - 2) as usize;
-        let n = frame_len.min(buf.len());
-        self.read(BSB_S0_RX, rd.wrapping_add(2), &mut buf[..n]);
 
-        // Advance past the whole packet and tell the chip we consumed it.
+        // Consume the whole packet from the chip regardless, so the pointer
+        // stays in sync. A frame too big for `buf` (cannot happen at MTU sizing,
+        // but guard rather than hand smoltcp a silently truncated frame) is
+        // dropped by returning None after advancing.
+        let fits = frame_len <= buf.len();
+        if fits {
+            self.read(BSB_S0_RX, rd.wrapping_add(2), &mut buf[..frame_len]);
+        }
         self.write_u16(BSB_S0_REG, SN_RX_RD, rd.wrapping_add(plen));
         self.write_u8(BSB_S0_REG, SN_CR, CMD_RECV);
-        Some(n)
+        fits.then_some(frame_len)
     }
 
     /// Transmit one Ethernet frame. The caller supplies a complete frame
@@ -206,7 +228,7 @@ where
 
         // Wait for enough free space in the TX buffer.
         let mut spins = 0u32;
-        while self.read_u16(BSB_S0_REG, SN_TX_FSR) < len {
+        while self.read_u16_stable(BSB_S0_REG, SN_TX_FSR) < len {
             spins += 1;
             if spins > SPIN_LIMIT {
                 return TxReport {
@@ -288,19 +310,31 @@ where
         self.write(bsb, addr, &[val]);
     }
 
-    /// Read a 16-bit big-endian register. The pointer/size registers can change
-    /// under an in-flight DMA, so read twice and accept once it is stable
-    /// (datasheet's recommended read-until-consistent for Sn_*_RSR/pointers).
+    /// Read a 16-bit big-endian register in one transaction. For host-controlled
+    /// registers (Sn_RX_RD, Sn_TX_WR) that do not change under us between writes.
     fn read_u16(&mut self, bsb: u8, addr: u16) -> u16 {
-        loop {
-            let mut a = [0u8; 2];
-            self.read(bsb, addr, &mut a);
+        let mut a = [0u8; 2];
+        self.read(bsb, addr, &mut a);
+        u16::from_be_bytes(a)
+    }
+
+    /// Read a chip-updated 16-bit register (Sn_RX_RSR, Sn_TX_FSR, Sn_RX_WR),
+    /// which can change under an in-flight DMA: read until two reads agree
+    /// (datasheet's recommended read-until-consistent). Bounded by SPIN_LIMIT so
+    /// a wedged or absent chip -- whose reads never stabilise -- cannot hang the
+    /// poll loop (and thus the `eth` IPC); returns the last sample at the bound.
+    fn read_u16_stable(&mut self, bsb: u8, addr: u16) -> u16 {
+        let mut a = [0u8; 2];
+        self.read(bsb, addr, &mut a);
+        for _ in 0..SPIN_LIMIT {
             let mut b = [0u8; 2];
             self.read(bsb, addr, &mut b);
             if a == b {
-                return u16::from_be_bytes(a);
+                break;
             }
+            a = b;
         }
+        u16::from_be_bytes(a)
     }
 
     fn write_u16(&mut self, bsb: u8, addr: u16, val: u16) {

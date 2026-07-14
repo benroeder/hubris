@@ -55,7 +55,7 @@ start = true
 notifications = ["uart-irq"]
 interrupts = {"uart0.irq" = "uart-irq"}
 
-# Ethernet: ENC28J60 on SPI0 (owned directly, sdcard-style) + smoltcp + DHCP.
+# Ethernet: W5500 (MACRAW) on SPI0 (owned directly, sdcard-style) + smoltcp + DHCP.
 # Replaces the generic spi_driver in this image -- both would own SPI0.
 [tasks.net]
 name = "task-rp235x-net"

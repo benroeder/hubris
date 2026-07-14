@@ -141,10 +141,10 @@ const STATIC_FALLBACK_MS: u64 = 8_000;
 /// this ever needs to be tighter.
 const POLL_MS: u64 = 5;
 
-/// RX watchdog: if the link is up but no frame arrives for this long while the
-/// interface is still trying to get connectivity (not DHCP-bound), the W5500 is
-/// assumed to have gone deaf and is hardware-reset. Gated on "not bound" so a
-/// genuinely quiet network with an established lease is never disturbed.
+/// RX watchdog: after this long with the link up but no frames received, the
+/// driver checks whether socket 0 is still in MACRAW and hardware-resets only
+/// if it is not. Silence alone never triggers a reset (it may be a quiet
+/// network), so this window can be short without risking spurious resets.
 const RX_WATCHDOG_MS: u64 = 4_000;
 
 /// clk_sys cycles per microsecond (150 MHz).
@@ -394,6 +394,10 @@ struct ServerImpl<'a> {
     addr: (Ipv4Address, u8),
     /// Poll counter, for throttling periodic diagnostics.
     polls: u32,
+    /// Kernel timer (ms) sampled at task start; the DHCP grace period is
+    /// measured relative to this so a task restart on a long-up system still
+    /// gives DHCP its full window.
+    start_ms: u64,
     /// Last observed `dev.rx_count` and the timestamp it last advanced -- the
     /// RX watchdog hard-resets the chip if it goes deaf while the link is up.
     last_rx_count: u32,
@@ -451,14 +455,18 @@ impl ServerImpl<'_> {
             }
         }
 
+        let now_ms = sys_get_timer().now;
+
         // Static-IP fallback: if DHCP has not bound within the grace period and
         // we have not already self-assigned, install the static address so the
         // board is reachable even where the DHCP server will not lease to it.
-        // DHCP stays primary -- a later `Configured` clears `static_active` and
-        // overwrites the address above.
+        // Measured from task start (`start_ms`), NOT system uptime -- a task
+        // restart on a long-up system must still give DHCP its full grace
+        // window rather than falling back on the first poll. DHCP stays primary
+        // -- a later `Configured` clears `static_active` and overwrites `addr`.
         if !self.bound
             && !self.static_active
-            && sys_get_timer().now >= STATIC_FALLBACK_MS
+            && now_ms.wrapping_sub(self.start_ms) >= STATIC_FALLBACK_MS
         {
             self.static_active = true;
             self.addr = (STATIC_ADDR, STATIC_PREFIX);
@@ -475,21 +483,25 @@ impl ServerImpl<'_> {
             )));
         }
 
-        // RX watchdog: note forward progress, and if the receiver has gone
-        // silent while the link is up (and we still need connectivity), hard-
-        // reset the chip. The `is_link_up` SPI read is short-circuited so it
-        // only runs once the silence timeout is already exceeded.
-        let now_ms = sys_get_timer().now;
+        // RX watchdog: track forward progress; on prolonged RX silence with the
+        // link up, hard-reset the chip ONLY if socket 0 has actually fallen out
+        // of MACRAW (a definite failure). Mere silence is not treated as a fault
+        // -- it may be a quiet network -- so this neither resets a healthy idle
+        // link (or disrupts an in-flight DHCP handshake) nor leaves a genuinely
+        // broken chip stuck, whether or not a lease is currently held. The two
+        // extra SPI reads (link, then Sn_SR) run at most once per watchdog
+        // window thanks to `&&` short-circuiting.
         if self.dev.rx_count != self.last_rx_count {
             self.last_rx_count = self.dev.rx_count;
             self.last_rx_ms = now_ms;
-        } else if !self.bound
-            && now_ms.wrapping_sub(self.last_rx_ms) > RX_WATCHDOG_MS
+        } else if now_ms.wrapping_sub(self.last_rx_ms) > RX_WATCHDOG_MS
             && self.dev.drv.is_link_up()
         {
             self.last_rx_ms = now_ms;
-            ringbuf_entry!(Trace::RxWatchdogReset);
-            self.dev.drv.reinit(&mut SpinDelay);
+            if !self.dev.drv.in_macraw() {
+                ringbuf_entry!(Trace::RxWatchdogReset);
+                self.dev.drv.reinit(&mut SpinDelay);
+            }
         }
     }
 
@@ -656,6 +668,7 @@ fn main() -> ! {
         static_active: false,
         addr: (Ipv4Address::UNSPECIFIED, 0),
         polls: 0,
+        start_ms: sys_get_timer().now,
         last_rx_count: 0,
         last_rx_ms: 0,
     };
