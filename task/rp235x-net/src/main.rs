@@ -9,7 +9,10 @@
 //! CS low across a whole `[addr][control][data]` frame, which the shared IPC
 //! SPI server cannot express, and an IPC round-trip per register access would
 //! dominate the packet path. Pins: SCK=GP2, MOSI=GP3, MISO=GP16 (SPI0
-//! funcsel), CS=GP17 and RST=GP14 (manual SIO, active low). The `w5500` driver
+//! funcsel), CS=GP17 and RST=GP14 (manual SIO, active low). INT (the W5500's
+//! open-drain active-low interrupt) is wired to GP9 but unused for now -- we
+//! poll; it is reserved so an interrupt-driven RX fast-path is a firmware-only
+//! change with no rewiring. The `w5500` driver
 //! core (lib/w5500) runs socket 0 in MACRAW mode -- raw Ethernet frames rather
 //! than the chip's TCP/IP offload -- so this task implements the embedded-hal
 //! 1.0 SPI traits over the PL022, wraps the driver in a `smoltcp::phy::Device`,
@@ -130,10 +133,13 @@ const STATIC_GW: Ipv4Address = Ipv4Address::new(10, 110, 10, 1);
 /// Grace period for DHCP before falling back to the static address.
 const STATIC_FALLBACK_MS: u64 = 8_000;
 
-/// Poll cadence when idle, in ms. DHCP timers are seconds-scale and inbound
-/// packets are discovered by polling the W5500's RX size, so 20 ms keeps ping
-/// latency low without burning the CPU.
-const POLL_MS: u64 = 20;
+/// Poll cadence when idle, in ms. Inbound packets are discovered by polling the
+/// W5500's RX size, so a short interval keeps ping latency low and drains the
+/// RX buffer often enough that a busy segment cannot overflow it between polls
+/// (the earlier 20 ms dropped ~20% under broadcast load). 5 ms is still cheap on
+/// the 150 MHz core; the INT line (GP9) is wired for an interrupt fast-path if
+/// this ever needs to be tighter.
+const POLL_MS: u64 = 5;
 
 /// RX watchdog: if the link is up but no frame arrives for this long while the
 /// interface is still trying to get connectivity (not DHCP-bound), the W5500 is
