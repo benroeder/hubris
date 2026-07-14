@@ -283,7 +283,7 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         // failure is visible at the shell instead of a silent no-op.
         userlib::hl::sleep_for(10);
         let stuck_time = wd.ctrl().read().time().bits();
-        Ok(0x8000_0000 | stuck_time as u32)
+        Ok(0x8000_0000 | stuck_time)
     }
 }
 

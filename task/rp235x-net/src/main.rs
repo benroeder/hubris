@@ -370,12 +370,12 @@ impl phy::Device for EthDevice {
         let n = self.drv.receive(&mut self.rx)?;
         self.rx_count = self.rx_count.wrapping_add(1);
         ringbuf_entry!(Trace::Rx {
-            ethertype: ethertype(&self.rx[..n as usize]),
+            ethertype: ethertype(&self.rx[..n]),
             len: n as u16,
         });
         Some((
             EthRxToken {
-                frame: &mut self.rx[..n as usize],
+                frame: &mut self.rx[..n],
             },
             EthTxToken {
                 drv: &mut self.drv,
@@ -431,7 +431,7 @@ impl ServerImpl<'_> {
         // receiving-but-not-draining vs hearing-nothing is distinguishable
         // even when zero frames reach the driver.
         self.polls = self.polls.wrapping_add(1);
-        if self.polls % 250 == 0 {
+        if self.polls.is_multiple_of(250) {
             let (rx_size, ir, sr, phy) = self.dev.drv.rx_diag();
             ringbuf_entry!(Trace::RxDiag {
                 rx_size,
@@ -444,7 +444,7 @@ impl ServerImpl<'_> {
         let now = Instant::from_millis(sys_get_timer().now as i64);
         self.iface.poll(now, &mut self.dev, &mut self.sockets);
 
-        let dhcp = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp_handle);
+        let dhcp = self.sockets.get_mut::<dhcpv4::Socket<'_>>(self.dhcp_handle);
         match dhcp.poll() {
             None => {}
             Some(dhcpv4::Event::Configured(config)) => {
@@ -533,7 +533,7 @@ impl ServerImpl<'_> {
         let dt = self
             .iface
             .poll_delay(now, &self.sockets)
-            .map(|d| d.total_millis() as u64)
+            .map(|d| d.total_millis())
             .unwrap_or(POLL_MS)
             .clamp(1, POLL_MS);
         sys_set_timer(Some(now_ms + dt), notifications::TIMER_MASK);
