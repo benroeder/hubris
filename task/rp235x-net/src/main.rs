@@ -34,7 +34,7 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::dhcpv4;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use userlib::{RecvMessage, sys_get_timer, sys_set_timer, task_slot};
@@ -78,6 +78,21 @@ enum Trace {
     Version(u8),
     /// The per-board MAC derived from the flash unique ID (or the fallback).
     Mac([u8; 6]),
+    /// The demo HTTP server answered a request on port 80 (bytes built / sent).
+    HttpServed {
+        built: u16,
+        sent: u16,
+    },
+    /// A firmware upload started: target flash `base`, total `size` bytes.
+    UpdateBegin {
+        base: u32,
+        size: u32,
+    },
+    /// A firmware upload finished: `wrote` bytes, computed `crc`.
+    UpdateDone {
+        crc: u32,
+        wrote: u32,
+    },
     /// The RX watchdog fired: link up but no frames received for the timeout,
     /// so the chip was hardware-reset and reinitialised.
     RxWatchdogReset,
@@ -92,6 +107,345 @@ fn ethertype(frame: &[u8]) -> u16 {
     } else {
         0
     }
+}
+
+/// TCP port the built-in demo HTTP server listens on.
+const HTTP_PORT: u16 = 80;
+
+/// Flash erase (sector) and program (page) granularity, matching the driver.
+const FLASH_SECTOR: u32 = 4096;
+const FLASH_PAGE: u32 = 256;
+
+// A/B partition layout (matches chips/rp235x/ab-partitions.json): the partition
+// table sits at flash 0, slot A at 0x2000, slot B at 0x42000. An `update` writes
+// the lower-version (inactive) slot; the boot ROM boots the higher-version slot,
+// leaving the running image as the fallback -- so a bad/interrupted update never
+// bricks the board.
+const PART_A: u32 = 0x0000_2000;
+const PART_B: u32 = 0x0004_2000;
+/// IMAGE_DEF version word offset within a slot (block @0x160, version item +0x24).
+/// This is the RP2350 boot-ROM version (picks which slot boots).
+const VER_OFF: u32 = 0x160 + 0x24;
+/// Hubris `abi::ImageHeader` offset within a slot (the `.header` section, placed
+/// right after the vector table). magic @+0, `total_image_len` @+4. Distinct
+/// from the IMAGE_DEF version above -- this gives the installed image's size.
+const HDR_OFF: u32 = 0x110;
+/// `abi::HEADER_MAGIC` (0x64_CE_D6_CA), validating the slot holds a real image.
+const HDR_MAGIC: u32 = 0x64CE_D6CA;
+
+/// Streaming CRC-32 (IEEE, reflected) update -- table-less to save the 1 KiB
+/// lookup; the image is CRC'd once so speed is irrelevant.
+fn crc32(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc
+}
+
+/// Pick the A/B slot the next update writes: the stale (lower effective
+/// version) partition, or 0 (write in place) if there is no A/B partition table.
+/// Thin wrapper over `read_slots` so the updater and the status page agree.
+fn update_target_base(flash: &Rp235xFlash) -> u32 {
+    read_slots(flash).target
+}
+
+/// Size of each A/B image slot (partition), from ab-partitions.json.
+const SLOT_SIZE: u32 = 256 * 1024;
+
+/// A/B slot status for the web UI.
+#[derive(Copy, Clone)]
+struct Slots {
+    /// Raw IMAGE_DEF version word of slot A / B (0xffff_ffff if erased, 0 if the
+    /// flash read failed). See `boot_version` for the value used to rank slots.
+    ver_a: u32,
+    ver_b: u32,
+    /// Installed image length (bytes) in slot A / B, 0 if the slot holds no
+    /// valid image (bad/erased `ImageHeader` magic).
+    size_a: u32,
+    size_b: u32,
+    /// An A/B partition table is present (else this is a single-image board).
+    ab: bool,
+    /// Flash base the next update writes (the stale slot, or 0 in place).
+    target: u32,
+}
+
+/// Read one slot's IMAGE_DEF version word and installed image size via the flash
+/// driver. Size comes from the Hubris `ImageHeader`; 0 if its magic is invalid.
+fn read_slot(flash: &Rp235xFlash, part: u32) -> (u32, u32) {
+    let mut v = [0u8; 4];
+    let ver = if flash.read(part + VER_OFF, &mut v).unwrap_or(0) >= 4 {
+        u32::from_le_bytes(v)
+    } else {
+        0
+    };
+    let mut hdr = [0u8; 8];
+    let size = if flash.read(part + HDR_OFF, &mut hdr).unwrap_or(0) >= 8
+        && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == HDR_MAGIC
+    {
+        u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]])
+    } else {
+        0
+    };
+    (ver, size)
+}
+
+/// Boot rank of a slot as `(valid, version)`, higher = preferred by the ROM.
+/// Validity is the PRIMARY key: a slot with no valid `ImageHeader` magic
+/// (`size == 0`) or an erased version word is not bootable, so ANY valid slot
+/// outranks it regardless of version -- even a legitimate v0.0 image. Version
+/// only tie-breaks among valid slots. Folding validity into a magic version 0
+/// (an earlier attempt) conflated a valid v0.0 image with an erased slot and
+/// could still target the only bootable image. Without this ranking, erased
+/// flash reads 0xffff_ffff and sorts as the *newest* image -- flipping the
+/// "active" slot and, worse, making the updater target the running slot instead
+/// of the stale one (breaking the unbrickable guarantee, e.g. after a
+/// power-interrupted update erases a slot's first sector). Note: a fully-erased
+/// or first-sector-erased slot is caught here; a half-written image whose header
+/// survived but whose body is truncated is not (the boot ROM rejects it via its
+/// own hash check and falls back).
+fn slot_rank(ver: u32, size: u32) -> (bool, u32) {
+    let valid = size != 0 && ver != 0xffff_ffff;
+    (valid, if valid { ver } else { 0 })
+}
+
+/// Read both A/B slots (version + size), the partition-table presence, and the
+/// stale slot the next update writes -- one flash pass, shared by the updater
+/// (`update_target_base`) and the status page.
+fn read_slots(flash: &Rp235xFlash) -> Slots {
+    let mut hdr = [0u8; 8];
+    let ab = flash.read(0, &mut hdr).unwrap_or(0) >= 8
+        && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == 0xffff_ded3
+        && hdr[4] == 0x0a;
+    let (ver_a, size_a) = read_slot(flash, PART_A);
+    let (ver_b, size_b) = read_slot(flash, PART_B);
+    // Write the stale (lower-ranked) slot; ties go to A. The ROM boots the
+    // higher-ranked slot -- a valid image always outranks an erased peer.
+    let target = if !ab {
+        0 // no A/B table: single image, write slot 0 in place
+    } else if slot_rank(ver_a, size_a) <= slot_rank(ver_b, size_b) {
+        PART_A
+    } else {
+        PART_B
+    };
+    Slots {
+        ver_a,
+        ver_b,
+        size_a,
+        size_b,
+        ab,
+        target,
+    }
+}
+
+/// State of the streaming firmware upload (`POST /update`).
+#[derive(Copy, Clone, PartialEq)]
+enum Update {
+    /// Not updating; the HTTP server is idle / serving GETs.
+    Idle,
+    /// Streaming the image to flash slot `base`: `size` total bytes, `off` fully
+    /// programmed so far, `crc` the running CRC-32, `plen` bytes staged in the
+    /// current (not-yet-programmed) page.
+    Recv {
+        base: u32,
+        size: u32,
+        off: u32,
+        crc: u32,
+        plen: u16,
+    },
+    /// Response sent; reboot once the kernel clock passes `at` (lets the reply
+    /// flush and the socket close before the chip resets).
+    Reboot { at: u64 },
+}
+
+/// Index just past the `\r\n\r\n` that ends the HTTP request headers, or None.
+fn headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Parse the decimal `Content-Length` header value (case-insensitive), or 0.
+fn content_length(headers: &[u8]) -> u32 {
+    let name = b"content-length:";
+    for line in headers.split(|&b| b == b'\n') {
+        if line.len() >= name.len()
+            && line[..name.len()]
+                .iter()
+                .zip(name)
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        {
+            let mut v = 0u32;
+            for &c in &line[name.len()..] {
+                if c.is_ascii_digit() {
+                    v = v.wrapping_mul(10) + (c - b'0') as u32;
+                } else if c != b' ' {
+                    break;
+                }
+            }
+            return v;
+        }
+    }
+    0
+}
+
+/// A `core::fmt::Write` sink over a byte slice, truncating at the end (never
+/// panics on overflow). Used to format the HTTP response without an allocator.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl core::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let end = (self.pos + b.len()).min(self.buf.len());
+        self.buf[self.pos..end].copy_from_slice(&b[..end - self.pos]);
+        self.pos = end;
+        Ok(())
+    }
+}
+
+/// Write one A/B slot's table row: `Slot X (0xNNNNN) | version | size/free |
+/// active?`. `size` is the installed image length (0 = empty slot).
+fn write_slot_row(
+    w: &mut SliceWriter<'_>,
+    letter: char,
+    part: u32,
+    ver: u32,
+    size: u32,
+    active: bool,
+) {
+    use core::fmt::Write;
+    let cap = SLOT_SIZE;
+    let _ = write!(w, "<tr><td>Slot {} (0x{:05x})</td><td>", letter, part);
+    // Version word `major.minor`, or `empty` for a blank/erased slot.
+    if ver == 0 || ver == 0xffff_ffff {
+        let _ = write!(w, "empty");
+    } else {
+        let _ = write!(w, "{}.{}", ver >> 16, ver & 0xffff);
+    }
+    let _ = write!(w, "</td><td>");
+    if size == 0 || size > cap {
+        let _ = write!(w, "&mdash;");
+    } else {
+        let _ = write!(
+            w,
+            "{} KiB used, {} KiB free",
+            size / 1024,
+            (cap - size) / 1024,
+        );
+    }
+    let _ = write!(
+        w,
+        "</td><td>{}</td></tr>",
+        if active { "&larr; active" } else { "" },
+    );
+}
+
+/// Format the demo status page (HTTP/1.0 response + minimal HTML) into `buf`,
+/// returning the byte length written. Served for any GET request.
+fn build_page(
+    buf: &mut [u8],
+    ip: [u8; 4],
+    prefix: u8,
+    mac: [u8; 6],
+    uptime_ms: u64,
+    rx: u32,
+    slots: &Slots,
+) -> usize {
+    use core::fmt::Write;
+    let mut w = SliceWriter { buf, pos: 0 };
+    // Connection: close lets the client know the response ends at EOF, so we
+    // can close immediately after sending -- no Content-Length needed.
+    let _ = write!(
+        w,
+        "HTTP/1.0 200 OK\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Connection: close\r\n\r\n\
+         <!doctype html><html><head><meta name=viewport \
+         content=\"width=device-width,initial-scale=1\"><title>RP2350</title>\
+         </head><body style=\"font-family:sans-serif\">\
+         <h1>Pico 2 + W5500</h1>\
+         <p>Served by the Hubris rp235x-net task over smoltcp (MACRAW).</p>\
+         <table>\
+         <tr><td>IP</td><td>{}.{}.{}.{}/{}</td></tr>\
+         <tr><td>MAC</td><td>{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}</td></tr>\
+         <tr><td>Uptime</td><td>{} s</td></tr>\
+         <tr><td>RX frames</td><td>{}</td></tr>\
+         </table>",
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        prefix,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        uptime_ms / 1000,
+        rx,
+    );
+
+    if slots.ab {
+        // The bootrom runs the higher-versioned slot; `target` is the stale
+        // slot the next update writes, so the *other* slot is active.
+        let active_a = slots.target == PART_B;
+        let target_letter = if slots.target == PART_A { 'A' } else { 'B' };
+        let _ = write!(
+            w,
+            "<h2>A/B image slots</h2><table>\
+             <tr><th>Slot</th><th>Version</th><th>Image</th><th></th></tr>",
+        );
+        write_slot_row(&mut w, 'A', PART_A, slots.ver_a, slots.size_a, active_a);
+        write_slot_row(&mut w, 'B', PART_B, slots.ver_b, slots.size_b, !active_a);
+        let _ = write!(
+            w,
+            "</table>\
+             <p>Next update writes <b>slot {}</b> (the stale one). \
+             Slot capacity {} KiB.</p>",
+            target_letter,
+            SLOT_SIZE / 1024,
+        );
+    } else {
+        let _ = write!(
+            w,
+            "<h2>Firmware</h2>\
+             <p>Single-image board (no A/B partition table).</p>",
+        );
+    }
+
+    let _ = write!(
+        w,
+        "<h2>Firmware update (A/B)</h2>\
+         <p>Uploads the stale slot, then reboots into it (unbrickable).</p>\
+         <form id=f><input type=file id=u required> \
+         <button>Upload &amp; reboot</button></form><pre id=o></pre>\
+         <script>f.onsubmit=async e=>{{e.preventDefault();\
+         o.textContent='uploading...';\
+         let d=await u.files[0].arrayBuffer();\
+         let r=await fetch('/update',{{method:'POST',body:d}});\
+         o.textContent=await r.text();}}</script>\
+         </body></html>",
+    );
+    w.pos
+}
+
+/// Format the plain-text `POST /update` acknowledgement into `buf`.
+fn build_update_ok(buf: &mut [u8], size: u32, crc: u32, base: u32) -> usize {
+    use core::fmt::Write;
+    let mut w = SliceWriter { buf, pos: 0 };
+    let _ = write!(
+        w,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
+         Connection: close\r\n\r\n\
+         wrote {} bytes to slot 0x{:x}, crc32={:08x}\nrebooting into it...\n",
+        size, base, crc
+    );
+    w.pos
 }
 
 // --- Pin map (SPI0 mux group; see the module docs) ---------------------------
@@ -406,6 +760,14 @@ struct ServerImpl<'a> {
     iface: Interface,
     sockets: SocketSet<'a>,
     dhcp_handle: smoltcp::iface::SocketHandle,
+    /// Listening TCP socket for the demo HTTP server (port 80).
+    http_handle: smoltcp::iface::SocketHandle,
+    /// This board's MAC, for the status page.
+    mac: [u8; 6],
+    /// Firmware-upload (`POST /update`) state machine.
+    update: Update,
+    /// Partial-page staging buffer for firmware writes (one flash page).
+    page: [u8; FLASH_PAGE as usize],
     /// DHCP has configured an address.
     bound: bool,
     /// The static fallback address is currently installed.
@@ -475,6 +837,8 @@ impl ServerImpl<'_> {
             }
         }
 
+        self.serve_http();
+
         let now_ms = sys_get_timer().now;
 
         // Static-IP fallback: if DHCP has not bound within the grace period and
@@ -523,6 +887,226 @@ impl ServerImpl<'_> {
                 self.dev.drv.reinit(&mut SpinDelay);
             }
         }
+    }
+
+    /// Demo HTTP server: `GET /` returns a status page with a firmware-upload
+    /// form; `POST /update` streams a new image into the inactive A/B slot and
+    /// reboots into it (the boot ROM boots the higher-version slot, leaving the
+    /// running image as an unbrickable fallback).
+    fn serve_http(&mut self) {
+        // Deferred reboot after a completed update: fire once the reply has had
+        // a moment to flush and the socket to close.
+        if let Update::Reboot { at } = self.update {
+            if sys_get_timer().now >= at {
+                let _ = Rp235xFlash::from(FLASH.get_task_id()).reboot(0);
+            }
+            return;
+        }
+        // Arm the listener if the socket is idle.
+        {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if !sock.is_open() {
+                let _ = sock.listen(HTTP_PORT);
+                self.update = Update::Idle;
+                return;
+            }
+        }
+        match self.update {
+            Update::Idle => self.http_idle(),
+            Update::Recv { .. } => self.http_recv(),
+            Update::Reboot { .. } => {}
+        }
+    }
+
+    /// Idle HTTP state: dispatch the incoming request (GET status vs POST
+    /// /update). Consumes nothing until the full request headers have arrived.
+    fn http_idle(&mut self) {
+        enum Action {
+            None,
+            Get,
+            Post(u32),
+            Bad,
+        }
+        // Body bytes that arrive in the same segment as the POST headers.
+        let mut first = [0u8; 512];
+        let mut firstlen = 0usize;
+        let action = {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if !(sock.can_recv() && sock.can_send()) {
+                return;
+            }
+            sock.recv(|buf| {
+                if buf.starts_with(b"GET ") {
+                    (buf.len(), Action::Get)
+                } else if buf.starts_with(b"POST /update") {
+                    match headers_end(buf) {
+                        None => (0, Action::None), // wait for the rest
+                        Some(h) => {
+                            let size = content_length(&buf[..h]);
+                            let body = &buf[h..];
+                            let n = body.len().min(first.len());
+                            first[..n].copy_from_slice(&body[..n]);
+                            firstlen = n;
+                            (h + n, Action::Post(size))
+                        }
+                    }
+                } else if buf.len() >= 5 {
+                    (buf.len(), Action::Bad)
+                } else {
+                    (0, Action::None)
+                }
+            })
+            .unwrap_or(Action::None)
+        };
+        match action {
+            Action::Get => {
+                let ip = self.addr.0.0;
+                let prefix = self.addr.1;
+                let mac = self.mac;
+                let up = sys_get_timer().now;
+                let rx = self.dev.rx_count;
+                let slots = read_slots(&Rp235xFlash::from(FLASH.get_task_id()));
+                // Sized to the TCP TX buffer so the full page never truncates.
+                let mut buf = [0u8; 2048];
+                let n = build_page(&mut buf, ip, prefix, mac, up, rx, &slots);
+                let sock =
+                    self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+                let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
+                sock.close();
+                ringbuf_entry!(Trace::HttpServed {
+                    built: n as u16,
+                    sent: sent as u16,
+                });
+            }
+            Action::Post(size) => {
+                let base =
+                    update_target_base(&Rp235xFlash::from(FLASH.get_task_id()));
+                ringbuf_entry!(Trace::UpdateBegin { base, size });
+                self.update = Update::Recv {
+                    base,
+                    size,
+                    off: 0,
+                    crc: 0xFFFF_FFFF,
+                    plen: 0,
+                };
+                self.feed_update(&first[..firstlen]);
+                self.finish_update_if_done();
+            }
+            Action::Bad => {
+                self.sockets
+                    .get_mut::<tcp::Socket<'_>>(self.http_handle)
+                    .close();
+            }
+            Action::None => {}
+        }
+    }
+
+    /// Streaming HTTP state: pull more of the firmware body and write it.
+    fn http_recv(&mut self) {
+        let mut stage = [0u8; 512];
+        let got = {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if sock.can_recv() {
+                sock.recv(|buf| {
+                    let n = buf.len().min(stage.len());
+                    stage[..n].copy_from_slice(&buf[..n]);
+                    (n, n)
+                })
+                .unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        if got > 0 {
+            self.feed_update(&stage[..got]);
+        }
+        self.finish_update_if_done();
+    }
+
+    /// Stream `bytes` of the firmware into the target flash slot: accumulate a
+    /// page, erase each new sector, program each full page (and the final
+    /// partial page once the whole image has arrived), CRC as we go.
+    fn feed_update(&mut self, bytes: &[u8]) {
+        let Update::Recv {
+            base,
+            size,
+            mut off,
+            mut crc,
+            mut plen,
+        } = self.update
+        else {
+            return;
+        };
+        let flash = Rp235xFlash::from(FLASH.get_task_id());
+        for &b in bytes {
+            if off + plen as u32 >= size {
+                break; // ignore anything past Content-Length
+            }
+            self.page[plen as usize] = b;
+            plen += 1;
+            if plen as u32 == FLASH_PAGE {
+                if off.is_multiple_of(FLASH_SECTOR) {
+                    let _ = flash.erase(base + off);
+                }
+                let _ = flash.program(base + off, &self.page);
+                crc = crc32(crc, &self.page);
+                off += FLASH_PAGE;
+                plen = 0;
+            }
+        }
+        if off + plen as u32 >= size && plen > 0 {
+            if off.is_multiple_of(FLASH_SECTOR) {
+                let _ = flash.erase(base + off);
+            }
+            let _ = flash.program(base + off, &self.page[..plen as usize]);
+            crc = crc32(crc, &self.page[..plen as usize]);
+            off += plen as u32;
+            plen = 0;
+        }
+        self.update = Update::Recv {
+            base,
+            size,
+            off,
+            crc,
+            plen,
+        };
+    }
+
+    /// If the whole image has been written, ACK the client and schedule the
+    /// reboot into the new slot.
+    fn finish_update_if_done(&mut self) {
+        let Update::Recv {
+            off,
+            size,
+            crc,
+            base,
+            ..
+        } = self.update
+        else {
+            return;
+        };
+        if off < size {
+            return;
+        }
+        let final_crc = crc ^ 0xFFFF_FFFF;
+        let mut resp = [0u8; 200];
+        let n = build_update_ok(&mut resp, size, final_crc, base);
+        {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            let _ = sock.send_slice(&resp[..n]);
+            sock.close();
+        }
+        ringbuf_entry!(Trace::UpdateDone {
+            crc: final_crc,
+            wrote: size,
+        });
+        self.update = Update::Reboot {
+            at: sys_get_timer().now + 500,
+        };
     }
 
     /// Arm the kernel timer for the next poll: smoltcp's own deadline when it
@@ -675,19 +1259,34 @@ fn main() -> ! {
     config.random_seed = 0x0060_2860_c0ff_ee00;
     let iface = Interface::new(config, &mut dev);
 
-    // Socket storage: just the DHCP client (ICMP echo needs no socket).
-    static mut SOCKET_STORAGE: [SocketStorage<'_>; 1] =
-        [SocketStorage::EMPTY; 1];
+    // Socket storage: the DHCP client + one TCP socket for the HTTP server
+    // (ICMP echo needs no socket).
+    static mut SOCKET_STORAGE: [SocketStorage<'_>; 2] =
+        [SocketStorage::EMPTY; 2];
     // SAFETY: taken exactly once here; the task is single-threaded.
     #[allow(static_mut_refs)]
     let mut sockets = SocketSet::new(unsafe { &mut SOCKET_STORAGE[..] });
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    // TCP socket for the demo HTTP server. 1 KiB RX (requests are tiny) + 2 KiB
+    // TX (the status page + A/B slot table runs ~1 KiB, over one MSS).
+    static mut TCP_RX: [u8; 1024] = [0; 1024];
+    static mut TCP_TX: [u8; 2048] = [0; 2048];
+    #[allow(static_mut_refs)]
+    let http_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
+    ));
 
     let mut server = ServerImpl {
         dev,
         iface,
         sockets,
         dhcp_handle,
+        http_handle,
+        mac,
+        update: Update::Idle,
+        page: [0; FLASH_PAGE as usize],
         bound: false,
         static_active: false,
         addr: (Ipv4Address::UNSPECIFIED, 0),

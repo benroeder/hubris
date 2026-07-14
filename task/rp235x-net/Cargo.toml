@@ -16,7 +16,7 @@ embedded-hal = { version = "1.0", default-features = false }
 # Workspace smoltcp enables ipv6/udp; this task additionally needs IPv4 (which
 # also gives ICMP echo replies at the interface level -- ping "just works")
 # and the DHCPv4 client socket. Features are additive per crate.
-smoltcp = { workspace = true, features = ["proto-ipv4", "socket-dhcpv4"] }
+smoltcp = { workspace = true, features = ["proto-ipv4", "socket-dhcpv4", "socket-tcp"] }
 
 w5500 = { path = "../../lib/w5500" }
 ringbuf = { path = "../../lib/ringbuf" }
