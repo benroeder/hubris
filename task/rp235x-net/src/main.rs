@@ -34,7 +34,7 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{ErrorType, Operation, SpiDevice};
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::dhcpv4;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use userlib::{RecvMessage, sys_get_timer, sys_set_timer, task_slot};
@@ -78,6 +78,11 @@ enum Trace {
     Version(u8),
     /// The per-board MAC derived from the flash unique ID (or the fallback).
     Mac([u8; 6]),
+    /// The demo HTTP server answered a request on port 80 (bytes built / sent).
+    HttpServed {
+        built: u16,
+        sent: u16,
+    },
     /// The RX watchdog fired: link up but no frames received for the timeout,
     /// so the chip was hardware-reset and reinitialised.
     RxWatchdogReset,
@@ -92,6 +97,74 @@ fn ethertype(frame: &[u8]) -> u16 {
     } else {
         0
     }
+}
+
+/// TCP port the built-in demo HTTP server listens on.
+const HTTP_PORT: u16 = 80;
+
+/// A `core::fmt::Write` sink over a byte slice, truncating at the end (never
+/// panics on overflow). Used to format the HTTP response without an allocator.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl core::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let end = (self.pos + b.len()).min(self.buf.len());
+        self.buf[self.pos..end].copy_from_slice(&b[..end - self.pos]);
+        self.pos = end;
+        Ok(())
+    }
+}
+
+/// Format the demo status page (HTTP/1.0 response + minimal HTML) into `buf`,
+/// returning the byte length written. Served for any request.
+#[allow(clippy::too_many_arguments)]
+fn build_page(
+    buf: &mut [u8],
+    ip: [u8; 4],
+    prefix: u8,
+    mac: [u8; 6],
+    uptime_ms: u64,
+    rx: u32,
+) -> usize {
+    use core::fmt::Write;
+    let mut w = SliceWriter { buf, pos: 0 };
+    // Connection: close lets the client know the response ends at EOF, so we
+    // can close immediately after sending -- no Content-Length needed.
+    let _ = write!(
+        w,
+        "HTTP/1.0 200 OK\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Connection: close\r\n\r\n\
+         <!doctype html><html><head><meta name=viewport \
+         content=\"width=device-width,initial-scale=1\"><title>RP2350</title>\
+         </head><body style=\"font-family:sans-serif\">\
+         <h1>Pico 2 + W5500</h1>\
+         <p>Served by the Hubris rp235x-net task over smoltcp (MACRAW).</p>\
+         <table>\
+         <tr><td>IP</td><td>{}.{}.{}.{}/{}</td></tr>\
+         <tr><td>MAC</td><td>{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}</td></tr>\
+         <tr><td>Uptime</td><td>{} s</td></tr>\
+         <tr><td>RX frames</td><td>{}</td></tr>\
+         </table></body></html>",
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        prefix,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        uptime_ms / 1000,
+        rx,
+    );
+    w.pos
 }
 
 // --- Pin map (SPI0 mux group; see the module docs) ---------------------------
@@ -406,6 +479,10 @@ struct ServerImpl<'a> {
     iface: Interface,
     sockets: SocketSet<'a>,
     dhcp_handle: smoltcp::iface::SocketHandle,
+    /// Listening TCP socket for the demo HTTP server (port 80).
+    http_handle: smoltcp::iface::SocketHandle,
+    /// This board's MAC, for the status page.
+    mac: [u8; 6],
     /// DHCP has configured an address.
     bound: bool,
     /// The static fallback address is currently installed.
@@ -475,6 +552,8 @@ impl ServerImpl<'_> {
             }
         }
 
+        self.serve_http();
+
         let now_ms = sys_get_timer().now;
 
         // Static-IP fallback: if DHCP has not bound within the grace period and
@@ -522,6 +601,41 @@ impl ServerImpl<'_> {
                 ringbuf_entry!(Trace::RxWatchdogReset);
                 self.dev.drv.reinit(&mut SpinDelay);
             }
+        }
+    }
+
+    /// Demo HTTP server: listen on port 80 and, for any request, send a small
+    /// status page and close. A single listening socket (one connection at a
+    /// time) is plenty to exercise the TCP path end to end.
+    fn serve_http(&mut self) {
+        // Snapshot status before borrowing the socket (avoids aliasing `self`).
+        let ip = self.addr.0.0;
+        let prefix = self.addr.1;
+        let mac = self.mac;
+        let uptime_ms = sys_get_timer().now;
+        let rx = self.dev.rx_count;
+
+        let sock = self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+        if !sock.is_open() {
+            // (Re)arm the listener. Fails harmlessly while a prior connection
+            // is still winding down (TIME-WAIT); we retry on the next poll.
+            let _ = sock.listen(HTTP_PORT);
+        }
+        // A client connected and sent a request.
+        if sock.can_recv() && sock.can_send() {
+            // We serve the same page for any request; drain what arrived so the
+            // socket does not stall, without parsing the request line.
+            let _ = sock.recv(|buf| (buf.len(), ()));
+            let mut page = [0u8; 768];
+            let n = build_page(&mut page, ip, prefix, mac, uptime_ms, rx);
+            let sent = sock.send_slice(&page[..n]).unwrap_or(0);
+            // Flush the response and send FIN; the socket returns to CLOSED and
+            // is re-listened above on a later poll.
+            sock.close();
+            ringbuf_entry!(Trace::HttpServed {
+                built: n as u16,
+                sent: sent as u16,
+            });
         }
     }
 
@@ -675,19 +789,32 @@ fn main() -> ! {
     config.random_seed = 0x0060_2860_c0ff_ee00;
     let iface = Interface::new(config, &mut dev);
 
-    // Socket storage: just the DHCP client (ICMP echo needs no socket).
-    static mut SOCKET_STORAGE: [SocketStorage<'_>; 1] =
-        [SocketStorage::EMPTY; 1];
+    // Socket storage: the DHCP client + one TCP socket for the HTTP server
+    // (ICMP echo needs no socket).
+    static mut SOCKET_STORAGE: [SocketStorage<'_>; 2] =
+        [SocketStorage::EMPTY; 2];
     // SAFETY: taken exactly once here; the task is single-threaded.
     #[allow(static_mut_refs)]
     let mut sockets = SocketSet::new(unsafe { &mut SOCKET_STORAGE[..] });
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    // TCP socket for the demo HTTP server. 1 KiB RX (requests are tiny) + 1 KiB
+    // TX (the status page is ~0.5 KiB); both fit one MSS-ish segment.
+    static mut TCP_RX: [u8; 1024] = [0; 1024];
+    static mut TCP_TX: [u8; 1024] = [0; 1024];
+    #[allow(static_mut_refs)]
+    let http_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
+    ));
 
     let mut server = ServerImpl {
         dev,
         iface,
         sockets,
         dhcp_handle,
+        http_handle,
+        mac,
         bound: false,
         static_active: false,
         addr: (Ipv4Address::UNSPECIFIED, 0),
