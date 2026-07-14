@@ -21,6 +21,7 @@ smoltcp = { workspace = true, features = ["proto-ipv4", "socket-dhcpv4"] }
 w5500 = { path = "../../lib/w5500" }
 ringbuf = { path = "../../lib/ringbuf" }
 task-rp235x-net-api = { path = "../rp235x-net-api" }
+drv-rp235x-flash-api = { path = "../../drv/rp235x-flash-api" }
 drv-rp235x-sys-api = { path = "../../drv/rp235x-sys-api" }
 userlib = { path = "../../sys/userlib" }
 

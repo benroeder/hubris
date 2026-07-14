@@ -39,9 +39,11 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use userlib::{RecvMessage, sys_get_timer, sys_set_timer, task_slot};
 
+use drv_rp235x_flash_api::Rp235xFlash;
 use ringbuf::{ringbuf, ringbuf_entry};
 
 task_slot!(SYS, sys);
+task_slot!(FLASH, flash);
 
 /// Traffic trace, read with `humility ringbuf`. `Rx`/`Tx` carry the ethernet
 /// EtherType (0x0806 = ARP, 0x0800 = IPv4) and frame length so we can see
@@ -74,6 +76,8 @@ enum Trace {
     },
     /// W5500 VERSIONR at bring-up (expect 0x04).
     Version(u8),
+    /// The per-board MAC derived from the flash unique ID (or the fallback).
+    Mac([u8; 6]),
     /// The RX watchdog fired: link up but no frames received for the timeout,
     /// so the chip was hardware-reset and reinitialised.
     RxWatchdogReset,
@@ -119,9 +123,25 @@ const DSS_8BIT: u8 = 0x7;
 /// Bound on FIFO-status spins so a dead SPI cannot wedge the server.
 const SPIN_LIMIT: u32 = 1_000_000;
 
-/// Locally-administered MAC address (bit 1 of the first octet set). Fixed for
-/// bring-up; deriving from the chip's unique ID is a follow-up.
-const MAC_ADDR: [u8; 6] = [0x02, 0xC0, 0xFF, 0xEE, 0x28, 0x61];
+/// Fallback locally-administered MAC (bit 1 of the first octet set), used only
+/// if the flash unique-ID read returns nothing. `derive_mac()` normally
+/// replaces it with a per-board address so two boards never share a MAC.
+const MAC_FALLBACK: [u8; 6] = [0x02, 0xC0, 0xFF, 0xEE, 0x28, 0x61];
+
+/// Derive a stable, per-board locally-administered MAC from the QSPI flash
+/// chip's 64-bit factory-unique ID (read via the flash driver, which owns QMI;
+/// the ROM chip-ID call is privilege-gated and faults from an unprivileged
+/// task). The low five octets are the low bytes of the ID; the first octet is
+/// fixed to 0x02 (locally administered, unicast). Falls back to
+/// [`MAC_FALLBACK`] only if the ID reads as zero.
+fn derive_mac() -> [u8; 6] {
+    let id = Rp235xFlash::from(FLASH.get_task_id()).unique_id();
+    if id == 0 {
+        return MAC_FALLBACK;
+    }
+    let b = id.to_le_bytes();
+    [0x02, b[0], b[1], b[2], b[3], b[4]]
+}
 
 /// Static-IP fallback: if DHCP does not bind within `STATIC_FALLBACK_MS` of
 /// boot, self-assign this address so the board is still reachable on networks
@@ -634,7 +654,11 @@ fn main() -> ! {
         spi: p.SPI0,
         sio: p.SIO,
     };
-    let drv = w5500::W5500::new(spi, Some(RstPin), &mut SpinDelay, MAC_ADDR);
+    // Per-board MAC from the flash chip's unique ID (both the W5500 SHAR and
+    // smoltcp must agree on it).
+    let mac = derive_mac();
+    ringbuf_entry!(Trace::Mac(mac));
+    let drv = w5500::W5500::new(spi, Some(RstPin), &mut SpinDelay, mac);
 
     let mut dev = EthDevice {
         drv,
@@ -647,7 +671,7 @@ fn main() -> ! {
     ringbuf_entry!(Trace::Version(dev.drv.version()));
 
     let mut config = Config::new();
-    config.hardware_addr = Some(EthernetAddress(MAC_ADDR).into());
+    config.hardware_addr = Some(EthernetAddress(mac).into());
     config.random_seed = 0x0060_2860_c0ff_ee00;
     let iface = Interface::new(config, &mut dev);
 

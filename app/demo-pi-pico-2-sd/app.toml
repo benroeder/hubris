@@ -70,7 +70,10 @@ max-sizes = {flash = 131072, ram = 49152}
 stacksize = 24576
 uses = ["spi0", "io_bank0", "pads_bank0", "sio"]
 start = true
-task-slots = ["sys"]
+# flash_driver: read the QSPI chip's unique ID once at startup to derive a
+# stable per-board MAC (it owns QMI; ROM funcs are privilege-gated so the net
+# task cannot read the chip ID itself).
+task-slots = ["sys", {flash = "flash_driver"}]
 notifications = ["timer"]
 
 [tasks.i2c_driver]

@@ -7206,6 +7206,7 @@ version = "0.1.0"
 dependencies = [
  "build-util",
  "cortex-m",
+ "drv-rp235x-flash-api",
  "drv-rp235x-sys-api",
  "embedded-hal 1.0.0",
  "idol",
