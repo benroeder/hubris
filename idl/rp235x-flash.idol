@@ -22,6 +22,12 @@ Interface(
             reply: Simple("u32"),
             idempotent: true,
         ),
+        "unique_id": (
+            description: "Read the QSPI flash chip's 64-bit factory-unique ID (command 4Bh). Per-board unique; used to derive stable MAC addresses etc.",
+            args: {},
+            reply: Simple("u64"),
+            idempotent: true,
+        ),
         "erase": (
             description: "Erase one 4 KiB sector at `offset` (must be sector-aligned).",
             args: { "offset": "u32" },

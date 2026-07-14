@@ -1,0 +1,17 @@
+// RP235x minimal network task (W5500 MACRAW + smoltcp) IPC interface.
+Interface(
+    name: "Rp235xNet",
+    ops: {
+        // Packed status word:
+        //   bit 63    = ethernet link up
+        //   bit 62    = DHCP bound (IPv4 configured)
+        //   bit 61    = static-IP fallback active (IPv4 configured, no lease)
+        //   bits 39:32 = IPv4 prefix length
+        //   bits 31:0  = IPv4 address (big-endian octets, a.b.c.d = a<<24|..)
+        "status": (
+            args: {},
+            reply: Simple("u64"),
+            idempotent: true,
+        ),
+    },
+)

@@ -7,7 +7,7 @@ stacksize = 944
 
 [kernel]
 name = "demo-pi-pico-2-sd"
-requires = {flash = 32768, ram = 16384}
+requires = {flash = 32768, ram = 12288}
 stacksize = 8192
 
 [tasks.jefe]
@@ -55,14 +55,26 @@ start = true
 notifications = ["uart-irq"]
 interrupts = {"uart0.irq" = "uart-irq"}
 
-[tasks.spi_driver]
-name = "drv-rp235x-spi"
-priority = 2
-max-sizes = {flash = 8192, ram = 2048}
-stacksize = 1024
-uses = ["spi0"]
+# Ethernet: W5500 (MACRAW) on SPI0 (owned directly, sdcard-style) + smoltcp + DHCP.
+# Replaces the generic spi_driver in this image -- both would own SPI0.
+[tasks.net]
+name = "task-rp235x-net"
+# Priority 4: BELOW usb (3) so the constant poll cadence cannot preempt the
+# console's TX path (a same-priority net task exposed a usb TX corruption
+# race), and above the shell (5), which calls us.
+priority = 4
+max-sizes = {flash = 131072, ram = 49152}
+# 24 KiB stack: smoltcp's poll + DHCP fit comfortably, and trimming from 32 KiB
+# frees pool headroom (this image runs the SRAM at ~99%; the audio task needs
+# every spare byte).
+stacksize = 24576
+uses = ["spi0", "io_bank0", "pads_bank0", "sio"]
 start = true
-task-slots = ["sys"]
+# flash_driver: read the QSPI chip's unique ID once at startup to derive a
+# stable per-board MAC (it owns QMI; ROM funcs are privilege-gated so the net
+# task cannot read the chip ID itself).
+task-slots = ["sys", {flash = "flash_driver"}]
+notifications = ["timer"]
 
 [tasks.i2c_driver]
 name = "drv-rp235x-i2c"
@@ -87,7 +99,7 @@ task-slots = ["sys"]
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
 priority = 3
-max-sizes = {flash = 65536, ram = 229376}
+max-sizes = {flash = 65536, ram = 204800}
 stacksize = 163840
 uses = ["pwm", "dma", "adc"]
 start = true
@@ -127,25 +139,16 @@ start = true
 
 [tasks.shell]
 name = "task-rp235x-shell"
-priority = 4
+priority = 5
 max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
-features = ["sdcard", "fat", "ds1302"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302"]
-
-[tasks.hiffy]
-name = "task-hiffy"
-priority = 4
-max-sizes = {flash = 32768, ram = 32768}
-stacksize = 2048
-start = true
-features = ["micro"]
-notifications = ["timer"]
+features = ["sdcard", "fat", "ds1302", "eth"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "net"]
 
 [tasks.idle]
 name = "task-idle"
-priority = 5
+priority = 6
 max-sizes = {flash = 128, ram = 256}
 stacksize = 256
 start = true

@@ -1,0 +1,24 @@
+# Minimal WIZnet W5500 driver, operated in MACRAW mode: the hardware TCP/IP
+# stack is bypassed and socket 0 carries raw Ethernet frames, so smoltcp runs
+# the stack on top exactly as it would over a plain MAC+PHY (e.g. the ENC28J60).
+# Self-contained (no external W5500 crate) so it can be reviewed and pinned like
+# the rest of the RP2350 port; register/MACRAW details follow the WIZnet W5500
+# datasheet (v1.1.0) and ioLibrary_Driver.
+[package]
+name = "w5500"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Written against embedded-hal 1.0 (SpiDevice / OutputPin / DelayNs), matching
+# the net task's PL022 SpiDevice shim.
+embedded-hal = { version = "1.0", default-features = false }
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

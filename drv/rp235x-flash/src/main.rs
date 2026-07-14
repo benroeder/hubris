@@ -227,6 +227,20 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         ) as u32)
     }
 
+    fn unique_id(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u64, RequestError<core::convert::Infallible>> {
+        // Read Unique ID (4Bh): opcode + 4 dummy bytes (32 dummy clocks), then
+        // clock in the 64-bit factory-unique ID present on W25Q-class parts.
+        // A pure read that changes no chip state; direct mode is safe here
+        // because the whole image runs from SRAM (see `Direct`).
+        let d = Direct::new(&self.qmi);
+        let mut id = [0u8; 8];
+        d.transact(&[0x4B, 0x00, 0x00, 0x00, 0x00], &mut id);
+        Ok(u64::from_be_bytes(id))
+    }
+
     fn reboot(
         &mut self,
         _: &RecvMessage,
@@ -269,7 +283,7 @@ impl idl::InOrderRp235xFlashImpl for ServerImpl {
         // failure is visible at the shell instead of a silent no-op.
         userlib::hl::sleep_for(10);
         let stuck_time = wd.ctrl().read().time().bits();
-        Ok(0x8000_0000 | stuck_time as u32)
+        Ok(0x8000_0000 | stuck_time)
     }
 }
 

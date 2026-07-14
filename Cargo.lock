@@ -7201,6 +7201,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-rp235x-net"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cortex-m",
+ "drv-rp235x-flash-api",
+ "drv-rp235x-sys-api",
+ "embedded-hal 1.0.0",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "ringbuf",
+ "rp235x-pac",
+ "smoltcp",
+ "task-rp235x-net-api",
+ "userlib",
+ "w5500",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "task-rp235x-net-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "idol",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "task-rp235x-shell"
 version = "0.1.0"
 dependencies = [
@@ -7218,6 +7252,7 @@ dependencies = [
  "drv-rp235x-uart-api",
  "drv-rp235x-ws2812-api",
  "embedded-sdmmc",
+ "task-rp235x-net-api",
  "task-rp235x-usb-api",
  "userlib",
 ]
@@ -8194,6 +8229,13 @@ dependencies = [
  "vsc7448-pac",
  "zerocopy 0.8.27",
  "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "w5500"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]

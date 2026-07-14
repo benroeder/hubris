@@ -117,7 +117,7 @@ priority = 4
 max-sizes = {flash = 40960, ram = 4096}
 stacksize = 2048
 start = true
-features = ["mailbox"]
+features = ["spibus", "mailbox"]
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "mailbox_driver"]
 
 [tasks.hiffy]

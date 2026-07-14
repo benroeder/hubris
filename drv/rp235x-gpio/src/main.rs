@@ -57,9 +57,13 @@ impl idl::InOrderRp235xGpioImpl for ServerImpl {
     ) -> Result<(), RequestError<GpioError>> {
         let p = Self::check(pin)?;
         // Enable the output driver (OD=0) and clear the RP2350 isolation latch.
+        // Also enable the input buffer (IE=1): unlike the RP2040, RP2350 pads
+        // reset with IE=0, so without it an output pin DRIVES correctly but
+        // `read` always returns 0 -- making read-back verification of outputs
+        // silently useless (bit us during ENC28J60 bring-up).
         self.pads_bank0
             .gpio(p)
-            .modify(|_, w| w.od().clear_bit().iso().clear_bit());
+            .modify(|_, w| w.od().clear_bit().ie().set_bit().iso().clear_bit());
         self.funcsel_sio(p);
         self.sio
             .gpio_oe_set()
