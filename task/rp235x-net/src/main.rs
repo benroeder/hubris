@@ -124,7 +124,14 @@ const FLASH_PAGE: u32 = 256;
 const PART_A: u32 = 0x0000_2000;
 const PART_B: u32 = 0x0004_2000;
 /// IMAGE_DEF version word offset within a slot (block @0x160, version item +0x24).
+/// This is the RP2350 boot-ROM version (picks which slot boots).
 const VER_OFF: u32 = 0x160 + 0x24;
+/// Hubris `abi::ImageHeader` offset within a slot (the `.header` section, placed
+/// right after the vector table). magic @+0, `total_image_len` @+4. Distinct
+/// from the IMAGE_DEF version above -- this gives the installed image's size.
+const HDR_OFF: u32 = 0x110;
+/// `abi::HEADER_MAGIC` (0x64_CE_D6_CA), validating the slot holds a real image.
+const HDR_MAGIC: u32 = 0x64CE_D6CA;
 
 /// Streaming CRC-32 (IEEE, reflected) update -- table-less to save the 1 KiB
 /// lookup; the image is CRC'd once so speed is irrelevant.
@@ -139,32 +146,98 @@ fn crc32(mut crc: u32, bytes: &[u8]) -> u32 {
     crc
 }
 
-/// Pick the A/B slot to write: the stale (lower-version) partition, or 0 (write
-/// in place) if there is no A/B partition table. Reads the table + both slots'
-/// version words via the flash driver -- same rule as the shell's updater.
+/// Pick the A/B slot the next update writes: the stale (lower effective
+/// version) partition, or 0 (write in place) if there is no A/B partition table.
+/// Thin wrapper over `read_slots` so the updater and the status page agree.
 fn update_target_base(flash: &Rp235xFlash) -> u32 {
-    let mut hdr = [0u8; 8];
-    if flash.read(0, &mut hdr).unwrap_or(0) < 8 {
-        return 0;
-    }
-    let marker = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    // hdr[4] is the first block item's type byte (0x0a = PARTITION_TABLE).
-    if marker != 0xffff_ded3 || hdr[4] != 0x0a {
-        return 0; // no A/B table: single image, write slot 0 in place
-    }
-    let ver = |part: u32| -> u32 {
-        let mut v = [0u8; 4];
-        if flash.read(part + VER_OFF, &mut v).unwrap_or(0) < 4 {
-            0
-        } else {
-            u32::from_le_bytes(v)
-        }
+    read_slots(flash).target
+}
+
+/// Size of each A/B image slot (partition), from ab-partitions.json.
+const SLOT_SIZE: u32 = 256 * 1024;
+
+/// A/B slot status for the web UI.
+#[derive(Copy, Clone)]
+struct Slots {
+    /// Raw IMAGE_DEF version word of slot A / B (0xffff_ffff if erased, 0 if the
+    /// flash read failed). See `boot_version` for the value used to rank slots.
+    ver_a: u32,
+    ver_b: u32,
+    /// Installed image length (bytes) in slot A / B, 0 if the slot holds no
+    /// valid image (bad/erased `ImageHeader` magic).
+    size_a: u32,
+    size_b: u32,
+    /// An A/B partition table is present (else this is a single-image board).
+    ab: bool,
+    /// Flash base the next update writes (the stale slot, or 0 in place).
+    target: u32,
+}
+
+/// Read one slot's IMAGE_DEF version word and installed image size via the flash
+/// driver. Size comes from the Hubris `ImageHeader`; 0 if its magic is invalid.
+fn read_slot(flash: &Rp235xFlash, part: u32) -> (u32, u32) {
+    let mut v = [0u8; 4];
+    let ver = if flash.read(part + VER_OFF, &mut v).unwrap_or(0) >= 4 {
+        u32::from_le_bytes(v)
+    } else {
+        0
     };
-    // Write the stale slot; ties go to A. The ROM boots the higher version.
-    if ver(PART_A) <= ver(PART_B) {
+    let mut hdr = [0u8; 8];
+    let size = if flash.read(part + HDR_OFF, &mut hdr).unwrap_or(0) >= 8
+        && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == HDR_MAGIC
+    {
+        u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]])
+    } else {
+        0
+    };
+    (ver, size)
+}
+
+/// Boot rank of a slot as `(valid, version)`, higher = preferred by the ROM.
+/// Validity is the PRIMARY key: a slot with no valid `ImageHeader` magic
+/// (`size == 0`) or an erased version word is not bootable, so ANY valid slot
+/// outranks it regardless of version -- even a legitimate v0.0 image. Version
+/// only tie-breaks among valid slots. Folding validity into a magic version 0
+/// (an earlier attempt) conflated a valid v0.0 image with an erased slot and
+/// could still target the only bootable image. Without this ranking, erased
+/// flash reads 0xffff_ffff and sorts as the *newest* image -- flipping the
+/// "active" slot and, worse, making the updater target the running slot instead
+/// of the stale one (breaking the unbrickable guarantee, e.g. after a
+/// power-interrupted update erases a slot's first sector). Note: a fully-erased
+/// or first-sector-erased slot is caught here; a half-written image whose header
+/// survived but whose body is truncated is not (the boot ROM rejects it via its
+/// own hash check and falls back).
+fn slot_rank(ver: u32, size: u32) -> (bool, u32) {
+    let valid = size != 0 && ver != 0xffff_ffff;
+    (valid, if valid { ver } else { 0 })
+}
+
+/// Read both A/B slots (version + size), the partition-table presence, and the
+/// stale slot the next update writes -- one flash pass, shared by the updater
+/// (`update_target_base`) and the status page.
+fn read_slots(flash: &Rp235xFlash) -> Slots {
+    let mut hdr = [0u8; 8];
+    let ab = flash.read(0, &mut hdr).unwrap_or(0) >= 8
+        && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == 0xffff_ded3
+        && hdr[4] == 0x0a;
+    let (ver_a, size_a) = read_slot(flash, PART_A);
+    let (ver_b, size_b) = read_slot(flash, PART_B);
+    // Write the stale (lower-ranked) slot; ties go to A. The ROM boots the
+    // higher-ranked slot -- a valid image always outranks an erased peer.
+    let target = if !ab {
+        0 // no A/B table: single image, write slot 0 in place
+    } else if slot_rank(ver_a, size_a) <= slot_rank(ver_b, size_b) {
         PART_A
     } else {
         PART_B
+    };
+    Slots {
+        ver_a,
+        ver_b,
+        size_a,
+        size_b,
+        ab,
+        target,
     }
 }
 
@@ -234,9 +307,45 @@ impl core::fmt::Write for SliceWriter<'_> {
     }
 }
 
+/// Write one A/B slot's table row: `Slot X (0xNNNNN) | version | size/free |
+/// active?`. `size` is the installed image length (0 = empty slot).
+fn write_slot_row(
+    w: &mut SliceWriter<'_>,
+    letter: char,
+    part: u32,
+    ver: u32,
+    size: u32,
+    active: bool,
+) {
+    use core::fmt::Write;
+    let cap = SLOT_SIZE;
+    let _ = write!(w, "<tr><td>Slot {} (0x{:05x})</td><td>", letter, part);
+    // Version word `major.minor`, or `empty` for a blank/erased slot.
+    if ver == 0 || ver == 0xffff_ffff {
+        let _ = write!(w, "empty");
+    } else {
+        let _ = write!(w, "{}.{}", ver >> 16, ver & 0xffff);
+    }
+    let _ = write!(w, "</td><td>");
+    if size == 0 || size > cap {
+        let _ = write!(w, "&mdash;");
+    } else {
+        let _ = write!(
+            w,
+            "{} KiB used, {} KiB free",
+            size / 1024,
+            (cap - size) / 1024,
+        );
+    }
+    let _ = write!(
+        w,
+        "</td><td>{}</td></tr>",
+        if active { "&larr; active" } else { "" },
+    );
+}
+
 /// Format the demo status page (HTTP/1.0 response + minimal HTML) into `buf`,
-/// returning the byte length written. Served for any request.
-#[allow(clippy::too_many_arguments)]
+/// returning the byte length written. Served for any GET request.
 fn build_page(
     buf: &mut [u8],
     ip: [u8; 4],
@@ -244,6 +353,7 @@ fn build_page(
     mac: [u8; 6],
     uptime_ms: u64,
     rx: u32,
+    slots: &Slots,
 ) -> usize {
     use core::fmt::Write;
     let mut w = SliceWriter { buf, pos: 0 };
@@ -264,16 +374,7 @@ fn build_page(
          <tr><td>MAC</td><td>{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}</td></tr>\
          <tr><td>Uptime</td><td>{} s</td></tr>\
          <tr><td>RX frames</td><td>{}</td></tr>\
-         </table>\
-         <h2>Firmware update (A/B)</h2>\
-         <form id=f><input type=file id=u required> \
-         <button>Upload &amp; reboot</button></form><pre id=o></pre>\
-         <script>f.onsubmit=async e=>{{e.preventDefault();\
-         o.textContent='uploading...';\
-         let d=await u.files[0].arrayBuffer();\
-         let r=await fetch('/update',{{method:'POST',body:d}});\
-         o.textContent=await r.text();}}</script>\
-         </body></html>",
+         </table>",
         ip[0],
         ip[1],
         ip[2],
@@ -287,6 +388,48 @@ fn build_page(
         mac[5],
         uptime_ms / 1000,
         rx,
+    );
+
+    if slots.ab {
+        // The bootrom runs the higher-versioned slot; `target` is the stale
+        // slot the next update writes, so the *other* slot is active.
+        let active_a = slots.target == PART_B;
+        let target_letter = if slots.target == PART_A { 'A' } else { 'B' };
+        let _ = write!(
+            w,
+            "<h2>A/B image slots</h2><table>\
+             <tr><th>Slot</th><th>Version</th><th>Image</th><th></th></tr>",
+        );
+        write_slot_row(&mut w, 'A', PART_A, slots.ver_a, slots.size_a, active_a);
+        write_slot_row(&mut w, 'B', PART_B, slots.ver_b, slots.size_b, !active_a);
+        let _ = write!(
+            w,
+            "</table>\
+             <p>Next update writes <b>slot {}</b> (the stale one). \
+             Slot capacity {} KiB.</p>",
+            target_letter,
+            SLOT_SIZE / 1024,
+        );
+    } else {
+        let _ = write!(
+            w,
+            "<h2>Firmware</h2>\
+             <p>Single-image board (no A/B partition table).</p>",
+        );
+    }
+
+    let _ = write!(
+        w,
+        "<h2>Firmware update (A/B)</h2>\
+         <p>Uploads the stale slot, then reboots into it (unbrickable).</p>\
+         <form id=f><input type=file id=u required> \
+         <button>Upload &amp; reboot</button></form><pre id=o></pre>\
+         <script>f.onsubmit=async e=>{{e.preventDefault();\
+         o.textContent='uploading...';\
+         let d=await u.files[0].arrayBuffer();\
+         let r=await fetch('/update',{{method:'POST',body:d}});\
+         o.textContent=await r.text();}}</script>\
+         </body></html>",
     );
     w.pos
 }
@@ -824,8 +967,10 @@ impl ServerImpl<'_> {
                 let mac = self.mac;
                 let up = sys_get_timer().now;
                 let rx = self.dev.rx_count;
-                let mut buf = [0u8; 1024];
-                let n = build_page(&mut buf, ip, prefix, mac, up, rx);
+                let slots = read_slots(&Rp235xFlash::from(FLASH.get_task_id()));
+                // Sized to the TCP TX buffer so the full page never truncates.
+                let mut buf = [0u8; 2048];
+                let n = build_page(&mut buf, ip, prefix, mac, up, rx, &slots);
                 let sock =
                     self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
                 let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
@@ -1123,10 +1268,10 @@ fn main() -> ! {
     let mut sockets = SocketSet::new(unsafe { &mut SOCKET_STORAGE[..] });
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
-    // TCP socket for the demo HTTP server. 1 KiB RX (requests are tiny) + 1 KiB
-    // TX (the status page is ~0.5 KiB); both fit one MSS-ish segment.
+    // TCP socket for the demo HTTP server. 1 KiB RX (requests are tiny) + 2 KiB
+    // TX (the status page + A/B slot table runs ~1 KiB, over one MSS).
     static mut TCP_RX: [u8; 1024] = [0; 1024];
-    static mut TCP_TX: [u8; 1024] = [0; 1024];
+    static mut TCP_TX: [u8; 2048] = [0; 2048];
     #[allow(static_mut_refs)]
     let http_handle = sockets.add(tcp::Socket::new(
         tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
