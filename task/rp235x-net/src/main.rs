@@ -83,6 +83,16 @@ enum Trace {
         built: u16,
         sent: u16,
     },
+    /// A firmware upload started: target flash `base`, total `size` bytes.
+    UpdateBegin {
+        base: u32,
+        size: u32,
+    },
+    /// A firmware upload finished: `wrote` bytes, computed `crc`.
+    UpdateDone {
+        crc: u32,
+        wrote: u32,
+    },
     /// The RX watchdog fired: link up but no frames received for the timeout,
     /// so the chip was hardware-reset and reinitialised.
     RxWatchdogReset,
@@ -101,6 +111,111 @@ fn ethertype(frame: &[u8]) -> u16 {
 
 /// TCP port the built-in demo HTTP server listens on.
 const HTTP_PORT: u16 = 80;
+
+/// Flash erase (sector) and program (page) granularity, matching the driver.
+const FLASH_SECTOR: u32 = 4096;
+const FLASH_PAGE: u32 = 256;
+
+// A/B partition layout (matches chips/rp235x/ab-partitions.json): the partition
+// table sits at flash 0, slot A at 0x2000, slot B at 0x42000. An `update` writes
+// the lower-version (inactive) slot; the boot ROM boots the higher-version slot,
+// leaving the running image as the fallback -- so a bad/interrupted update never
+// bricks the board.
+const PART_A: u32 = 0x0000_2000;
+const PART_B: u32 = 0x0004_2000;
+/// IMAGE_DEF version word offset within a slot (block @0x160, version item +0x24).
+const VER_OFF: u32 = 0x160 + 0x24;
+
+/// Streaming CRC-32 (IEEE, reflected) update -- table-less to save the 1 KiB
+/// lookup; the image is CRC'd once so speed is irrelevant.
+fn crc32(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc
+}
+
+/// Pick the A/B slot to write: the stale (lower-version) partition, or 0 (write
+/// in place) if there is no A/B partition table. Reads the table + both slots'
+/// version words via the flash driver -- same rule as the shell's updater.
+fn update_target_base(flash: &Rp235xFlash) -> u32 {
+    let mut hdr = [0u8; 8];
+    if flash.read(0, &mut hdr).unwrap_or(0) < 8 {
+        return 0;
+    }
+    let marker = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    // hdr[4] is the first block item's type byte (0x0a = PARTITION_TABLE).
+    if marker != 0xffff_ded3 || hdr[4] != 0x0a {
+        return 0; // no A/B table: single image, write slot 0 in place
+    }
+    let ver = |part: u32| -> u32 {
+        let mut v = [0u8; 4];
+        if flash.read(part + VER_OFF, &mut v).unwrap_or(0) < 4 {
+            0
+        } else {
+            u32::from_le_bytes(v)
+        }
+    };
+    // Write the stale slot; ties go to A. The ROM boots the higher version.
+    if ver(PART_A) <= ver(PART_B) {
+        PART_A
+    } else {
+        PART_B
+    }
+}
+
+/// State of the streaming firmware upload (`POST /update`).
+#[derive(Copy, Clone, PartialEq)]
+enum Update {
+    /// Not updating; the HTTP server is idle / serving GETs.
+    Idle,
+    /// Streaming the image to flash slot `base`: `size` total bytes, `off` fully
+    /// programmed so far, `crc` the running CRC-32, `plen` bytes staged in the
+    /// current (not-yet-programmed) page.
+    Recv {
+        base: u32,
+        size: u32,
+        off: u32,
+        crc: u32,
+        plen: u16,
+    },
+    /// Response sent; reboot once the kernel clock passes `at` (lets the reply
+    /// flush and the socket close before the chip resets).
+    Reboot { at: u64 },
+}
+
+/// Index just past the `\r\n\r\n` that ends the HTTP request headers, or None.
+fn headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Parse the decimal `Content-Length` header value (case-insensitive), or 0.
+fn content_length(headers: &[u8]) -> u32 {
+    let name = b"content-length:";
+    for line in headers.split(|&b| b == b'\n') {
+        if line.len() >= name.len()
+            && line[..name.len()]
+                .iter()
+                .zip(name)
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        {
+            let mut v = 0u32;
+            for &c in &line[name.len()..] {
+                if c.is_ascii_digit() {
+                    v = v.wrapping_mul(10) + (c - b'0') as u32;
+                } else if c != b' ' {
+                    break;
+                }
+            }
+            return v;
+        }
+    }
+    0
+}
 
 /// A `core::fmt::Write` sink over a byte slice, truncating at the end (never
 /// panics on overflow). Used to format the HTTP response without an allocator.
@@ -149,7 +264,16 @@ fn build_page(
          <tr><td>MAC</td><td>{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}</td></tr>\
          <tr><td>Uptime</td><td>{} s</td></tr>\
          <tr><td>RX frames</td><td>{}</td></tr>\
-         </table></body></html>",
+         </table>\
+         <h2>Firmware update (A/B)</h2>\
+         <form id=f><input type=file id=u required> \
+         <button>Upload &amp; reboot</button></form><pre id=o></pre>\
+         <script>f.onsubmit=async e=>{{e.preventDefault();\
+         o.textContent='uploading...';\
+         let d=await u.files[0].arrayBuffer();\
+         let r=await fetch('/update',{{method:'POST',body:d}});\
+         o.textContent=await r.text();}}</script>\
+         </body></html>",
         ip[0],
         ip[1],
         ip[2],
@@ -163,6 +287,20 @@ fn build_page(
         mac[5],
         uptime_ms / 1000,
         rx,
+    );
+    w.pos
+}
+
+/// Format the plain-text `POST /update` acknowledgement into `buf`.
+fn build_update_ok(buf: &mut [u8], size: u32, crc: u32, base: u32) -> usize {
+    use core::fmt::Write;
+    let mut w = SliceWriter { buf, pos: 0 };
+    let _ = write!(
+        w,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
+         Connection: close\r\n\r\n\
+         wrote {} bytes to slot 0x{:x}, crc32={:08x}\nrebooting into it...\n",
+        size, base, crc
     );
     w.pos
 }
@@ -483,6 +621,10 @@ struct ServerImpl<'a> {
     http_handle: smoltcp::iface::SocketHandle,
     /// This board's MAC, for the status page.
     mac: [u8; 6],
+    /// Firmware-upload (`POST /update`) state machine.
+    update: Update,
+    /// Partial-page staging buffer for firmware writes (one flash page).
+    page: [u8; FLASH_PAGE as usize],
     /// DHCP has configured an address.
     bound: bool,
     /// The static fallback address is currently installed.
@@ -604,39 +746,222 @@ impl ServerImpl<'_> {
         }
     }
 
-    /// Demo HTTP server: listen on port 80 and, for any request, send a small
-    /// status page and close. A single listening socket (one connection at a
-    /// time) is plenty to exercise the TCP path end to end.
+    /// Demo HTTP server: `GET /` returns a status page with a firmware-upload
+    /// form; `POST /update` streams a new image into the inactive A/B slot and
+    /// reboots into it (the boot ROM boots the higher-version slot, leaving the
+    /// running image as an unbrickable fallback).
     fn serve_http(&mut self) {
-        // Snapshot status before borrowing the socket (avoids aliasing `self`).
-        let ip = self.addr.0.0;
-        let prefix = self.addr.1;
-        let mac = self.mac;
-        let uptime_ms = sys_get_timer().now;
-        let rx = self.dev.rx_count;
+        // Deferred reboot after a completed update: fire once the reply has had
+        // a moment to flush and the socket to close.
+        if let Update::Reboot { at } = self.update {
+            if sys_get_timer().now >= at {
+                let _ = Rp235xFlash::from(FLASH.get_task_id()).reboot(0);
+            }
+            return;
+        }
+        // Arm the listener if the socket is idle.
+        {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if !sock.is_open() {
+                let _ = sock.listen(HTTP_PORT);
+                self.update = Update::Idle;
+                return;
+            }
+        }
+        match self.update {
+            Update::Idle => self.http_idle(),
+            Update::Recv { .. } => self.http_recv(),
+            Update::Reboot { .. } => {}
+        }
+    }
 
-        let sock = self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
-        if !sock.is_open() {
-            // (Re)arm the listener. Fails harmlessly while a prior connection
-            // is still winding down (TIME-WAIT); we retry on the next poll.
-            let _ = sock.listen(HTTP_PORT);
+    /// Idle HTTP state: dispatch the incoming request (GET status vs POST
+    /// /update). Consumes nothing until the full request headers have arrived.
+    fn http_idle(&mut self) {
+        enum Action {
+            None,
+            Get,
+            Post(u32),
+            Bad,
         }
-        // A client connected and sent a request.
-        if sock.can_recv() && sock.can_send() {
-            // We serve the same page for any request; drain what arrived so the
-            // socket does not stall, without parsing the request line.
-            let _ = sock.recv(|buf| (buf.len(), ()));
-            let mut page = [0u8; 768];
-            let n = build_page(&mut page, ip, prefix, mac, uptime_ms, rx);
-            let sent = sock.send_slice(&page[..n]).unwrap_or(0);
-            // Flush the response and send FIN; the socket returns to CLOSED and
-            // is re-listened above on a later poll.
+        // Body bytes that arrive in the same segment as the POST headers.
+        let mut first = [0u8; 512];
+        let mut firstlen = 0usize;
+        let action = {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if !(sock.can_recv() && sock.can_send()) {
+                return;
+            }
+            sock.recv(|buf| {
+                if buf.starts_with(b"GET ") {
+                    (buf.len(), Action::Get)
+                } else if buf.starts_with(b"POST /update") {
+                    match headers_end(buf) {
+                        None => (0, Action::None), // wait for the rest
+                        Some(h) => {
+                            let size = content_length(&buf[..h]);
+                            let body = &buf[h..];
+                            let n = body.len().min(first.len());
+                            first[..n].copy_from_slice(&body[..n]);
+                            firstlen = n;
+                            (h + n, Action::Post(size))
+                        }
+                    }
+                } else if buf.len() >= 5 {
+                    (buf.len(), Action::Bad)
+                } else {
+                    (0, Action::None)
+                }
+            })
+            .unwrap_or(Action::None)
+        };
+        match action {
+            Action::Get => {
+                let ip = self.addr.0.0;
+                let prefix = self.addr.1;
+                let mac = self.mac;
+                let up = sys_get_timer().now;
+                let rx = self.dev.rx_count;
+                let mut buf = [0u8; 1024];
+                let n = build_page(&mut buf, ip, prefix, mac, up, rx);
+                let sock =
+                    self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+                let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
+                sock.close();
+                ringbuf_entry!(Trace::HttpServed {
+                    built: n as u16,
+                    sent: sent as u16,
+                });
+            }
+            Action::Post(size) => {
+                let base =
+                    update_target_base(&Rp235xFlash::from(FLASH.get_task_id()));
+                ringbuf_entry!(Trace::UpdateBegin { base, size });
+                self.update = Update::Recv {
+                    base,
+                    size,
+                    off: 0,
+                    crc: 0xFFFF_FFFF,
+                    plen: 0,
+                };
+                self.feed_update(&first[..firstlen]);
+                self.finish_update_if_done();
+            }
+            Action::Bad => {
+                self.sockets
+                    .get_mut::<tcp::Socket<'_>>(self.http_handle)
+                    .close();
+            }
+            Action::None => {}
+        }
+    }
+
+    /// Streaming HTTP state: pull more of the firmware body and write it.
+    fn http_recv(&mut self) {
+        let mut stage = [0u8; 512];
+        let got = {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            if sock.can_recv() {
+                sock.recv(|buf| {
+                    let n = buf.len().min(stage.len());
+                    stage[..n].copy_from_slice(&buf[..n]);
+                    (n, n)
+                })
+                .unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        if got > 0 {
+            self.feed_update(&stage[..got]);
+        }
+        self.finish_update_if_done();
+    }
+
+    /// Stream `bytes` of the firmware into the target flash slot: accumulate a
+    /// page, erase each new sector, program each full page (and the final
+    /// partial page once the whole image has arrived), CRC as we go.
+    fn feed_update(&mut self, bytes: &[u8]) {
+        let Update::Recv {
+            base,
+            size,
+            mut off,
+            mut crc,
+            mut plen,
+        } = self.update
+        else {
+            return;
+        };
+        let flash = Rp235xFlash::from(FLASH.get_task_id());
+        for &b in bytes {
+            if off + plen as u32 >= size {
+                break; // ignore anything past Content-Length
+            }
+            self.page[plen as usize] = b;
+            plen += 1;
+            if plen as u32 == FLASH_PAGE {
+                if off.is_multiple_of(FLASH_SECTOR) {
+                    let _ = flash.erase(base + off);
+                }
+                let _ = flash.program(base + off, &self.page);
+                crc = crc32(crc, &self.page);
+                off += FLASH_PAGE;
+                plen = 0;
+            }
+        }
+        if off + plen as u32 >= size && plen > 0 {
+            if off.is_multiple_of(FLASH_SECTOR) {
+                let _ = flash.erase(base + off);
+            }
+            let _ = flash.program(base + off, &self.page[..plen as usize]);
+            crc = crc32(crc, &self.page[..plen as usize]);
+            off += plen as u32;
+            plen = 0;
+        }
+        self.update = Update::Recv {
+            base,
+            size,
+            off,
+            crc,
+            plen,
+        };
+    }
+
+    /// If the whole image has been written, ACK the client and schedule the
+    /// reboot into the new slot.
+    fn finish_update_if_done(&mut self) {
+        let Update::Recv {
+            off,
+            size,
+            crc,
+            base,
+            ..
+        } = self.update
+        else {
+            return;
+        };
+        if off < size {
+            return;
+        }
+        let final_crc = crc ^ 0xFFFF_FFFF;
+        let mut resp = [0u8; 200];
+        let n = build_update_ok(&mut resp, size, final_crc, base);
+        {
+            let sock =
+                self.sockets.get_mut::<tcp::Socket<'_>>(self.http_handle);
+            let _ = sock.send_slice(&resp[..n]);
             sock.close();
-            ringbuf_entry!(Trace::HttpServed {
-                built: n as u16,
-                sent: sent as u16,
-            });
         }
+        ringbuf_entry!(Trace::UpdateDone {
+            crc: final_crc,
+            wrote: size,
+        });
+        self.update = Update::Reboot {
+            at: sys_get_timer().now + 500,
+        };
     }
 
     /// Arm the kernel timer for the next poll: smoltcp's own deadline when it
@@ -815,6 +1140,8 @@ fn main() -> ! {
         dhcp_handle,
         http_handle,
         mac,
+        update: Update::Idle,
+        page: [0; FLASH_PAGE as usize],
         bound: false,
         static_active: false,
         addr: (Ipv4Address::UNSPECIFIED, 0),
