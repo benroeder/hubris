@@ -628,6 +628,64 @@ impl<S: ByteSource> FlacDecoder<S> {
         })
     }
 
+    /// Construct the decoder IN PLACE at `slot`, so the ~36 KiB decode buffer
+    /// is initialised directly in its final storage and never exists on the
+    /// caller's stack (placement-new). On `Ok(())` the slot is fully
+    /// initialised; on `Err` the slot is untouched (uninitialised).
+    ///
+    /// This exists for no-heap servers that park the decoder in a static:
+    /// `Self::new` costs sizeof(Self) of transient stack ON TOP of the
+    /// destination, which overflows small task stacks.
+    ///
+    /// # Safety
+    /// `slot` must be valid for writes of `Self` and properly aligned. If it
+    /// previously held a live decoder, the caller must have dropped it.
+    #[inline(never)]
+    pub unsafe fn new_at(
+        slot: *mut Self,
+        src: S,
+    ) -> Result<(), DecodeError> {
+        let adapter = ByteSourceReader { src };
+        let mut scratch = [0u8; 256];
+        let reader = claxon_nostd::FlacReader::new_with_metadata(
+            adapter,
+            &mut scratch,
+            |_| {},
+        )
+        .map_err(flac_err)?;
+
+        let info = reader.streaminfo();
+        if info.channels == 0 || info.channels as usize > FLAC_MAX_CHANNELS {
+            return Err(DecodeError::Unsupported);
+        }
+        if info.max_block_size as usize > FLAC_MAX_BLOCK {
+            return Err(DecodeError::Unsupported);
+        }
+
+        // Field-wise initialisation through raw pointers: the big buffer is
+        // zeroed in place; only the (small) FlacReader moves via the stack.
+        // SAFETY: caller guarantees `slot` is valid + aligned (fn contract).
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).sample_rate)
+                .write(info.sample_rate);
+            core::ptr::addr_of_mut!((*slot).channels)
+                .write(info.channels as u8);
+            core::ptr::addr_of_mut!((*slot).shift)
+                .write(info.bits_per_sample as i32 - 16);
+            core::ptr::addr_of_mut!((*slot).reader).write(reader);
+            core::ptr::write_bytes(
+                core::ptr::addr_of_mut!((*slot).buffer) as *mut u8,
+                0,
+                core::mem::size_of::<[i32; FLAC_MAX_SAMPLES]>(),
+            );
+            core::ptr::addr_of_mut!((*slot).block_size).write(0);
+            core::ptr::addr_of_mut!((*slot).pos).write(0);
+            core::ptr::addr_of_mut!((*slot).had_error).write(false);
+            core::ptr::addr_of_mut!((*slot).done).write(false);
+        }
+        Ok(())
+    }
+
     /// Decode the next FLAC block into `self.buffer`. Returns true on a block,
     /// false at a clean end of stream or on a decode error (which sets flags).
     fn decode_next_block(&mut self) -> bool {
