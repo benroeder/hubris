@@ -1,0 +1,44 @@
+// RP2350 (RP235x) ST7789V TFT driver API (SB Components MusicPi HAT).
+//
+// 1.14" 135x240 panel driven in landscape (240x135) over SPI1 at 25 MHz:
+// CLK=GP14, MOSI=GP15, D/C=GP6, CS=GP13, RST=GP12, backlight=GP7. The panel's
+// RAM window is offset inside the controller's 240x320 RAM (x+40, y+53 in
+// landscape); colours are RGB565. See docs/musicpi-research/musicpi.md.
+
+Interface(
+    name: "Rp235xSt7789",
+    ops: {
+        "fill": (
+            description: "Fill the whole screen with an RGB565 colour.",
+            args: { "color": "u16" },
+            reply: Result(ok: "()", err: CLike("St7789Error")),
+            idempotent: true,
+        ),
+        "rect": (
+            description: "Fill a rectangle (landscape pixel coords, x 0..239, y 0..134) with an RGB565 colour. Clipped to the panel.",
+            args: { "x": "u16", "y": "u16", "w": "u16", "h": "u16", "color": "u16" },
+            reply: Result(ok: "()", err: CLike("St7789Error")),
+            idempotent: true,
+        ),
+        "bars": (
+            description: "Draw the classic 8-colour-bar test pattern.",
+            args: {},
+            reply: Result(ok: "()", err: CLike("St7789Error")),
+            idempotent: true,
+        ),
+        "text": (
+            description: "Render ASCII text at glyph-cell coords (16x16 cells: col 0..14, row 0..7), white-on-black 8x8 font scaled 2x, wrapping at the right edge.",
+            args: { "col": "u8", "row": "u8", "color": "u16" },
+            leases: {
+                "chars": (type: "[u8]", read: true, max_len: Some(48)),
+            },
+            reply: Result(ok: "()", err: CLike("St7789Error")),
+        ),
+        "backlight": (
+            description: "Backlight on (nonzero) / off (0).",
+            args: { "on": "u8" },
+            reply: Result(ok: "()", err: CLike("St7789Error")),
+            idempotent: true,
+        ),
+    },
+)

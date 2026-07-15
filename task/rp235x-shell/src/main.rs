@@ -37,6 +37,8 @@ use drv_rp235x_spi_api::Rp235xSpi;
 use task_rp235x_net_api::Rp235xNet;
 #[cfg(feature = "i2s")]
 use drv_rp235x_i2s_api::Rp235xI2s;
+#[cfg(feature = "tft")]
+use drv_rp235x_st7789_api::Rp235xSt7789;
 #[cfg(feature = "ws2812")]
 use drv_rp235x_ws2812_api::Rp235xWs2812;
 
@@ -78,6 +80,8 @@ task_slot!(SPI, spi_driver);
 task_slot!(NET, net);
 #[cfg(feature = "i2s")]
 task_slot!(I2S, i2s);
+#[cfg(feature = "tft")]
+task_slot!(TFT, tft);
 task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
@@ -179,6 +183,9 @@ const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. 
   spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
   spi recv              peripheral: show bytes clocked in by the controller\r\n\
   spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
+#[cfg(feature = "tft")]
+const HELP_TFT: &[u8] =
+    b"  tft bars|fill <hex>|bl 0|1|text <msg>  1.14in TFT test commands\r\n";
 #[cfg(feature = "i2s")]
 const HELP_I2S: &[u8] =
     b"  i2s [tone <hz> [hzR]|stop]  I2S DAC: dump regs, or tone (L/R freqs)\r\n";
@@ -230,6 +237,8 @@ struct Shell {
     net: Rp235xNet,
     #[cfg(feature = "i2s")]
     i2s: Rp235xI2s,
+    #[cfg(feature = "tft")]
+    tft: Rp235xSt7789,
     i2c: Rp235xI2c,
     flash: Rp235xFlash,
     adc: Rp235xAdc,
@@ -340,6 +349,8 @@ impl Shell {
                 self.out.put(HELP_ETH);
                 #[cfg(feature = "i2s")]
                 self.out.put(HELP_I2S);
+                #[cfg(feature = "tft")]
+                self.out.put(HELP_TFT);
                 #[cfg(feature = "mailbox")]
                 self.out.put(HELP_MAILBOX);
                 #[cfg(feature = "slink")]
@@ -381,6 +392,8 @@ impl Shell {
             "i2s" => {
                 self.cmd_i2s(words.next(), words.next(), words.next())
             }
+            #[cfg(feature = "tft")]
+            "tft" => self.cmd_tft(line, words.next(), words.next()),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -1289,6 +1302,55 @@ impl Shell {
             _ => self
                 .out
                 .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
+        }
+    }
+
+    /// `tft <sub>`: ST7789 test commands -- colour bars, solid fill, text,
+    /// backlight. `text` renders the rest of the line at the top-left.
+    #[cfg(feature = "tft")]
+    fn cmd_tft(&mut self, line: &str, sub: Option<&str>, arg: Option<&str>) {
+        match sub {
+            Some("bars") => {
+                let _ = self.tft.bars();
+                self.out.put(b"ok\r\n");
+            }
+            Some("fill") => {
+                // Bare RGB565 hex (no 0x prefix), like the other hex args.
+                let Some(c) =
+                    arg.and_then(|a| u16::from_str_radix(a, 16).ok())
+                else {
+                    self.out.put(b"usage: tft fill <rgb565-hex>\r\n");
+                    return;
+                };
+                let _ = self.tft.fill(c);
+                self.out.put(b"ok\r\n");
+            }
+            Some("bl") => {
+                let Some(on) = arg.and_then(|a| a.parse::<u8>().ok()) else {
+                    self.out.put(b"usage: tft bl 0|1\r\n");
+                    return;
+                };
+                let _ = self.tft.backlight(on);
+                self.out.put(b"ok\r\n");
+            }
+            Some("text") => {
+                // Everything after the "text" verb, whitespace-tolerant
+                // (same idiom as `sd write` / `mailbox role`).
+                let msg = subcommand_rest(line, "text").as_bytes();
+                if msg.is_empty() {
+                    self.out.put(b"usage: tft text <msg>\r\n");
+                    return;
+                }
+                let n = msg.len().min(48);
+                let _ = self.tft.fill(0);
+                match self.tft.text(0, 0, 0xffff, &msg[..n]) {
+                    Ok(()) => self.out.put(b"ok\r\n"),
+                    Err(_) => self.out.put(b"tft text failed\r\n"),
+                }
+            }
+            _ => self.out.put(
+                b"usage: tft bars|fill <rgb565-hex>|bl 0|1|text <msg>\r\n",
+            ),
         }
     }
 
@@ -3880,6 +3942,8 @@ pub fn main() -> ! {
         pwm: Rp235xPwm::from(PWM.get_task_id()),
         #[cfg(feature = "i2s")]
         i2s: Rp235xI2s::from(I2S.get_task_id()),
+        #[cfg(feature = "tft")]
+        tft: Rp235xSt7789::from(TFT.get_task_id()),
         #[cfg(feature = "cyw43")]
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
         #[cfg(feature = "mailbox")]

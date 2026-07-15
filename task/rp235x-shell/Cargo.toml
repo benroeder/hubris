@@ -11,6 +11,7 @@ drv-rp235x-uart-api = { path = "../../drv/rp235x-uart-api" }
 drv-rp235x-spi-api = { path = "../../drv/rp235x-spi-api", optional = true }
 task-rp235x-net-api = { path = "../rp235x-net-api", optional = true }
 drv-rp235x-i2s-api = { path = "../../drv/rp235x-i2s-api", optional = true }
+drv-rp235x-st7789-api = { path = "../../drv/rp235x-st7789-api", optional = true }
 drv-rp235x-i2c-api = { path = "../../drv/rp235x-i2c-api" }
 drv-rp235x-flash-api = { path = "../../drv/rp235x-flash-api" }
 drv-rp235x-mailbox-api = { path = "../../drv/rp235x-mailbox-api", optional = true }
@@ -30,6 +31,7 @@ spibus = ["dep:drv-rp235x-spi-api"]
 # Ethernet status via the rp235x-net task (ENC28J60 + smoltcp).
 eth = ["dep:task-rp235x-net-api"]
 i2s = ["dep:drv-rp235x-i2s-api"]
+tft = ["dep:drv-rp235x-st7789-api"]
 cyw43 = ["dep:drv-rp235x-cyw43-api"]
 mailbox = ["dep:drv-rp235x-mailbox-api"]
 slink = ["dep:drv-rp235x-slink-api"]

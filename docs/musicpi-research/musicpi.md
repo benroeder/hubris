@@ -56,6 +56,21 @@ DAC line-out, always on -- the headphone amp (and DAC mute) gate on GP22.
   I2C0 on this HAT, so this is accepted for now; drop i2c_driver from the app
   when the TFT stage reshuffles it.
 
+## TFT (stage 3) driver facts -- verified from SB's own Demo_Display.py
+
+- Panel: **1.14" 135x240, ST7789V controller**, 4-wire SPI (CLK=GP14 MOSI=GP15,
+  no MISO), D/C=GP6, CS=GP13, RST=GP12, BL=GP7 (plain GPIO, high = on).
+- **Init parameters (the critical magic numbers):** `rotation=90, width=240,
+  height=135, rowstart=40, colstart=53` -- the panel's RAM window is offset
+  inside the ST7789V's 240x320 RAM; without these offsets the image lands
+  off-screen. 135x240 ST7789 panels also conventionally need INVON
+  (colour inversion on) -- adafruit_st7789 does this internally.
+- CAVEAT: the datasheet SB ships (`st7789v-datasheet.pdf`, QT154H2201) is for a
+  **1.54" 240x240** module -- wrong panel, right controller family. Trust the
+  schematic + demo code (1.14", offsets above); use the datasheet only for
+  electrical/backlight numbers (3 white LEDs, ~45 mA typ via the BC817 +
+  10R on BL).
+
 ## Follow-ups for full MusicPi support
 
 1. Remap sdcard to SPI0 GP16-19 (matches the proven sdcard driver pattern).
