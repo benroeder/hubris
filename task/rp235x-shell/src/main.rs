@@ -35,6 +35,8 @@ use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
 #[cfg(feature = "eth")]
 use task_rp235x_net_api::Rp235xNet;
+#[cfg(feature = "i2s")]
+use drv_rp235x_i2s_api::Rp235xI2s;
 #[cfg(feature = "ws2812")]
 use drv_rp235x_ws2812_api::Rp235xWs2812;
 
@@ -74,6 +76,8 @@ task_slot!(UART, uart_driver);
 task_slot!(SPI, spi_driver);
 #[cfg(feature = "eth")]
 task_slot!(NET, net);
+#[cfg(feature = "i2s")]
+task_slot!(I2S, i2s);
 task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
@@ -173,6 +177,9 @@ const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. 
   spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
   spi recv              peripheral: show bytes clocked in by the controller\r\n\
   spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
+#[cfg(feature = "i2s")]
+const HELP_I2S: &[u8] =
+    b"  i2s [tone <hz>|stop]  I2S DAC: dump PIO/DMA regs, or start/stop a tone\r\n";
 #[cfg(feature = "eth")]
 const HELP_ETH: &[u8] =
     b"  eth                   ethernet status: link, DHCP state, IPv4 address\r\n";
@@ -219,6 +226,8 @@ struct Shell {
     spi: Rp235xSpi,
     #[cfg(feature = "eth")]
     net: Rp235xNet,
+    #[cfg(feature = "i2s")]
+    i2s: Rp235xI2s,
     i2c: Rp235xI2c,
     flash: Rp235xFlash,
     adc: Rp235xAdc,
@@ -327,6 +336,8 @@ impl Shell {
                 self.out.put(HELP_SPIBUS);
                 #[cfg(feature = "eth")]
                 self.out.put(HELP_ETH);
+                #[cfg(feature = "i2s")]
+                self.out.put(HELP_I2S);
                 #[cfg(feature = "mailbox")]
                 self.out.put(HELP_MAILBOX);
                 #[cfg(feature = "slink")]
@@ -364,6 +375,8 @@ impl Shell {
             "spi" => self.cmd_spi(line, words.next()),
             #[cfg(feature = "eth")]
             "eth" => self.cmd_eth(),
+            #[cfg(feature = "i2s")]
+            "i2s" => self.cmd_i2s(words.next(), words.next()),
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -1258,6 +1271,60 @@ impl Shell {
             _ => self
                 .out
                 .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
+        }
+    }
+
+    /// `i2s [tone <hz>|stop]`: I2S DAC bring-up -- dump the PIO/DMA registers
+    /// via the i2s task (which holds the MPU grants), or drive a test tone.
+    #[cfg(feature = "i2s")]
+    fn cmd_i2s(&mut self, sub: Option<&str>, arg: Option<&str>) {
+        match sub {
+            Some("tone") => {
+                let hz = arg.and_then(|a| a.parse().ok()).unwrap_or(440);
+                match self.i2s.audio_start(hz, 48_000) {
+                    Ok(()) => self.out.put(b"i2s tone started\r\n"),
+                    Err(_) => self.out.put(b"i2s tone FAILED\r\n"),
+                }
+            }
+            Some("stop") => {
+                let _ = self.i2s.audio_stop();
+                self.out.put(b"i2s stopped\r\n");
+            }
+            _ => {
+                const REGS: [&[u8]; 23] = [
+                    b"dma ctrl   ",
+                    b"dma count  ",
+                    b"dma rd     ",
+                    b"dma wr     ",
+                    b"pio fstat  ",
+                    b"pio fdebug ",
+                    b"pio flevel ",
+                    b"pio ctrl   ",
+                    b"sm0 execctl",
+                    b"sm0 addr   ",
+                    b"io26 ctrl  ",
+                    b"io26 status",
+                    b"io27 status",
+                    b"io22 status",
+                    b"pads26     ",
+                    b"sm0 clkdiv ",
+                    b"sm0 pinctrl",
+                    b"sm0 shiftct",
+                    b"pio gpiobas",
+                    b"addr hist  ",
+                    b"bck trans  ",
+                    b"lrck trans ",
+                    b"din trans  ",
+                ];
+                for (i, name) in REGS.iter().enumerate() {
+                    let v = self.i2s.dbg(i as u8).unwrap_or(0xdead_beef);
+                    self.out.put(b"  ");
+                    self.out.put(name);
+                    self.out.put(b" = 0x");
+                    self.out.put_hex32(v);
+                    self.out.put(b"\r\n");
+                }
+            }
         }
     }
 
@@ -3761,6 +3828,8 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        #[cfg(feature = "i2s")]
+        i2s: Rp235xI2s::from(I2S.get_task_id()),
         #[cfg(feature = "cyw43")]
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
         #[cfg(feature = "mailbox")]

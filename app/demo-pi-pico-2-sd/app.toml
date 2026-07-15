@@ -55,26 +55,9 @@ start = true
 notifications = ["uart-irq"]
 interrupts = {"uart0.irq" = "uart-irq"}
 
-# Ethernet: W5500 (MACRAW) on SPI0 (owned directly, sdcard-style) + smoltcp + DHCP.
-# Replaces the generic spi_driver in this image -- both would own SPI0.
-[tasks.net]
-name = "task-rp235x-net"
-# Priority 4: BELOW usb (3) so the constant poll cadence cannot preempt the
-# console's TX path (a same-priority net task exposed a usb TX corruption
-# race), and above the shell (5), which calls us.
-priority = 4
-max-sizes = {flash = 131072, ram = 49152}
-# 24 KiB stack: smoltcp's poll + DHCP fit comfortably, and trimming from 32 KiB
-# frees pool headroom (this image runs the SRAM at ~99%; the audio task needs
-# every spare byte).
-stacksize = 24576
-uses = ["spi0", "io_bank0", "pads_bank0", "sio"]
-start = true
-# flash_driver: read the QSPI chip's unique ID once at startup to derive a
-# stable per-board MAC (it owns QMI; ROM funcs are privilege-gated so the net
-# task cannot read the chip ID itself).
-task-slots = ["sys", {flash = "flash_driver"}]
-notifications = ["timer"]
+# Ethernet (W5500 on SPI0) removed from this image: the I2S/PCM5102A audio build
+# does not need it, and dropping the W5500's ~130 mA load frees the 3V3 rail for
+# the DAC. The net task + lib/w5500 remain in-tree for other apps.
 
 [tasks.i2c_driver]
 name = "drv-rp235x-i2c"
@@ -110,6 +93,20 @@ features = ["sdcard"]
 # gpio_driver at priority 2 is likewise strictly higher than pwm_driver (3).
 task-slots = ["sys", "sdcard", {gpio = "gpio_driver"}]
 
+# I2S audio out via PIO0 + DMA (SB Components MusicPi HAT: PCM5100A DAC +
+# PAM8908 amp). BCK=GP10, LRCK=GP11, DIN=GP9, XSMT=GP22 (SIO, high = unmute),
+# amp gain GP20/21. Auto-plays a boot tone. NOTE: GP10/11 collide with the
+# sdcard task's SPI1 pins -- i2s starts later and re-muxes them to PIO, so SD
+# commands are broken on the MusicPi until SD moves to its SPI0 (GP16-19).
+# See docs/pcm5102a-research (PCM510xA family datasheet).
+[tasks.i2s]
+name = "drv-rp235x-i2s"
+priority = 4
+max-sizes = {flash = 32768, ram = 24576}
+stacksize = 2048
+uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
+start = true
+
 [tasks.flash_driver]
 name = "drv-rp235x-flash"
 priority = 2
@@ -143,8 +140,8 @@ priority = 5
 max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
-features = ["sdcard", "fat", "ds1302", "eth"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "net"]
+features = ["sdcard", "fat", "ds1302", "i2s"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "i2s"]
 
 [tasks.idle]
 name = "task-idle"

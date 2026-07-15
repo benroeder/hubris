@@ -149,6 +149,9 @@ pub fn open_accessctrl_for_reboot(p: &Peripherals) {
     p.RESETS.reset().modify(|_, w| w.dma().clear_bit());
     while !p.RESETS.reset_done().read().dma().bit_is_set() {}
     p.DMA.seccfg_ch0().modify(|_, w| w.p().clear_bit());
+    // Channel 1 too, for the I2S (PCM5102A) audio task, which runs its PIO TX
+    // DMA on ch1 (ch0 is the PWM audio path). Harmless where ch1 is unused.
+    p.DMA.seccfg_ch1().modify(|_, w| w.p().clear_bit());
 
     // Watchdog tick generator. The flash driver's `reboot` arms the watchdog
     // *timer* (LOAD counts down at the watchdog tick), which silently never
