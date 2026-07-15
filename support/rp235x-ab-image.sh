@@ -8,8 +8,8 @@
 # Usage:   support/rp235x-ab-image.sh <app> [slotA_ver] [slotB_ver] [--flash]
 # Example: support/rp235x-ab-image.sh demo-pi-pico-2-wifi 2.0 1.0 --flash
 #
-# Apps: demo-pi-pico-2, demo-pi-pico-2-wifi, demo-pi-pico-2-wifi-amp,
-#       demo-pi-pico-2-amp, demo-pi-pico-2-slink
+# Apps: demo-pi-pico-2, demo-pi-pico-2-sd, demo-pi-pico-2-wifi,
+#       demo-pi-pico-2-wifi-amp, demo-pi-pico-2-amp, demo-pi-pico-2-slink
 set -euo pipefail
 
 APP="${1:?usage: $0 <app> [slotA_ver] [slotB_ver] [--flash]}"

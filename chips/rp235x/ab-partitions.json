@@ -19,7 +19,8 @@
             "start": "264k",
             "size": "256k",
             "families": ["rp2350-arm-s"],
-            "permissions": {"secure": "rw", "nonsecure": "rw", "bootloader": "rw"}
+            "permissions": {"secure": "rw", "nonsecure": "rw", "bootloader": "rw"},
+            "link": ["a", 0]
         }
     ]
 }

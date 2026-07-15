@@ -2551,6 +2551,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-rp235x-i2s"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "counters",
+ "drv-rp235x-i2s-api",
+ "drv-rp235x-sdcard-api",
+ "embedded-sdmmc",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "ringbuf",
+ "rp235x-audio-decode",
+ "rp235x-pac",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-rp235x-i2s-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "derive-idol-err",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-rp235x-mailbox"
 version = "0.1.0"
 dependencies = [
@@ -7244,6 +7278,7 @@ dependencies = [
  "drv-rp235x-flash-api",
  "drv-rp235x-gpio-api",
  "drv-rp235x-i2c-api",
+ "drv-rp235x-i2s-api",
  "drv-rp235x-mailbox-api",
  "drv-rp235x-pwm-api",
  "drv-rp235x-sdcard-api",

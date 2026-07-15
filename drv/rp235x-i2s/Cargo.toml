@@ -1,0 +1,38 @@
+[package]
+name = "drv-rp235x-i2s"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = { workspace = true }
+idol-runtime = { workspace = true }
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+rp235x-pac = { workspace = true }
+
+drv-rp235x-i2s-api = { path = "../rp235x-i2s-api" }
+drv-rp235x-sdcard-api = { path = "../rp235x-sdcard-api", optional = true }
+embedded-sdmmc = { workspace = true, optional = true }
+rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3", "flac"], optional = true }
+counters = { path = "../../lib/counters" }
+ringbuf = { path = "../../lib/ringbuf" }
+userlib = { path = "../../sys/userlib" }
+
+[features]
+# `sdcard` wires the streaming WAV/FLAC/MP3 player (`play_file`) to the SD
+# block device via embedded-sdmmc -- the same decode stack as the pwm player.
+# Without it, `play_file` compiles but returns OpenFailed.
+sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc", "dep:rp235x-audio-decode"]
+
+[build-dependencies]
+idol = { workspace = true }
+
+[[bin]]
+name = "drv-rp235x-i2s"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

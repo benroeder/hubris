@@ -35,6 +35,8 @@ use drv_rp235x_slink_api::Rp235xSlink;
 use drv_rp235x_spi_api::Rp235xSpi;
 #[cfg(feature = "eth")]
 use task_rp235x_net_api::Rp235xNet;
+#[cfg(feature = "i2s")]
+use drv_rp235x_i2s_api::Rp235xI2s;
 #[cfg(feature = "ws2812")]
 use drv_rp235x_ws2812_api::Rp235xWs2812;
 
@@ -74,6 +76,8 @@ task_slot!(UART, uart_driver);
 task_slot!(SPI, spi_driver);
 #[cfg(feature = "eth")]
 task_slot!(NET, net);
+#[cfg(feature = "i2s")]
+task_slot!(I2S, i2s);
 task_slot!(I2C, i2c_driver);
 task_slot!(FLASH, flash_driver);
 task_slot!(ADC, adc_driver);
@@ -113,7 +117,10 @@ const MIC_CHANNEL: u8 = 2;
 const MIC_PIN: u8 = 28;
 /// Seengreat push buttons, silk-screened by GPIO. Each wires to GND, so with a
 /// pull-up the pin idles 1 (released) and reads 0 while pressed (active-low).
-const BUTTON_PINS: [u8; 2] = [20, 21];
+// MusicPi BT1/BT2/BT3 (active-low, 10K pull-ups on the HAT). NOTE: the old
+// Seengreat pins GP20/21 are the MusicPi's amp-gain DIP-switch nets, driven
+// to VBUS (5V) -- never configure or read them on this board.
+const BUTTON_PINS: [u8; 3] = [2, 3, 4];
 /// Default sine frequency for the `audiosel` source picker (GP21 = sine).
 const AUDIO_DEFAULT_HZ: u32 = 440;
 
@@ -166,13 +173,15 @@ const HELP: &[u8] = b"commands:\r\n\
 
 // Per-driver help lines, printed only when that driver's feature is enabled so
 // `help` never advertises a command the build doesn't have.
-#[cfg(feature = "mailbox")]
 #[cfg(feature = "spibus")]
 const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
   spi role controller|peripheral   set bus role for board-to-board (GP16-19)\r\n\
   spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
   spi recv              peripheral: show bytes clocked in by the controller\r\n\
   spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
+#[cfg(feature = "i2s")]
+const HELP_I2S: &[u8] =
+    b"  i2s [tone <hz> [hzR]|stop]  I2S DAC: dump regs, or tone (L/R freqs)\r\n";
 #[cfg(feature = "eth")]
 const HELP_ETH: &[u8] =
     b"  eth                   ethernet status: link, DHCP state, IPv4 address\r\n";
@@ -219,6 +228,8 @@ struct Shell {
     spi: Rp235xSpi,
     #[cfg(feature = "eth")]
     net: Rp235xNet,
+    #[cfg(feature = "i2s")]
+    i2s: Rp235xI2s,
     i2c: Rp235xI2c,
     flash: Rp235xFlash,
     adc: Rp235xAdc,
@@ -327,6 +338,8 @@ impl Shell {
                 self.out.put(HELP_SPIBUS);
                 #[cfg(feature = "eth")]
                 self.out.put(HELP_ETH);
+                #[cfg(feature = "i2s")]
+                self.out.put(HELP_I2S);
                 #[cfg(feature = "mailbox")]
                 self.out.put(HELP_MAILBOX);
                 #[cfg(feature = "slink")]
@@ -364,6 +377,10 @@ impl Shell {
             "spi" => self.cmd_spi(line, words.next()),
             #[cfg(feature = "eth")]
             "eth" => self.cmd_eth(),
+            #[cfg(feature = "i2s")]
+            "i2s" => {
+                self.cmd_i2s(words.next(), words.next(), words.next())
+            }
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -529,6 +546,12 @@ impl Shell {
     /// routing failed. Shared by `play_tone` and `cmd_sine` so the pin/funcsel
     /// live in one place.
     fn route_buzzer(&mut self) -> bool {
+        // See route_audio_jack: GP18 is the SD card's SCK on I2S builds.
+        if cfg!(feature = "i2s") {
+            self.out
+                .put(b"no buzzer pin on this build (GP18 = SD card SCK)\r\n");
+            return false;
+        }
         self.gpio.set_function(BUZZER_PIN, 4).is_ok()
     }
 
@@ -579,6 +602,14 @@ impl Shell {
     /// selected. Returns false if either GPIO routing failed. Shared by
     /// `cmd_audio` and `cmd_audio2`.
     fn route_audio_jack(&mut self) -> bool {
+        // On I2S (MusicPi) builds GP18/GP19 are the SD card's SPI0 SCK/MOSI,
+        // not an audio jack: remuxing them to PWM would silently kill the SD
+        // card until reboot. Audio out is the I2S DAC (`play`, `i2s tone`).
+        if cfg!(feature = "i2s") {
+            self.out
+                .put(b"no PWM audio jack on this build (use i2s/play)\r\n");
+            return false;
+        }
         self.gpio.set_function(AUDIO_LEFT_PIN, 4).is_ok()
             && self.gpio.set_function(AUDIO_RIGHT_PIN, 4).is_ok()
     }
@@ -1261,6 +1292,73 @@ impl Shell {
         }
     }
 
+    /// `i2s [tone <hz>|stop]`: I2S DAC bring-up -- dump the PIO/DMA registers
+    /// via the i2s task (which holds the MPU grants), or drive a test tone.
+    #[cfg(feature = "i2s")]
+    fn cmd_i2s(
+        &mut self,
+        sub: Option<&str>,
+        arg: Option<&str>,
+        arg2: Option<&str>,
+    ) {
+        match sub {
+            Some("tone") => {
+                let hz = arg.and_then(|a| a.parse().ok()).unwrap_or(440);
+                // Optional second frequency = distinct right channel, for
+                // checking stereo identity by ear.
+                let hz_r = arg2.and_then(|a| a.parse().ok()).unwrap_or(hz);
+                let r = if hz_r != hz {
+                    self.i2s.audio_stereo(hz, hz_r, 48_000)
+                } else {
+                    self.i2s.audio_start(hz, 48_000)
+                };
+                match r {
+                    Ok(()) => self.out.put(b"i2s tone started\r\n"),
+                    Err(_) => self.out.put(b"i2s tone FAILED\r\n"),
+                }
+            }
+            Some("stop") => {
+                let _ = self.i2s.audio_stop();
+                self.out.put(b"i2s stopped\r\n");
+            }
+            _ => {
+                const REGS: [&[u8]; 23] = [
+                    b"dma ctrl   ",
+                    b"dma count  ",
+                    b"dma rd     ",
+                    b"dma wr     ",
+                    b"pio fstat  ",
+                    b"pio fdebug ",
+                    b"pio flevel ",
+                    b"pio ctrl   ",
+                    b"sm0 execctl",
+                    b"sm0 addr   ",
+                    b"io26 ctrl  ",
+                    b"io26 status",
+                    b"io27 status",
+                    b"io22 status",
+                    b"pads26     ",
+                    b"sm0 clkdiv ",
+                    b"sm0 pinctrl",
+                    b"sm0 shiftct",
+                    b"pio gpiobas",
+                    b"addr hist  ",
+                    b"bck trans  ",
+                    b"lrck trans ",
+                    b"din trans  ",
+                ];
+                for (i, name) in REGS.iter().enumerate() {
+                    let v = self.i2s.dbg(i as u8).unwrap_or(0xdead_beef);
+                    self.out.put(b"  ");
+                    self.out.put(name);
+                    self.out.put(b" = 0x");
+                    self.out.put_hex32(v);
+                    self.out.put(b"\r\n");
+                }
+            }
+        }
+    }
+
     /// `eth`: link / DHCP / address status from the net task.
     #[cfg(feature = "eth")]
     fn cmd_eth(&mut self) {
@@ -1628,8 +1726,8 @@ impl Shell {
             // Watch ~10 s in a tight on-board loop, printing each button only when
             // its state CHANGES (edge). Sampling on-device at ~kHz can't miss a
             // normal press the way host polling does. 0 = pressed.
-            self.out.put(b"watching GP20/GP21 for 10s...\r\n");
-            let mut last = [1u8; 2];
+            self.out.put(b"watching BT1/BT2/BT3 (GP2/3/4) for 10s...\r\n");
+            let mut last = [1u8; BUTTON_PINS.len()];
             let t0 = sys_get_timer().now;
             while sys_get_timer().now - t0 < 10_000 {
                 for (i, &pin) in BUTTON_PINS.iter().enumerate() {
@@ -1679,8 +1777,8 @@ impl Shell {
         let _ = self.prep_audio_source();
         // Start on the sine so there is immediate sound.
         let _ = self.pwm.audio_start(AUDIO_DEFAULT_HZ);
-        self.out.put(b"source: sine  (GP20=mic  GP21=sine)\r\n");
-        let mut last = [1u8; 2];
+        self.out.put(b"source: sine  (BT1=mic  other=sine)\r\n");
+        let mut last = [1u8; BUTTON_PINS.len()];
         let t0 = sys_get_timer().now;
         while sys_get_timer().now - t0 < secs * 1000 {
             for (i, &pin) in BUTTON_PINS.iter().enumerate() {
@@ -2991,21 +3089,40 @@ impl Shell {
             self.out.put(b"play: name too long (8.3 max)\r\n");
             return;
         }
-        if !self.route_audio_jack() {
-            self.out.put(b"play: jack routing failed\r\n");
-            return;
-        }
-        match self.pwm.play_file(name.as_bytes()) {
+        // On I2S builds the player lives in the i2s task (DAC output); no
+        // jack pin routing -- the I2S pins are muxed once at i2s task start.
+        #[cfg(feature = "i2s")]
+        match self.i2s.play_file(name.as_bytes()) {
             Ok(packed) => self.report_play_reply(b"played", packed),
-            Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
+            Err(drv_rp235x_i2s_api::I2sError::OpenFailed) => {
                 self.out.put(b"play: open failed (no card/file?)\r\n");
             }
-            Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
-                self.out.put(
-                    b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
-                );
+            Err(drv_rp235x_i2s_api::I2sError::BadFile) => {
+                self.out.put(b"play: not a playable WAV/FLAC/MP3\r\n");
+            }
+            Err(drv_rp235x_i2s_api::I2sError::BadRate) => {
+                self.out.put(b"play: rate outside 32-48 kHz (DAC PLL)\r\n");
             }
             Err(_) => self.out.put(b"play: error\r\n"),
+        }
+        #[cfg(not(feature = "i2s"))]
+        {
+            if !self.route_audio_jack() {
+                self.out.put(b"play: jack routing failed\r\n");
+                return;
+            }
+            match self.pwm.play_file(name.as_bytes()) {
+                Ok(packed) => self.report_play_reply(b"played", packed),
+                Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
+                    self.out.put(b"play: open failed (no card/file?)\r\n");
+                }
+                Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
+                    self.out.put(
+                        b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
+                    );
+                }
+                Err(_) => self.out.put(b"play: error\r\n"),
+            }
         }
     }
 
@@ -3761,6 +3878,8 @@ pub fn main() -> ! {
         flash: Rp235xFlash::from(FLASH.get_task_id()),
         adc: Rp235xAdc::from(ADC.get_task_id()),
         pwm: Rp235xPwm::from(PWM.get_task_id()),
+        #[cfg(feature = "i2s")]
+        i2s: Rp235xI2s::from(I2S.get_task_id()),
         #[cfg(feature = "cyw43")]
         cyw43: Rp235xCyw43::from(CYW43.get_task_id()),
         #[cfg(feature = "mailbox")]
