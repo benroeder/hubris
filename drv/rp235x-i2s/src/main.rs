@@ -18,9 +18,9 @@
 //! I2S program + the sample packing (i16 -> u16<<16; no PlayQuant dither, the
 //! DAC does the real conversion).
 //!
-//! Stage 1 arms a fixed square-wave tone at boot and serves the Idol API so the
-//! shell can retune/stop it. The SD/decode path (reusing lib/rp235x-audio-decode
-//! and the pwm `sd.rs`) is Stage 2.
+//! Arms a sine test tone at boot and serves the Idol API (tone/stereo/stop,
+//! `play_file` for SD WAV/FLAC/MP3 via the shared decode stack, and a `dbg`
+//! register peek used during bring-up).
 
 #![no_std]
 #![no_main]
@@ -86,11 +86,10 @@ const RATE_MIN_HZ: u32 = 32_000;
 const RATE_MAX_HZ: u32 = 48_000;
 
 // ---- DMA / ring -------------------------------------------------------------
-/// DMA channel. BRING-UP: temporarily ch0 -- its SECCFG clear is proven by the
-/// pwm audio path, isolating a "DMA armed but never transfers" fault to the
-/// TREQ index vs the (new, unproven) SECCFG_CH1 clear. ch0 collides with pwm
-/// audio commands, so move back to ch1 once the root cause is pinned.
-const DMA_CH: usize = 0;
+/// DMA channel: ch1 (SECCFG_CH1.P cleared in the pre-kernel main). ch0 belongs
+/// to the pwm driver's tone/mic paths -- sharing it let a pwm command clobber
+/// an i2s stream mid-song.
+const DMA_CH: usize = 1;
 /// TREQ (DREQ) select for the PIO0 SM0 TX FIFO. RP2350 DREQ index 0 = PIO0_TX0.
 /// (If the tone is silent/garbled, this is the first thing to re-check.)
 const TREQ_PIO0_TX0: u8 = 0;
@@ -100,8 +99,10 @@ const DATA_SIZE_WORD: u8 = 2;
 /// as the pwm player's, banking ~93 ms of slack at 44.1 kHz against the FLAC
 /// decoder's bursty whole-block prefetch.
 const RING_SIZE_BITS: u8 = 14;
-/// Large finite reload -- loops for hours until aborted (ENDLESS/COUNT=0 does
-/// not arm on this HW; see the pwm driver note).
+/// Large finite reload: ~93 minutes at 48 kHz, after which an unattended tone
+/// goes silent (the next tone/stop/play re-arms cleanly). ENDLESS/COUNT=0 does
+/// not arm on this HW (see the pwm driver note); a completion-IRQ re-arm is
+/// the fix if a truly endless stream is ever needed.
 const TRANS_COUNT: u32 = 0x0fff_ffff;
 
 /// Frames in the ring. Each frame is ONE 32-bit word, `(right << 16) | left`
@@ -121,8 +122,8 @@ const PLAY_STALL_MS: u64 = 500;
 const PLAY_STALL_POLL_MASK: u32 = 0x3ffff;
 const RING_BYTES: usize = RING_WORDS * 4;
 
-/// Backing store, 2x the ring so a 16 KiB window can be found 4096-byte aligned
-/// (the DMA ring-wrap requires the base aligned to the ring size).
+/// Backing store, 2x the ring so a RING_BYTES-aligned window always fits (the
+/// DMA ring-wrap requires the read base aligned to the ring size).
 const STORE_WORDS: usize = RING_WORDS * 2;
 /// SAFETY: single-threaded task; the only writers are `fill_ring_tone` (before
 /// arming) and the DMA reads it after.
@@ -199,11 +200,13 @@ fn route_pio_pin(p: &rp235x_pac::Peripherals, pin: u32) {
         .modify(|_, w| unsafe { w.funcsel().bits(FUNCSEL_PIO0) });
 }
 
-/// (int, frac) clock divider for the PIO SM at `rate` Hz (PIO clk = 128*rate).
+/// (int, frac) clock divider for the PIO SM at `rate` Hz (PIO clk =
+/// PIO_CYCLES_PER_FRAME * rate = 64 * rate). frac rounds to nearest.
 fn clkdiv_for(rate: u32) -> (u16, u8) {
     let pio_clk = PIO_CYCLES_PER_FRAME * rate;
     let int = SYS_CLK_HZ / pio_clk;
-    let frac = ((SYS_CLK_HZ % pio_clk) as u64 * 256 / pio_clk as u64) as u8;
+    let frac = (((SYS_CLK_HZ % pio_clk) as u64 * 256 + pio_clk as u64 / 2)
+        / pio_clk as u64) as u8;
     (int as u16, frac)
 }
 
@@ -328,8 +331,8 @@ fn isin(deg: u32) -> i16 {
 }
 
 /// Fill the ring with a stereo sine: `cyc_l` / `cyc_r` whole cycles for the
-/// left / right channels. One word per frame, canonical pico-extras packing
-/// `(left << 16) | right` (top half plays while ws=0 = LEFT).
+/// left / right channels. One word per frame, `(right << 16) | left` (see
+/// `fill_chunk` for the derivation of the channel order).
 fn fill_ring_tone(cyc_l: u32, cyc_r: u32) {
     let ring = ring_ptr();
     let sine = |frame: usize, cyc: u32| -> u16 {
@@ -342,7 +345,7 @@ fn fill_ring_tone(cyc_l: u32, cyc_r: u32) {
         let r = sine(f, cyc_r) as u32;
         // SAFETY: ring is the aligned window in RING_STORE; f < RING_WORDS.
         unsafe {
-            ring.add(f).write_volatile((l << 16) | r);
+            ring.add(f).write_volatile((r << 16) | l);
         }
     }
 }
@@ -390,6 +393,10 @@ fn play(
     if !(RATE_MIN_HZ..=RATE_MAX_HZ).contains(&rate) {
         return Err(I2sError::BadArg.into());
     }
+    // Abort the previous stream BEFORE restarting the SM / rewriting the ring
+    // -- a still-armed DMA would refill the freshly-flushed FIFO with stale
+    // frames and race the ring rewrite (audible click on retune).
+    abort_dma(p);
     set_rate(p, rate);
     fill_ring_tone(cycle_count(hz_left, rate), cycle_count(hz_right, rate));
     arm_dma(p);
@@ -412,12 +419,15 @@ fn fill_chunk<D: decoder::Decoder>(dec: &mut D, chunk: usize) -> usize {
     for i in 0..PLAY_CHUNK_FRAMES {
         let l = pcm[2 * i] as u16 as u32;
         let r = pcm[2 * i + 1] as u16 as u32;
-        // Canonical pico-extras FIFO format: bits 31:16 play while ws=0 (the
-        // LEFT channel in I2S), bits 15:0 while ws=1 (right).
+        // Frame word = (RIGHT << 16) | LEFT. Verified three ways: the pico-sdk
+        // feeds this program interleaved little-endian [L, R] i16 pairs (which
+        // read as R-in-the-top-half words), and both a cycle decode of the
+        // program and the receiver's I2S 1-bit delay put the top half in the
+        // right channel. (Matches the pwm driver's ring packing too.)
         // SAFETY: ring is the aligned window in RING_STORE; base + i <
         // RING_FRAMES. Single-threaded server, no references taken.
         unsafe {
-            ring.add(base + i).write_volatile((l << 16) | r);
+            ring.add(base + i).write_volatile((r << 16) | l);
         }
     }
     got

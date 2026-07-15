@@ -83,7 +83,7 @@ impl BlockDevice for SdBlockDevice {
 }
 
 /// Fixed timestamp source. The player never writes, so the value is irrelevant;
-/// a constant keeps the pwm task free of an RTC dependency. 2025-01-01 00:00:00.
+/// a constant keeps the audio task free of an RTC dependency. 2025-01-01 00:00:00.
 pub struct DummyTime;
 
 impl TimeSource for DummyTime {

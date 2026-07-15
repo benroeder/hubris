@@ -182,7 +182,7 @@ const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. 
   spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
 #[cfg(feature = "i2s")]
 const HELP_I2S: &[u8] =
-    b"  i2s [tone <hz>|stop]  I2S DAC: dump PIO/DMA regs, or start/stop a tone\r\n";
+    b"  i2s [tone <hz> [hzR]|stop]  I2S DAC: dump regs, or tone (L/R freqs)\r\n";
 #[cfg(feature = "eth")]
 const HELP_ETH: &[u8] =
     b"  eth                   ethernet status: link, DHCP state, IPv4 address\r\n";
@@ -379,7 +379,9 @@ impl Shell {
             #[cfg(feature = "eth")]
             "eth" => self.cmd_eth(),
             #[cfg(feature = "i2s")]
-            "i2s" => self.cmd_i2s(words.next(), words.next()),
+            "i2s" => {
+                self.cmd_i2s(words.next(), words.next(), words.next())
+            }
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -1280,11 +1282,24 @@ impl Shell {
     /// `i2s [tone <hz>|stop]`: I2S DAC bring-up -- dump the PIO/DMA registers
     /// via the i2s task (which holds the MPU grants), or drive a test tone.
     #[cfg(feature = "i2s")]
-    fn cmd_i2s(&mut self, sub: Option<&str>, arg: Option<&str>) {
+    fn cmd_i2s(
+        &mut self,
+        sub: Option<&str>,
+        arg: Option<&str>,
+        arg2: Option<&str>,
+    ) {
         match sub {
             Some("tone") => {
                 let hz = arg.and_then(|a| a.parse().ok()).unwrap_or(440);
-                match self.i2s.audio_start(hz, 48_000) {
+                // Optional second frequency = distinct right channel, for
+                // checking stereo identity by ear.
+                let hz_r = arg2.and_then(|a| a.parse().ok()).unwrap_or(hz);
+                let r = if hz_r != hz {
+                    self.i2s.audio_stereo(hz, hz_r, 48_000)
+                } else {
+                    self.i2s.audio_start(hz, 48_000)
+                };
+                match r {
                     Ok(()) => self.out.put(b"i2s tone started\r\n"),
                     Err(_) => self.out.put(b"i2s tone FAILED\r\n"),
                 }
