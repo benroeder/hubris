@@ -37,12 +37,36 @@ Interface(
             idempotent: true,
         ),
         "play_file": (
-            description: "Stream a 16-bit WAV/FLAC/MP3 from the FAT root of the SD card out the I2S DAC. Opens `name` (8.3 short name), sets the PIO clock to the file's rate (32-48 kHz), and streams via the DMA ring while poll-refilling from the decoder until EOF. BLOCKING for the whole track. Returns the packed rate/underruns/truncated/refills word (same layout as the pwm player).",
+            description: "Start streaming a 16-bit WAV/FLAC/MP3 from the FAT root of the SD card into the mixer's SD source. Opens `name` (8.3 short name), sets the PIO clock to the file's rate (32-48 kHz), and returns immediately (the timer-driven mixer tick refills from the decoder). Returns the sample rate; end-of-track is visible via `status`.",
             args: {},
             leases: {
                 "name": (type: "[u8]", read: true, max_len: Some(12)),
             },
             reply: Result(ok: "u32", err: CLike("I2sError")),
+        ),
+        "mixer_set": (
+            description: "Set one mixer source: src 0=tone A, 1=tone B, 2=SD. enable 0/1; gain in Q15 (0..=32767); hz = sim-tone frequency for sources 0/1 (ignored for SD).",
+            args: { "src": "u8", "enable": "u8", "gain": "u16", "hz": "u32" },
+            reply: Result(ok: "()", err: CLike("I2sError")),
+            idempotent: true,
+        ),
+        "duck_set": (
+            description: "Configure ducking of the SD source under the live bus (tones A+B, later the capture inputs): enable 0/1, threshold Q15, attack/release in ms (envelope smoothing), floor Q15 (gain the SD source ducks down to).",
+            args: { "enable": "u8", "threshold": "u16", "attack_ms": "u16", "release_ms": "u16", "floor": "u16" },
+            reply: Result(ok: "()", err: CLike("I2sError")),
+            idempotent: true,
+        ),
+        "status": (
+            description: "Mixer status, packed: bits 0..6 VU tone-bus (Q7), 8..14 VU SD (Q7), 16..22 VU out (Q7), 24 = SD source active, 25 = duck currently engaged.",
+            args: {},
+            reply: Result(ok: "u32", err: CLike("I2sError")),
+            idempotent: true,
+        ),
+        "stop_file": (
+            description: "Stop the SD source (the mixer keeps running).",
+            args: {},
+            reply: Result(ok: "()", err: CLike("I2sError")),
+            idempotent: true,
         ),
         "dbg": (
             description: "Bring-up register peek (this task holds the pio0/dma MPU grants the shell lacks). which: 0=DMA ch CTRL, 1=remaining TRANS_COUNT, 2=READ_ADDR, 3=WRITE_ADDR, 4=PIO FSTAT, 5=PIO FDEBUG, 6=PIO FLEVEL, 7=PIO CTRL, 8=SM0 EXECCTRL, else 0.",

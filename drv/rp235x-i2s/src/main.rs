@@ -29,6 +29,7 @@ use core::ptr::addr_of_mut;
 use drv_rp235x_i2s_api::I2sError;
 use idol_runtime::RequestError;
 use userlib::sys_get_timer;
+use userlib::sys_set_timer;
 use userlib::RecvMessage;
 #[cfg(feature = "sdcard")]
 use idol_runtime::{Leased, LenLimit, R};
@@ -383,25 +384,7 @@ fn arm_dma(p: &rp235x_pac::Peripherals) {
     });
 }
 
-/// Retune/restart the tone: validate, set the rate, refill the ring, re-arm.
-fn play(
-    p: &rp235x_pac::Peripherals,
-    hz_left: u32,
-    hz_right: u32,
-    rate: u32,
-) -> Result<(), RequestError<I2sError>> {
-    if !(RATE_MIN_HZ..=RATE_MAX_HZ).contains(&rate) {
-        return Err(I2sError::BadArg.into());
-    }
-    // Abort the previous stream BEFORE restarting the SM / rewriting the ring
-    // -- a still-armed DMA would refill the freshly-flushed FIFO with stale
-    // frames and race the ring rewrite (audible click on retune).
-    abort_dma(p);
-    set_rate(p, rate);
-    fill_ring_tone(cycle_count(hz_left, rate), cycle_count(hz_right, rate));
-    arm_dma(p);
-    Ok(())
-}
+
 
 /// Fill one ring chunk from the decoder: 16-bit interleaved stereo straight
 /// into `(right << 16) | left` frames -- no quantizer, the DAC gets the
@@ -512,6 +495,43 @@ fn play_loop<D: decoder::Decoder>(
     (underruns, refills)
 }
 
+/// Mixer tick period (ms). One ring chunk is ~10 ms at 48 kHz; a 3 ms tick
+/// keeps the producer comfortably ahead with the 8-chunk ring banking slack.
+const TICK_MS: u64 = 3;
+
+/// One mixer source's control state.
+#[derive(Copy, Clone)]
+struct Src {
+    enable: bool,
+    /// Q15 gain (0..=32767).
+    gain: u16,
+    /// DDS phase + step (tone sources only; step derives from `hz` and fs).
+    phase: u32,
+    hz: u32,
+}
+
+/// Ducking config + envelope state: the SD source ducks under the live bus.
+#[derive(Copy, Clone)]
+struct Duck {
+    enable: bool,
+    /// Q15 envelope threshold.
+    threshold: u16,
+    attack_ms: u16,
+    release_ms: u16,
+    /// Q15 gain the SD source ducks down to.
+    floor: u16,
+    /// Q15 envelope of the live bus.
+    env: u16,
+    /// Q15 current duck gain (slews between 32767 and `floor`).
+    gain: u16,
+}
+
+/// The SD-source decoder lives here (not on an op's stack) so it survives
+/// across mixer ticks. SAFETY: single-threaded task; only play_file/stop_file
+/// and the tick touch it.
+#[cfg(feature = "sdcard")]
+static mut SD_DEC: Option<decoder::AnyDecoder<sd::SdFileSource>> = None;
+
 /// Pack the player reply like the pwm driver: rate in bits 0..15, underruns
 /// 16..22 (saturating), truncated flag bit 23, refills 24..31 (saturating).
 #[cfg(feature = "sdcard")]
@@ -527,30 +547,154 @@ fn pack_play_reply(
         | (refills.min(0xff) << 24)
 }
 
-struct ServerImpl;
+struct ServerImpl {
+    /// Tone A, tone B (sim stand-ins for the capture inputs), SD source gain.
+    tone_a: Src,
+    tone_b: Src,
+    sd_gain: u16,
+    sd_active: bool,
+    duck: Duck,
+    /// Current sample rate (sets the PIO clock + DDS steps).
+    rate: u32,
+    /// Next ring chunk the tick will refill.
+    next_fill: usize,
+    /// VU peaks (abs, Q15) since the last status read.
+    vu_bus: u16,
+    vu_sd: u16,
+    vu_out: u16,
+}
+
+impl ServerImpl {
+    fn dds_step(hz: u32, rate: u32) -> u32 {
+        // 32-bit phase accumulator: step = hz * 2^32 / rate.
+        ((hz as u64) << 32).div_euclid(rate as u64) as u32
+    }
+
+    /// Duck slew coefficient (Q15 per chunk) for a time constant in ms.
+    fn slew(ms: u16) -> u32 {
+        let chunk_ms =
+            (PLAY_CHUNK_FRAMES as u32 * 1000 / 48_000).max(1);
+        (32767 * chunk_ms / (ms as u32).max(chunk_ms)).min(32767)
+    }
+
+    /// Mix one ring chunk from the enabled sources; updates duck + VU state.
+    fn mix_chunk(&mut self, chunk: usize) {
+        let ring = ring_ptr();
+        let base = chunk * PLAY_CHUNK_FRAMES;
+
+        // Pull SD samples for this chunk (interleaved stereo), if active.
+        let mut sd = [0i16; PLAY_CHUNK_FRAMES * 2];
+        #[cfg(feature = "sdcard")]
+        if self.sd_active {
+            // SAFETY: single-threaded; see SD_DEC.
+            let dec = unsafe { &mut *core::ptr::addr_of_mut!(SD_DEC) };
+            if let Some(d) = dec.as_mut() {
+                let got = decoder::Decoder::next_pcm(d, &mut sd);
+                for s in sd.iter_mut().skip(got) {
+                    *s = 0;
+                }
+                if got == 0 {
+                    self.sd_active = false;
+                    *dec = None;
+                } else {
+                    decoder::Decoder::prefetch(d);
+                }
+            }
+        }
+
+        let step_a = Self::dds_step(self.tone_a.hz, self.rate);
+        let step_b = Self::dds_step(self.tone_b.hz, self.rate);
+        let (mut pk_bus, mut pk_sd, mut pk_out) = (0u16, 0u16, 0u16);
+
+        for i in 0..PLAY_CHUNK_FRAMES {
+            // Tone sources (mono -> both channels).
+            let mut bus = 0i32;
+            if self.tone_a.enable {
+                let s = isin((self.tone_a.phase >> 23) as u32 * 360 / 512)
+                    as i32;
+                bus += s * self.tone_a.gain as i32 >> 15;
+                self.tone_a.phase = self.tone_a.phase.wrapping_add(step_a);
+            }
+            if self.tone_b.enable {
+                let s = isin((self.tone_b.phase >> 23) as u32 * 360 / 512)
+                    as i32;
+                bus += s * self.tone_b.gain as i32 >> 15;
+                self.tone_b.phase = self.tone_b.phase.wrapping_add(step_b);
+            }
+            pk_bus = pk_bus.max(bus.unsigned_abs().min(32767) as u16);
+
+            let (sl, sr) = (sd[2 * i] as i32, sd[2 * i + 1] as i32);
+            pk_sd = pk_sd.max(sl.unsigned_abs().min(32767) as u16);
+            let sd_g = (self.sd_gain as i32 * self.duck.gain as i32) >> 15;
+            let l = (bus + (sl * sd_g >> 15)).clamp(-32768, 32767);
+            let r = (bus + (sr * sd_g >> 15)).clamp(-32768, 32767);
+            pk_out = pk_out.max(l.unsigned_abs().min(32767) as u16);
+
+            // SAFETY: ring window; base + i < RING_FRAMES.
+            unsafe {
+                ring.add(base + i).write_volatile(
+                    ((r as u16 as u32) << 16) | l as u16 as u32,
+                );
+            }
+        }
+
+        // Duck: smooth the bus envelope, slew the SD gain toward floor when
+        // over threshold (attack) and back to unity when under (release).
+        let d = &mut self.duck;
+        let ec = Self::slew(20) as i32; // fixed 20 ms envelope smoothing
+        d.env = (d.env as i32 + ((pk_bus as i32 - d.env as i32) * ec >> 15))
+            .clamp(0, 32767) as u16;
+        let (target, rate_ms) = if d.enable && d.env > d.threshold {
+            (d.floor, d.attack_ms)
+        } else {
+            (32767u16, d.release_ms)
+        };
+        let sc = Self::slew(rate_ms) as i32;
+        d.gain =
+            (d.gain as i32 + ((target as i32 - d.gain as i32) * sc >> 15))
+                .clamp(0, 32767) as u16;
+
+        self.vu_bus = self.vu_bus.max(pk_bus);
+        self.vu_sd = self.vu_sd.max(pk_sd);
+        self.vu_out = self.vu_out.max(pk_out);
+    }
+
+    /// Timer tick: refill every chunk the DMA has finished since last time.
+    fn tick(&mut self, p: &rp235x_pac::Peripherals) {
+        let cur = dma_chunk(p);
+        while self.next_fill != cur {
+            let c = self.next_fill;
+            self.mix_chunk(c);
+            self.next_fill = (self.next_fill + 1) % PLAY_CHUNKS;
+        }
+    }
+}
+
 
 impl idl::InOrderRp235xI2sImpl for ServerImpl {
     fn tone(
         &mut self,
         _: &RecvMessage,
         freq_hz: u32,
-        rate_hz: u32,
+        _rate_hz: u32,
         _ms: u32,
     ) -> Result<(), RequestError<I2sError>> {
-        // Stage 1: `tone` starts a continuous tone (the timed variant lands with
-        // the notification-driven stop in Stage 2).
-        let p = unsafe { rp235x_pac::Peripherals::steal() };
-        play(&p, freq_hz, freq_hz, rate_hz)
+        // Tone = enable mixer source A at full gain (the mixer runs always).
+        if !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&freq_hz) {
+            return Err(I2sError::BadArg.into());
+        }
+        self.tone_a = Src { enable: true, gain: 24576, phase: 0, hz: freq_hz };
+        self.tone_b.enable = false;
+        Ok(())
     }
 
     fn audio_start(
         &mut self,
-        _: &RecvMessage,
+        msg: &RecvMessage,
         freq_hz: u32,
         rate_hz: u32,
     ) -> Result<(), RequestError<I2sError>> {
-        let p = unsafe { rp235x_pac::Peripherals::steal() };
-        play(&p, freq_hz, freq_hz, rate_hz)
+        self.tone(msg, freq_hz, rate_hz, 0)
     }
 
     fn audio_stereo(
@@ -558,10 +702,100 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
         _: &RecvMessage,
         hz_left: u32,
         hz_right: u32,
-        rate_hz: u32,
+        _rate_hz: u32,
     ) -> Result<(), RequestError<I2sError>> {
-        let p = unsafe { rp235x_pac::Peripherals::steal() };
-        play(&p, hz_left, hz_right, rate_hz)
+        // Two mixer tones. (Both are mono into both ears now -- per-channel
+        // panning arrives with the real capture inputs.)
+        if !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&hz_left)
+            || !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&hz_right)
+        {
+            return Err(I2sError::BadArg.into());
+        }
+        self.tone_a = Src { enable: true, gain: 16384, phase: 0, hz: hz_left };
+        self.tone_b = Src { enable: true, gain: 16384, phase: 0, hz: hz_right };
+        Ok(())
+    }
+
+    fn mixer_set(
+        &mut self,
+        _: &RecvMessage,
+        src: u8,
+        enable: u8,
+        gain: u16,
+        hz: u32,
+    ) -> Result<(), RequestError<I2sError>> {
+        let gain = gain.min(32767);
+        match src {
+            0 | 1 => {
+                if enable != 0 && !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&hz) {
+                    return Err(I2sError::BadArg.into());
+                }
+                let t = if src == 0 {
+                    &mut self.tone_a
+                } else {
+                    &mut self.tone_b
+                };
+                t.enable = enable != 0;
+                t.gain = gain;
+                if hz != 0 {
+                    t.hz = hz;
+                }
+            }
+            2 => {
+                self.sd_gain = gain;
+                if enable == 0 {
+                    self.sd_active = false;
+                }
+            }
+            _ => return Err(I2sError::BadArg.into()),
+        }
+        Ok(())
+    }
+
+    fn duck_set(
+        &mut self,
+        _: &RecvMessage,
+        enable: u8,
+        threshold: u16,
+        attack_ms: u16,
+        release_ms: u16,
+        floor: u16,
+    ) -> Result<(), RequestError<I2sError>> {
+        self.duck.enable = enable != 0;
+        self.duck.threshold = threshold.min(32767);
+        self.duck.attack_ms = attack_ms.max(1);
+        self.duck.release_ms = release_ms.max(1);
+        self.duck.floor = floor.min(32767);
+        Ok(())
+    }
+
+    fn status(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<I2sError>> {
+        // Q15 -> Q7 VU fields; peaks reset on read.
+        let v = ((self.vu_bus >> 8) as u32 & 0x7f)
+            | (((self.vu_sd >> 8) as u32 & 0x7f) << 8)
+            | (((self.vu_out >> 8) as u32 & 0x7f) << 16)
+            | ((self.sd_active as u32) << 24)
+            | (((self.duck.gain < 30000) as u32) << 25);
+        self.vu_bus = 0;
+        self.vu_sd = 0;
+        self.vu_out = 0;
+        Ok(v)
+    }
+
+    fn stop_file(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<I2sError>> {
+        self.sd_active = false;
+        #[cfg(feature = "sdcard")]
+        // SAFETY: single-threaded; see SD_DEC.
+        unsafe {
+            *core::ptr::addr_of_mut!(SD_DEC) = None;
+        }
+        Ok(())
     }
 
     #[cfg(not(feature = "sdcard"))]
@@ -598,11 +832,6 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
                 decoder::FlacDecoder::new(source)
                     .map_err(|_| I2sError::BadFile)?,
             )
-        } else if decoder::is_mp3_name(&name_buf[..n]) {
-            decoder::AnyDecoder::Mp3(
-                decoder::Nanomp3Decoder::new(source)
-                    .map_err(|_| I2sError::BadFile)?,
-            )
         } else {
             decoder::AnyDecoder::Wav(
                 decoder::WavDecoder::new(source)
@@ -617,19 +846,24 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
             return Err(I2sError::BadRate.into());
         }
 
+        // Retune the whole mixer to the file's rate (tones re-derive their
+        // DDS steps from `self.rate`), park the decoder, mark active. The
+        // timer tick does all further work; this op returns immediately.
         let p = unsafe { rp235x_pac::Peripherals::steal() };
-        abort_dma(&p);
-        set_rate(&p, rate);
-        let (underruns, refills) = play_loop(&p, &mut dec);
-        // Leave the ring zeroed so the DAC's zero-data detect mutes.
-        let ring = ring_ptr();
-        for i in 0..RING_WORDS {
-            // SAFETY: i < RING_WORDS, within the aligned window.
-            unsafe { ring.add(i).write_volatile(0) };
+        decoder::Decoder::prefetch(&mut dec);
+        if rate != self.rate {
+            abort_dma(&p);
+            set_rate(&p, rate);
+            arm_dma(&p);
+            self.rate = rate;
+            self.next_fill = 0;
         }
-        arm_dma(&p);
-        let truncated = decoder::Decoder::had_error(&dec) as u32;
-        Ok(pack_play_reply(rate, underruns, refills, truncated))
+        // SAFETY: single-threaded; see SD_DEC.
+        unsafe {
+            *core::ptr::addr_of_mut!(SD_DEC) = Some(dec);
+        }
+        self.sd_active = true;
+        Ok(pack_play_reply(rate, 0, 0, 0))
     }
 
     fn dbg(
@@ -711,44 +945,75 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
         &mut self,
         _: &RecvMessage,
     ) -> Result<(), RequestError<I2sError>> {
-        // Abort the DMA and fill the ring with silence; the DAC's zero-data
-        // detector then analog-mutes.
-        let p = unsafe { rp235x_pac::Peripherals::steal() };
-        abort_dma(&p);
-        let ring = ring_ptr();
-        for i in 0..RING_WORDS {
-            // SAFETY: i < RING_WORDS, within the aligned window.
-            unsafe { ring.add(i).write_volatile(0) };
-        }
-        arm_dma(&p);
+        // Silence the tone sources; the mixer keeps streaming (zeros when
+        // nothing is enabled -- the DAC's zero-data detect analog-mutes).
+        self.tone_a.enable = false;
+        self.tone_b.enable = false;
         Ok(())
     }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl {
     fn current_notification_mask(&self) -> u32 {
-        0
+        notifications::TIMER_MASK
     }
-    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {}
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::TIMER_MASK) {
+            let p = unsafe { rp235x_pac::Peripherals::steal() };
+            self.tick(&p);
+            sys_set_timer(
+                Some(sys_get_timer().now + TICK_MS),
+                notifications::TIMER_MASK,
+            );
+        }
+    }
 }
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
     let p = unsafe { rp235x_pac::Peripherals::steal() };
-    // BRING-UP INSTRUMENTATION (no debug probe on this board): pause between
-    // stages so the pin states can be sampled over the shell to localise a
-    // failure. Expected walk: ~0-3s BCK=1,LRCK=1 (post-init park); ~3-6s
-    // BCK=0,LRCK=1 (SM enabled, stalled on empty FIFO at the first `out`);
-    // >6s toggling (DMA feeding). asm::delay is cycles: 150e6 * 3 = 3 s.
     // MusicPi control pin: XSMT/amp-EN high = DAC unmuted + headphone amp on.
     // (Amp gain is set by the on-board DIP switches; see the note above.)
     sio_output(&p, XSMT, true);
     pio_init(&p);
-    // Boot tone: a 440 Hz square at 48 kHz, so the DAC makes sound immediately
-    // (proves PIO I2S + PLL) without needing a shell command.
-    let _ = play(&p, DEFAULT_TONE_HZ, DEFAULT_TONE_HZ, DEFAULT_RATE_HZ);
+    set_rate(&p, DEFAULT_RATE_HZ);
 
-    let mut server = ServerImpl;
+    let mut server = ServerImpl {
+        // Boot tone: source A at 440 Hz (the liveness signal, as ever).
+        tone_a: Src {
+            enable: true,
+            gain: 16384,
+            phase: 0,
+            hz: DEFAULT_TONE_HZ,
+        },
+        tone_b: Src { enable: false, gain: 16384, phase: 0, hz: 880 },
+        sd_gain: 24576,
+        sd_active: false,
+        duck: Duck {
+            enable: false,
+            threshold: 4096,
+            attack_ms: 30,
+            release_ms: 400,
+            floor: 4096,
+            env: 0,
+            gain: 32767,
+        },
+        rate: DEFAULT_RATE_HZ,
+        next_fill: 0,
+        vu_bus: 0,
+        vu_sd: 0,
+        vu_out: 0,
+    };
+    // Prime the whole ring, then arm the DMA and the mixer tick.
+    for c in 0..PLAY_CHUNKS {
+        server.mix_chunk(c);
+    }
+    arm_dma(&p);
+    sys_set_timer(
+        Some(sys_get_timer().now + TICK_MS),
+        notifications::TIMER_MASK,
+    );
+
     let mut incoming = [0u8; idl::INCOMING_SIZE];
     loop {
         idol_runtime::dispatch(&mut incoming, &mut server);
@@ -759,3 +1024,5 @@ mod idl {
     use drv_rp235x_i2s_api::I2sError;
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }
+
+include!(concat!(env!("OUT_DIR"), "/notifications.rs"));

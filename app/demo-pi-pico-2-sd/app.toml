@@ -89,12 +89,13 @@ priority = 4
 # Player-sized: the FLAC/MP3 decoders live on this task's stack for the whole
 # blocking play op (same budget the pwm player used). sdcard (prio 2) must be
 # strictly higher priority than this client (4).
-max-sizes = {flash = 65536, ram = 196608}
-stacksize = 159744
+max-sizes = {flash = 98304, ram = 196608}
+stacksize = 65536
 uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
 start = true
 features = ["sdcard"]
 task-slots = ["sdcard"]
+notifications = ["timer"]
 
 # MusicPi WS2812 RGB pixel on GP26, sharing PIO0 with the i2s task (SM1,
 # instruction slots 8..11 -- the "musicpi" feature selects pin/SM/base).
