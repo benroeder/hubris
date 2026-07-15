@@ -193,6 +193,12 @@ const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. 
   spi load <hex<=8>     peripheral: stage response bytes for the controller\r\n\
   spi recv              peripheral: show bytes clocked in by the controller\r\n\
   spi bench [n]         controller: time clocking n bytes; reports B/s\r\n";
+#[cfg(feature = "i2s")]
+const HELP_MIXER: &[u8] = b"\
+  mix a|b|sd <pct> [hz]  set a mixer source's level (tones a/b take a freq)\r\n\
+  mix status            mixer VU/state readout\r\n\
+  duck on [thr%] [atk-ms] [rel-ms] [floor%] | off   duck SD under the tones\r\n\
+  stop                  stop the SD source (mixer keeps running)\r\n";
 #[cfg(feature = "tft")]
 const HELP_TFT: &[u8] =
     b"  tft bars|fill <hex>|bl 0|1|text <msg>  1.14in TFT test commands\r\n";
@@ -366,6 +372,8 @@ impl Shell {
                 self.out.put(HELP_ETH);
                 #[cfg(feature = "i2s")]
                 self.out.put(HELP_I2S);
+                #[cfg(feature = "i2s")]
+                self.out.put(HELP_MIXER);
                 #[cfg(feature = "tft")]
                 self.out.put(HELP_TFT);
                 #[cfg(feature = "mailbox")]
@@ -419,6 +427,22 @@ impl Shell {
             }
             #[cfg(feature = "tft")]
             "tft" => self.cmd_tft(line, words.next(), words.next()),
+            #[cfg(feature = "i2s")]
+            "mix" if cfg!(feature = "i2s") => {
+                self.cmd_mixer(words.next(), words.next(), words.next())
+            }
+            #[cfg(feature = "i2s")]
+            "duck" => self.cmd_duck(
+                words.next(),
+                words.next(),
+                words.next(),
+                words.next(),
+            ),
+            #[cfg(feature = "i2s")]
+            "stop" => {
+                let _ = self.i2s.stop_file();
+                self.out.put(b"stopped\r\n");
+            }
             "i2c" => self.cmd_i2c(words.next(), words.next(), words.next()),
             "flash" => self.cmd_flash(words.next(), words.next(), words.next()),
             "rom" => self.cmd_rom(words.next()),
@@ -1348,6 +1372,91 @@ impl Shell {
             _ => self
                 .out
                 .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
+        }
+    }
+
+    /// `mix <src> <pct> [hz]` / `mix status`: mixer source levels + readout.
+    #[cfg(feature = "i2s")]
+    fn cmd_mixer(
+        &mut self,
+        sub: Option<&str>,
+        pct: Option<&str>,
+        hz: Option<&str>,
+    ) {
+        if sub == Some("status") {
+            match self.i2s.status() {
+                Ok(v) => {
+                    self.out.put(b"bus ");
+                    self.out.put_u32(v & 0x7f);
+                    self.out.put(b"/127  sd ");
+                    self.out.put_u32((v >> 8) & 0x7f);
+                    self.out.put(b"/127  out ");
+                    self.out.put_u32((v >> 16) & 0x7f);
+                    self.out.put(if v & (1 << 24) != 0 {
+                        b"/127  sd: PLAYING" as &[u8]
+                    } else {
+                        b"/127  sd: idle"
+                    });
+                    self.out.put(if v & (1 << 25) != 0 {
+                        b"  DUCKED\r\n" as &[u8]
+                    } else {
+                        b"\r\n"
+                    });
+                }
+                Err(_) => self.out.put(b"mix: status failed\r\n"),
+            }
+            return;
+        }
+        let src = match sub {
+            Some("a") => 0u8,
+            Some("b") => 1,
+            Some("sd") => 2,
+            _ => {
+                self.out
+                    .put(b"usage: mix a|b|sd <pct> [hz] | mix status\r\n");
+                return;
+            }
+        };
+        let Some(pct) =
+            pct.and_then(|a| a.parse::<u32>().ok()).filter(|p| *p <= 100)
+        else {
+            self.out.put(b"usage: mix a|b|sd <0-100> [hz]\r\n");
+            return;
+        };
+        let hz = hz.and_then(|a| a.parse::<u32>().ok()).unwrap_or(0);
+        let gain = (pct * 32767 / 100) as u16;
+        match self.i2s.mixer_set(src, (pct > 0) as u8, gain, hz) {
+            Ok(()) => self.out.put(b"ok\r\n"),
+            Err(_) => self.out.put(b"mix: failed (bad freq?)\r\n"),
+        }
+    }
+
+    /// `duck on [thr%] [attack-ms] [release-ms] [floor%]` / `duck off`.
+    #[cfg(feature = "i2s")]
+    fn cmd_duck(
+        &mut self,
+        sub: Option<&str>,
+        thr: Option<&str>,
+        atk: Option<&str>,
+        rel: Option<&str>,
+    ) {
+        let on = match sub {
+            Some("on") => true,
+            Some("off") => false,
+            _ => {
+                self.out.put(
+                    b"usage: duck on [thr%] [atk-ms] [rel-ms] | duck off\r\n",
+                );
+                return;
+            }
+        };
+        let thr = thr.and_then(|a| a.parse::<u32>().ok()).unwrap_or(10);
+        let atk = atk.and_then(|a| a.parse::<u16>().ok()).unwrap_or(30);
+        let rel = rel.and_then(|a| a.parse::<u16>().ok()).unwrap_or(400);
+        let threshold = (thr.min(100) * 32767 / 100) as u16;
+        match self.i2s.duck_set(on as u8, threshold, atk, rel, 4096) {
+            Ok(()) => self.out.put(b"ok\r\n"),
+            Err(_) => self.out.put(b"duck: failed\r\n"),
         }
     }
 
