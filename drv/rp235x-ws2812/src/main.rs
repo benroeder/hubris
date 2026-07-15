@@ -26,7 +26,20 @@ use idol_runtime::RequestError;
 use userlib::RecvMessage;
 
 /// GPIO the WS2812 data line lives on.
+#[cfg(not(feature = "musicpi"))]
 const PIN: u8 = 22;
+#[cfg(feature = "musicpi")]
+const PIN: u8 = 26;
+/// PIO0 state machine + instruction-memory base. On the MusicPi the I2S audio
+/// task owns SM0 and instr slots 0..7, so this driver takes SM1 and 8..11.
+#[cfg(not(feature = "musicpi"))]
+const SM: usize = 0;
+#[cfg(feature = "musicpi")]
+const SM: usize = 1;
+#[cfg(not(feature = "musicpi"))]
+const PROG_BASE: u16 = 0;
+#[cfg(feature = "musicpi")]
+const PROG_BASE: u16 = 8;
 /// funcsel that routes a GPIO to PIO0 on the RP2350.
 const FUNCSEL_PIO0: u8 = 6;
 
@@ -67,14 +80,14 @@ impl idl::InOrderRp235xWs2812Impl for ServerImpl {
         // enabled + fed an 8 MHz clock in setup(), so this bound is only reached
         // if PIO0 was never brought out of reset.
         let mut spins = 0u32;
-        while self.pio.fstat().read().txfull().bits() & 1 != 0 {
+        while self.pio.fstat().read().txfull().bits() & (1 << SM) != 0 {
             spins += 1;
             if spins > 1_000_000 {
                 return Err(Ws2812Error::Stalled.into());
             }
         }
         // Left-justify the 24-bit GRB value for the MSB-first 24-bit autopull.
-        self.pio.txf(0).write(|w| unsafe { w.bits(grb << 8) });
+        self.pio.txf(SM).write(|w| unsafe { w.bits(grb << 8) });
         Ok(())
     }
 }
@@ -104,14 +117,20 @@ fn setup(p: &rp235x_pac::Peripherals) {
         .modify(|_, w| unsafe { w.funcsel().bits(FUNCSEL_PIO0) });
 
     let pio = &p.PIO0;
-    // Disable all state machines before touching config.
-    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
-    // Load the 4-instruction program at offset 0.
+    // Disable OUR state machine before touching config -- bitwise, so the I2S
+    // task's SM (sharing this PIO block) is never clobbered.
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() & !(1 << SM) as u8)
+    });
+    // Load the 4-instruction program at PROG_BASE, relocating the two absolute
+    // `jmp` targets (opcode 000) by the base offset.
     for (i, insn) in WS2812.iter().enumerate() {
-        pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
+        let insn = if insn >> 13 == 0 { insn + PROG_BASE } else { *insn };
+        pio.instr_mem(PROG_BASE as usize + i)
+            .write(|w| unsafe { w.bits(insn as u32) });
     }
 
-    let sm = pio.sm(0);
+    let sm = pio.sm(SM);
     // 8 MHz SM clock: 150 MHz / 18.75.
     sm.sm_clkdiv()
         .write(|w| unsafe { w.int().bits(DIV_INT).frac().bits(DIV_FRAC) });
@@ -131,15 +150,24 @@ fn setup(p: &rp235x_pac::Peripherals) {
         w.set_base().bits(PIN);
         w.set_count().bits(1)
     });
-    // The 4-instruction program wraps 0..3.
-    sm.sm_execctrl()
-        .modify(|_, w| unsafe { w.wrap_top().bits(3).wrap_bottom().bits(0) });
-    // Make GP22 a PIO output via an immediate `set pindirs, 1`.
+    // The 4-instruction program wraps PROG_BASE..PROG_BASE+3.
+    sm.sm_execctrl().modify(|_, w| unsafe {
+        w.wrap_top()
+            .bits(PROG_BASE as u8 + 3)
+            .wrap_bottom()
+            .bits(PROG_BASE as u8)
+    });
+    // Make the pixel pin a PIO output via an immediate `set pindirs, 1`, then
+    // force the PC to the program base (`jmp PROG_BASE`; a fresh SM0 starts at
+    // 0 anyway, but SM1's PC is wherever earlier code left it).
     sm.sm_instr()
         .write(|w| unsafe { w.sm0_instr().bits(SET_PINDIRS_OUT) });
-    // Enable SM0. With an empty FIFO it stalls on the `out` instruction holding
-    // the line low (side 0).
-    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+    sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(PROG_BASE) });
+    // Enable OUR SM (bitwise; see above). With an empty FIFO it stalls on the
+    // `out` instruction holding the line low (side 0).
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() | (1 << SM) as u8)
+    });
     // Blank the pixel. GP22 floats (pindir=0) between the funcsel routing above
     // and the `set pindirs` output enable, so the WS2812 can latch a garbage
     // colour during boot. Clearing it needs a >50 us low (reset) BEFORE the 0
@@ -147,7 +175,7 @@ fn setup(p: &rp235x_pac::Peripherals) {
     // (absent) pixel and keeps the garbage. The enabled SM holds the line low,
     // so busy-wait one reset period, then clock the 0 frame to latch off.
     cortex_m::asm::delay(RESET_CYCLES);
-    pio.txf(0).write(|w| unsafe { w.bits(0) });
+    pio.txf(SM).write(|w| unsafe { w.bits(0) });
 }
 
 #[export_name = "main"]

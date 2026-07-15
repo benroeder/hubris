@@ -107,6 +107,17 @@ stacksize = 2048
 uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
 start = true
 
+# MusicPi WS2812 RGB pixel on GP26, sharing PIO0 with the i2s task (SM1,
+# instruction slots 8..11 -- the "musicpi" feature selects pin/SM/base).
+[tasks.ws2812]
+name = "drv-rp235x-ws2812"
+priority = 3
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 512
+uses = ["pio0", "io_bank0", "pads_bank0", "sio"]
+start = true
+features = ["musicpi"]
+
 [tasks.flash_driver]
 name = "drv-rp235x-flash"
 priority = 2
@@ -140,8 +151,8 @@ priority = 5
 max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
-features = ["sdcard", "fat", "ds1302", "i2s"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "i2s"]
+features = ["sdcard", "fat", "ds1302", "i2s", "ws2812"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "i2s", "ws2812"]
 
 [tasks.idle]
 name = "task-idle"

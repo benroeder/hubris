@@ -15,6 +15,11 @@ drv-rp235x-ws2812-api = { path = "../rp235x-ws2812-api" }
 counters = { path = "../../lib/counters" }
 userlib = { path = "../../sys/userlib" }
 
+[features]
+# SB Components MusicPi HAT: pixel on GP26, PIO0 SM1 + instr-mem 8..11 (SM0 +
+# slots 0..7 belong to the I2S audio task). Default: GP22, SM0, slots 0..3.
+musicpi = []
+
 [build-dependencies]
 idol = { workspace = true }
 

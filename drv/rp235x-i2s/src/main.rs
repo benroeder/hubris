@@ -189,7 +189,10 @@ fn pio_init(p: &rp235x_pac::Peripherals) {
     route_pio_pin(p, LRCK);
 
     let pio = &p.PIO0;
-    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    // Disable OUR SM only -- SM1 belongs to the ws2812 driver on the MusicPi.
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() & !1)
+    });
     for (i, insn) in I2S_PROG.iter().enumerate() {
         pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
     }
@@ -236,7 +239,10 @@ fn pio_init(p: &rp235x_pac::Peripherals) {
 /// Set the SM clock for `rate` and enable it.
 fn set_rate(p: &rp235x_pac::Peripherals, rate: u32) {
     let pio = &p.PIO0;
-    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    // Bitwise: never clobber SM1 (ws2812).
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() & !1)
+    });
     let (int, frac) = clkdiv_for(rate);
     pio.sm(0)
         .sm_clkdiv()
@@ -248,7 +254,9 @@ fn set_rate(p: &rp235x_pac::Peripherals, rate: u32) {
         w.sm_restart().bits(1);
         w.clkdiv_restart().bits(1)
     });
-    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(1) });
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() | 1)
+    });
 }
 
 /// Snap `freq` to a whole number of cycles across the ring so the loop is
