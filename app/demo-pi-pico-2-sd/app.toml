@@ -85,7 +85,7 @@ task-slots = ["sys"]
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
 priority = 3
-max-sizes = {flash = 16384, ram = 36864}
+max-sizes = {flash = 16384, ram = 34816}
 stacksize = 768
 uses = ["pwm", "dma", "adc"]
 start = true
@@ -103,8 +103,8 @@ priority = 4
 # Player-sized: the FLAC/MP3 decoders live on this task's stack for the whole
 # blocking play op (same budget the pwm player used). sdcard (prio 2) must be
 # strictly higher priority than this client (4).
-max-sizes = {flash = 65536, ram = 200704}
-stacksize = 163840
+max-sizes = {flash = 65536, ram = 196608}
+stacksize = 159744
 uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
 start = true
 features = ["sdcard"]
@@ -142,14 +142,19 @@ start = true
 features = ["musicpi"]
 task-slots = ["sys"]
 
-[tasks.ds1302]
-name = "drv-rp235x-ds1302"
+# ds1302 removed on the MusicPi: it bit-banged GP6-8, which are the TFT's
+# D/C and backlight pins here. The driver stays in-tree for the RTC apps.
+
+# MusicPi 1.14" TFT (ST7789V) on SPI1: CLK=GP14, MOSI=GP15, D/C=GP6, CS=GP13,
+# RST=GP12, backlight=GP7. See docs/musicpi-research/musicpi.md.
+[tasks.tft]
+name = "drv-rp235x-st7789"
 priority = 3
-max-sizes = {flash = 8192, ram = 2048}
-stacksize = 512
-uses = ["sio", "io_bank0", "pads_bank0"]
+max-sizes = {flash = 32768, ram = 4096}
+stacksize = 1536
+uses = ["spi1", "io_bank0", "pads_bank0", "sio"]
 start = true
-# The DS1302 driver talks straight to SIO/IO_BANK0/PADS_BANK0; no task-slots.
+task-slots = ["sys"]
 
 [tasks.shell]
 name = "task-rp235x-shell"
@@ -157,8 +162,8 @@ priority = 5
 max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
-features = ["sdcard", "fat", "ds1302", "i2s", "ws2812"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "ds1302", "i2s", "ws2812"]
+features = ["sdcard", "fat", "i2s", "ws2812", "tft"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "i2s", "ws2812", "tft"]
 
 [tasks.idle]
 name = "task-idle"
