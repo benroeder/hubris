@@ -16,7 +16,7 @@ drv-rp235x-i2c-api = { path = "../../drv/rp235x-i2c-api" }
 drv-rp235x-flash-api = { path = "../../drv/rp235x-flash-api" }
 drv-rp235x-mailbox-api = { path = "../../drv/rp235x-mailbox-api", optional = true }
 drv-rp235x-adc-api = { path = "../../drv/rp235x-adc-api" }
-drv-rp235x-pwm-api = { path = "../../drv/rp235x-pwm-api" }
+drv-rp235x-pwm-api = { path = "../../drv/rp235x-pwm-api", optional = true }
 drv-rp235x-cyw43-api = { path = "../../drv/rp235x-cyw43-api", optional = true }
 drv-rp235x-slink-api = { path = "../../drv/rp235x-slink-api", optional = true }
 drv-rp235x-ws2812-api = { path = "../../drv/rp235x-ws2812-api", optional = true }
@@ -32,6 +32,8 @@ spibus = ["dep:drv-rp235x-spi-api"]
 eth = ["dep:task-rp235x-net-api"]
 i2s = ["dep:drv-rp235x-i2s-api"]
 tft = ["dep:drv-rp235x-st7789-api"]
+# PWM-jack audio + buzzer + led-dim commands (needs a pwm_driver task).
+pwm = ["dep:drv-rp235x-pwm-api"]
 cyw43 = ["dep:drv-rp235x-cyw43-api"]
 mailbox = ["dep:drv-rp235x-mailbox-api"]
 slink = ["dep:drv-rp235x-slink-api"]

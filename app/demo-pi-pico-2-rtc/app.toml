@@ -87,7 +87,7 @@ task-slots = ["sys"]
 [tasks.pwm_driver]
 name = "drv-rp235x-pwm"
 priority = 2
-max-sizes = {flash = 8192, ram = 16384}
+max-sizes = {flash = 16384, ram = 34816}
 stacksize = 768
 uses = ["pwm", "dma", "adc"]
 start = true
@@ -116,7 +116,7 @@ priority = 4
 max-sizes = {flash = 40960, ram = 4096}
 stacksize = 2048
 start = true
-features = ["spibus", "ds1302"]
+features = ["spibus", "ds1302", "pwm"]
 task-slots = ["usb", "gpio_driver", "uart_driver", "spi_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "ds1302"]
 
 [tasks.hiffy]
