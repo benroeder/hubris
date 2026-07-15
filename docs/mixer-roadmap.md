@@ -41,6 +41,39 @@ rp235x-startup). Note: 256fs divides 150 MHz evenly only at fs=48828 Hz; at
 work). The proper endgame ADC is the PCM1865 (4-ch, BCK-PLL, no MCLK, I2C) --
 no hobby breakout exists; needs the TI EVM or a custom PCB.
 
+## Sprint-2 capture design (worked out, ready to implement)
+
+PIO1 (add `[pio1]` 0x5030_0000 to chip.toml; un-reset in the pre-kernel main
+like pio0/pio2). Four SMs, no MCLK needed until real PCM1802s arrive:
+
+- SM0/SM1: **I2S slave receivers** for inputs A (GP27) and B (GP28), clocked
+  by reading the GP10/11 BCK/LRCK we already drive (any PIO can `wait gpio` /
+  `in pins` another block's outputs). One shared 8-instruction program at
+  offset 0; the SMs differ only in PINCTRL in_base:
+  `[0x208B, 0x200B, 0x208A, 0x200A,  ; one-time sync: LRCK hi, LRCK lo,`
+  ` 0x208A, 0x4001, 0x200A, 0x0004]  ;   skip 1 BCK (I2S delay); loop: BCK hi, in 1, BCK lo, jmp 4`
+  autopush 32, ISR shift LEFT. KEY INSIGHT: sync ONCE then free-run -- the
+  I2S 1-bit delay pushes each frame's last bit across the frame boundary, so
+  a per-frame resync would skip alternate frames; free-running after one
+  aligned sync yields exact (L<<16)|R words forever (same clock domain, zero
+  drift). Captured via DMA ch2/ch3 (ring on WRITE) into 4 KiB capture rings.
+
+- SM2/SM3: **simadc fake ADCs** (feature-gated): I2S slave transmitters
+  driving GP27/GP28 as outputs; the receivers read the same pads back (ie=1)
+  -- zero wires. 6-instruction program at offset 8:
+  `[0x208B, 0x200B,                  ; sync to LRCK fall`
+  ` 0x208A, 0x200A, 0x6001, 0x000A]  ; loop: BCK hi, BCK lo, out 1 (data changes on fall), jmp`
+  autopull 32, OSR shift LEFT. Fed by DMA ch4/ch5 looping tiny cycle-snapped
+  sine rings (256 frames, filled once at init; distinct pitches per input so
+  channel identity is audible). DMA ch2-5 need SECCFG_CHn.P clears in
+  rp235x-startup.
+
+- Mixer: sources A/B read their capture rings ((L<<16)|R stereo) instead of
+  the DDS when capture is enabled; DDS stays as the no-hardware fallback.
+  When the PCM1802s arrive: disable simadc, add the MCLK SM (256*fs on GP5),
+  check the boards' FMT/MODE straps, plug in -- the receive path will already
+  be validated against real I2S timing.
+
 ## Core split (AMP; builds on the rp2350-amp branch: core-1 launch + SIO
 ## mailbox proven; RCP-salt caveat still open)
 
