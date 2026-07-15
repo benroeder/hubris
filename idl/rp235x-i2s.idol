@@ -68,6 +68,14 @@ Interface(
             reply: Result(ok: "()", err: CLike("I2sError")),
             idempotent: true,
         ),
+        "list_files": (
+            description: "List the playable files (.FLA/.WAV) in the SD FAT root as text lines 'NAME.EXT size' into the lease. Returns (bytes_written << 8) | min(count, 255).",
+            args: {},
+            leases: {
+                "out": (type: "[u8]", write: true, max_len: Some(768)),
+            },
+            reply: Result(ok: "u32", err: CLike("I2sError")),
+        ),
         "dbg": (
             description: "Bring-up register peek (this task holds the pio0/dma MPU grants the shell lacks). which: 0=DMA ch CTRL, 1=remaining TRANS_COUNT, 2=READ_ADDR, 3=WRITE_ADDR, 4=PIO FSTAT, 5=PIO FDEBUG, 6=PIO FLEVEL, 7=PIO CTRL, 8=SM0 EXECCTRL, else 0.",
             args: { "which": "u8" },

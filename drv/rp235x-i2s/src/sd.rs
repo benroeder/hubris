@@ -121,6 +121,78 @@ impl SdFileSource {
     /// Mount FAT volume 0, open the root directory, and open `name` read-only.
     /// On any failure the partially-opened handles are released and `None` is
     /// returned. `name` is a raw byte slice (an 8.3 short name) from the lease.
+    /// List the playable files (.FLA / .WAV) in the FAT root as text lines
+    /// "NAME.EXT <size>\n" written into `out`, returning (bytes_written,
+    /// file_count). Entries that would overflow `out` are dropped (count
+    /// still reflects them). Standalone: opens and closes its own volume.
+    pub fn list(sdcard: Rp235xSdcard, out: &mut [u8]) -> Option<(usize, u32)> {
+        let vm = VolumeManager::new(SdBlockDevice::new(sdcard), DummyTime);
+        let volume = vm.open_raw_volume(VolumeIdx(0)).ok()?;
+        let dir = match vm.open_root_dir(volume) {
+            Ok(d) => d,
+            Err(_) => {
+                let _ = vm.close_volume(volume);
+                return None;
+            }
+        };
+        let mut pos = 0usize;
+        let mut count = 0u32;
+        let r = vm.iterate_dir(dir, |e| {
+            if e.attributes.is_directory() {
+                return;
+            }
+            let ext = e.name.extension();
+            let playable = ext.eq_ignore_ascii_case(b"FLA")
+                || ext.eq_ignore_ascii_case(b"WAV");
+            if !playable {
+                return;
+            }
+            count += 1;
+            // "BASE.EXT SIZE\n" -- worst case 8+1+3+1+10+1 = 24 bytes.
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in e.name.base_name() {
+                line[n] = b;
+                n += 1;
+            }
+            line[n] = b'.';
+            n += 1;
+            for &b in ext {
+                line[n] = b;
+                n += 1;
+            }
+            line[n] = b' ';
+            n += 1;
+            // decimal size
+            let mut sz = e.size;
+            let mut digits = [0u8; 10];
+            let mut d = 0;
+            loop {
+                digits[d] = b'0' + (sz % 10) as u8;
+                sz /= 10;
+                d += 1;
+                if sz == 0 {
+                    break;
+                }
+            }
+            while d > 0 {
+                d -= 1;
+                line[n] = digits[d];
+                n += 1;
+            }
+            line[n] = b'\n';
+            n += 1;
+            if pos + n <= out.len() {
+                out[pos..pos + n].copy_from_slice(&line[..n]);
+                pos += n;
+            }
+        });
+        let _ = vm.close_dir(dir);
+        let _ = vm.close_volume(volume);
+        r.ok()?;
+        Some((pos, count))
+    }
+
     pub fn open(sdcard: Rp235xSdcard, name: &[u8]) -> Option<Self> {
         // The FAT short name must be valid UTF-8 (ASCII in practice) for
         // embedded-sdmmc's ToShortFileName.

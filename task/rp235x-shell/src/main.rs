@@ -198,7 +198,8 @@ const HELP_MIXER: &[u8] = b"\
   mix a|b|sd <pct> [hz]  set a mixer source's level (tones a/b take a freq)\r\n\
   mix status            mixer VU/state readout\r\n\
   duck on [thr%] [atk-ms] [rel-ms] [floor%] | off   duck SD under the tones\r\n\
-  stop                  stop the SD source (mixer keeps running)\r\n";
+  stop                  stop the SD source (mixer keeps running)\r\n\
+  files                 list the playable files (.FLA/.WAV) on the SD\r\n";
 #[cfg(feature = "tft")]
 const HELP_TFT: &[u8] =
     b"  tft bars|fill <hex>|bl 0|1|text <msg>  1.14in TFT test commands\r\n";
@@ -438,6 +439,8 @@ impl Shell {
                 words.next(),
                 words.next(),
             ),
+            #[cfg(feature = "i2s")]
+            "files" => self.cmd_files(),
             #[cfg(feature = "i2s")]
             "stop" => {
                 let _ = self.i2s.stop_file();
@@ -1372,6 +1375,23 @@ impl Shell {
             _ => self
                 .out
                 .put(b"usage: spi xfer|role|load|recv|bench ...\r\n"),
+        }
+    }
+
+    /// `files`: list the playable SD files via the i2s task (the same op the
+    /// HTTP API will use for its source list).
+    #[cfg(feature = "i2s")]
+    fn cmd_files(&mut self) {
+        let mut buf = [0u8; 768];
+        match self.i2s.list_files(&mut buf) {
+            Ok(packed) => {
+                let n = (packed >> 8) as usize;
+                self.out.put(&buf[..n.min(768)]);
+                self.out.put(b"(");
+                self.out.put_u32(packed & 0xff);
+                self.out.put(b" playable files)\r\n");
+            }
+            Err(_) => self.out.put(b"files: failed (no card?)\r\n"),
         }
     }
 

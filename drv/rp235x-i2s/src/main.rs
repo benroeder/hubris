@@ -806,6 +806,33 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
         Ok(pack_play_reply(rate, 0, 0, 0))
     }
 
+    #[cfg(not(feature = "sdcard"))]
+    fn list_files(
+        &mut self,
+        _: &RecvMessage,
+        _out: LenLimit<Leased<idol_runtime::W, [u8]>, 768>,
+    ) -> Result<u32, RequestError<I2sError>> {
+        Err(I2sError::OpenFailed.into())
+    }
+
+    #[cfg(feature = "sdcard")]
+    fn list_files(
+        &mut self,
+        _: &RecvMessage,
+        out: LenLimit<Leased<idol_runtime::W, [u8]>, 768>,
+    ) -> Result<u32, RequestError<I2sError>> {
+        let mut buf = [0u8; 768];
+        let cap = out.len().min(768);
+        let (n, count) = sd::SdFileSource::list(
+            Rp235xSdcard::from(SDCARD.get_task_id()),
+            &mut buf[..cap],
+        )
+        .ok_or(I2sError::OpenFailed)?;
+        out.write_range(0..n, &buf[..n])
+            .map_err(|()| RequestError::went_away())?;
+        Ok(((n as u32) << 8) | count.min(255))
+    }
+
     fn dbg(
         &mut self,
         _: &RecvMessage,
