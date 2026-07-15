@@ -152,6 +152,12 @@ pub fn open_accessctrl_for_reboot(p: &Peripherals) {
     // Channel 1 too, for the I2S (PCM5102A) audio task, which runs its PIO TX
     // DMA on ch1 (ch0 is the PWM audio path). Harmless where ch1 is unused.
     p.DMA.seccfg_ch1().modify(|_, w| w.p().clear_bit());
+    // Channels 2-5: the mixer's capture path (2/3 = I2S RX rings, 4/5 = the
+    // simadc fake-ADC feeders). Harmless where unused.
+    p.DMA.seccfg_ch2().modify(|_, w| w.p().clear_bit());
+    p.DMA.seccfg_ch3().modify(|_, w| w.p().clear_bit());
+    p.DMA.seccfg_ch4().modify(|_, w| w.p().clear_bit());
+    p.DMA.seccfg_ch5().modify(|_, w| w.p().clear_bit());
 
     // Watchdog tick generator. The flash driver's `reboot` arms the watchdog
     // *timer* (LOAD counts down at the watchdog tick), which silently never

@@ -2557,6 +2557,7 @@ dependencies = [
  "build-util",
  "cortex-m",
  "counters",
+ "drv-rp235x-gpio-api",
  "drv-rp235x-i2s-api",
  "drv-rp235x-sdcard-api",
  "embedded-sdmmc",

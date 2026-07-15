@@ -1179,6 +1179,10 @@ fn main() -> ! {
     // P1: prove PIO works (echo through PIO0 SM0; result in PIO_PROBE).
     pio_echo_test(&p);
 
+    // PIO1 (I2S capture + simadc) out of reset for the i2s task.
+    p.RESETS.reset().modify(|_, w| w.pio1().clear_bit());
+    while p.RESETS.reset_done().read().pio1().bit_is_clear() {}
+
     // The CYW43439 Wi-Fi bring-up now lives in the drv-rp235x-cyw43 task (owns
     // PIO2 + the control pins, streams firmware from auxflash). The pre-kernel
     // probe below is kept for reference but no longer invoked.

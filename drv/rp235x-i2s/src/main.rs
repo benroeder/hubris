@@ -26,6 +26,7 @@
 #![no_main]
 
 use core::ptr::addr_of_mut;
+use drv_rp235x_gpio_api::Rp235xGpio;
 use drv_rp235x_i2s_api::I2sError;
 use idol_runtime::RequestError;
 use userlib::sys_get_timer;
@@ -46,6 +47,7 @@ mod sd;
 
 #[cfg(feature = "sdcard")]
 task_slot!(SDCARD, sdcard);
+task_slot!(GPIO, gpio);
 
 // ---- Pins (Pico 2 GPIO numbers) -- SB Components MusicPi HAT ----------------
 // PCM5100A DAC (same PCM510xA family/datasheet) + PAM8908 headphone amp.
@@ -162,17 +164,12 @@ const SET_PINDIRS_1: u16 = 0xe081;
 /// `set pindirs, 3` (side 0b00) -- make the side-set pair (BCK, LRCK) outputs.
 const SET_PINDIRS_3: u16 = 0xe083;
 
-/// Configure a GPIO as an SIO output driven to `high`.
+/// Configure a GPIO as an SIO output driven to `high`. Muxing goes through
+/// the gpio task (this task has no IO_BANK0/PADS_BANK0 grant -- MPU regions
+/// are budgeted); the level itself is set via SIO, which we do own.
 fn sio_output(p: &rp235x_pac::Peripherals, pin: u32, high: bool) {
-    p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
-        w.od().clear_bit();
-        w.iso().clear_bit();
-        w.ie().set_bit()
-    });
-    p.IO_BANK0
-        .gpio(pin as usize)
-        .gpio_ctrl()
-        .modify(|_, w| unsafe { w.funcsel().bits(5) });
+    let gpio = Rp235xGpio::from(GPIO.get_task_id());
+    let _ = gpio.set_function(pin as u8, 5);
     if high {
         p.SIO.gpio_out_set().write(|w| unsafe { w.bits(1 << pin) });
     } else {
@@ -181,18 +178,10 @@ fn sio_output(p: &rp235x_pac::Peripherals, pin: u32, high: bool) {
     p.SIO.gpio_oe_set().write(|w| unsafe { w.bits(1 << pin) });
 }
 
-/// Configure a GPIO pad + route it to PIO0 (mirrors the ws2812/cyw43 PIO pins).
-fn route_pio_pin(p: &rp235x_pac::Peripherals, pin: u32) {
-    p.PADS_BANK0.gpio(pin as usize).modify(|_, w| {
-        w.od().clear_bit();
-        w.iso().clear_bit();
-        w.ie().set_bit();
-        unsafe { w.drive().bits(3) }
-    });
-    p.IO_BANK0
-        .gpio(pin as usize)
-        .gpio_ctrl()
-        .modify(|_, w| unsafe { w.funcsel().bits(FUNCSEL_PIO0) });
+/// Route a pad to PIO0 via the gpio task (un-isolates + enables the buffers).
+fn route_pio_pin(_p: &rp235x_pac::Peripherals, pin: u32) {
+    let gpio = Rp235xGpio::from(GPIO.get_task_id());
+    let _ = gpio.set_function(pin as u8, FUNCSEL_PIO0);
 }
 
 /// (int, frac) clock divider for the PIO SM at `rate` Hz (PIO clk =
@@ -203,6 +192,179 @@ fn clkdiv_for(rate: u32) -> (u16, u8) {
     let frac = (((SYS_CLK_HZ % pio_clk) as u64 * 256 + pio_clk as u64 / 2)
         / pio_clk as u64) as u8;
     (int as u16, frac)
+}
+
+/// Arm a free-running ring DMA channel. `ring_on_write` selects which address
+/// wraps; the other stays fixed (a PIO FIFO).
+fn arm_ring_dma(
+    p: &rp235x_pac::Peripherals,
+    ch_i: usize,
+    read: u32,
+    write: u32,
+    treq: u8,
+    ring_bits: u8,
+    ring_on_write: bool,
+) {
+    p.DMA
+        .chan_abort()
+        .write(|w| unsafe { w.chan_abort().bits(1 << ch_i) });
+    while p.DMA.chan_abort().read().bits() & (1 << ch_i) != 0 {}
+    let ch = p.DMA.ch(ch_i);
+    ch.ch_read_addr().write(|w| unsafe { w.bits(read) });
+    ch.ch_write_addr().write(|w| unsafe { w.bits(write) });
+    ch.ch_trans_count()
+        .write(|w| unsafe { w.count().bits(TRANS_COUNT) });
+    ch.ch_ctrl_trig().write(|w| unsafe {
+        w.en().bit(true);
+        w.data_size().bits(DATA_SIZE_WORD);
+        w.incr_read().bit(!ring_on_write);
+        w.incr_write().bit(ring_on_write);
+        w.ring_size().bits(ring_bits);
+        w.ring_sel().bit(ring_on_write);
+        w.treq_sel().bits(treq);
+        w.chain_to().bits(ch_i as u8);
+        w.high_priority().bit(false);
+        w
+    });
+}
+
+/// PIO1 bring-up: the capture receivers (SM0/SM1) and, with `simadc`, the
+/// fake-ADC transmitters (SM2/SM3) that drive the same pads. All SMs run at
+/// full clk_sys (they are `wait`-paced by the PIO0-driven BCK/LRCK).
+fn pio1_init(p: &rp235x_pac::Peripherals) {
+    // Input pads via the gpio task (un-isolates + enables both buffers). With
+    // simadc the same pads are also PIO1 OUTPUTS -- the receivers read the
+    // driven value back.
+    {
+        let gpio = Rp235xGpio::from(GPIO.get_task_id());
+        for pin in [IN_A, IN_B] {
+            let _ = gpio.set_function(pin as u8, FUNCSEL_PIO1);
+        }
+    }
+
+    let pio = &p.PIO1;
+    pio.ctrl().modify(|_, w| unsafe { w.sm_enable().bits(0) });
+    for (i, insn) in PIO1_RX_PROG.iter().enumerate() {
+        pio.instr_mem(i).write(|w| unsafe { w.bits(*insn as u32) });
+    }
+    #[cfg(feature = "simadc")]
+    for (i, insn) in PIO1_SIM_PROG.iter().enumerate() {
+        pio.instr_mem(8 + i)
+            .write(|w| unsafe { w.bits(*insn as u32) });
+    }
+
+    // Receivers: SM0 reads IN_A, SM1 reads IN_B. autopush 32, shift LEFT.
+    for (smi, pin) in [(0usize, IN_A), (1, IN_B)] {
+        let sm = pio.sm(smi);
+        sm.sm_clkdiv().write(|w| unsafe { w.int().bits(1).frac().bits(0) });
+        sm.sm_shiftctrl().modify(|_, w| unsafe {
+            w.in_shiftdir().clear_bit();
+            w.autopush().set_bit();
+            w.push_thresh().bits(0)
+        });
+        sm.sm_pinctrl()
+            .modify(|_, w| unsafe { w.in_base().bits(pin as u8) });
+        sm.sm_execctrl()
+            .modify(|_, w| unsafe { w.wrap_top().bits(7).wrap_bottom().bits(4) });
+        // Start at the sync preamble.
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0000) });
+    }
+
+    // Fake ADCs: SM2 drives IN_A, SM3 drives IN_B. autopull 32, shift LEFT.
+    #[cfg(feature = "simadc")]
+    for (smi, pin) in [(2usize, IN_A), (3, IN_B)] {
+        let sm = pio.sm(smi);
+        sm.sm_clkdiv().write(|w| unsafe { w.int().bits(1).frac().bits(0) });
+        sm.sm_shiftctrl().modify(|_, w| unsafe {
+            w.out_shiftdir().clear_bit();
+            w.autopull().set_bit();
+            w.pull_thresh().bits(0)
+        });
+        sm.sm_pinctrl().modify(|_, w| unsafe {
+            w.out_base().bits(pin as u8);
+            w.out_count().bits(1);
+            w.set_base().bits(pin as u8);
+            w.set_count().bits(1)
+        });
+        sm.sm_execctrl()
+            .modify(|_, w| unsafe {
+                w.wrap_top().bits(13).wrap_bottom().bits(10)
+            });
+        // Pin to output, then start at the sync preamble (instr 8).
+        sm.sm_instr()
+            .write(|w| unsafe { w.sm0_instr().bits(SET_PINDIRS_1) });
+        sm.sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0008) });
+    }
+
+    // Fill the simadc rings with cycle-snapped sines: A ~523 Hz, B ~659 Hz at
+    // 48 kHz (they track fs). Same value both channels of each fake input.
+    #[cfg(feature = "simadc")]
+    {
+        // SAFETY: pre-arm, single-threaded.
+        let (a, b) = unsafe {
+            (
+                &mut (*core::ptr::addr_of_mut!(SIM_A)).0,
+                &mut (*core::ptr::addr_of_mut!(SIM_B)).0,
+            )
+        };
+        for (ring, hz) in [(a, 523u32), (b, 659u32)] {
+            let cyc = ((SIM_FRAMES as u32 * hz + 24_000) / 48_000).max(1);
+            for (f, w) in ring.iter_mut().enumerate() {
+                let deg =
+                    (f as u32 * cyc % SIM_FRAMES as u32) * 360 / SIM_FRAMES as u32;
+                let v = isin(deg) as u16 as u32;
+                *w = (v << 16) | v;
+            }
+        }
+        arm_ring_dma(
+            p,
+            DMA_SIM_A,
+            core::ptr::addr_of!(SIM_A) as u32,
+            pio.txf(2).as_ptr() as u32,
+            TREQ_PIO1_TX2,
+            SIM_RING_BITS,
+            false,
+        );
+        arm_ring_dma(
+            p,
+            DMA_SIM_B,
+            core::ptr::addr_of!(SIM_B) as u32,
+            pio.txf(3).as_ptr() as u32,
+            TREQ_PIO1_TX3,
+            SIM_RING_BITS,
+            false,
+        );
+    }
+
+    // Capture DMA: RXF -> rings, ring on the WRITE address.
+    arm_ring_dma(
+        p,
+        DMA_RX_A,
+        pio.rxf(0).as_ptr() as u32,
+        core::ptr::addr_of!(CAP_A) as u32,
+        TREQ_PIO1_RX0,
+        CAP_RING_BITS,
+        true,
+    );
+    arm_ring_dma(
+        p,
+        DMA_RX_B,
+        pio.rxf(1).as_ptr() as u32,
+        core::ptr::addr_of!(CAP_B) as u32,
+        TREQ_PIO1_RX1,
+        CAP_RING_BITS,
+        true,
+    );
+
+    // Enable: transmitters first (they park in the sync preamble with data
+    // banked), then the receivers.
+    #[cfg(feature = "simadc")]
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() | 0b1100)
+    });
+    pio.ctrl().modify(|r, w| unsafe {
+        w.sm_enable().bits(r.sm_enable().bits() | 0b0011)
+    });
 }
 
 /// One-time PIO setup: route the 3 pins, load the program, configure SM0's
@@ -372,6 +534,8 @@ struct Src {
     /// Q15 gain (0..=32767).
     gain: u16,
     /// DDS phase + step (tone sources only; step derives from `hz` and fs).
+    /// Unused on capture (`simadc`) builds, where A/B come from the rings.
+    #[cfg_attr(feature = "simadc", allow(dead_code))]
     phase: u32,
     hz: u32,
 }
@@ -391,6 +555,68 @@ struct Duck {
     /// Q15 current duck gain (slews between 32767 and `floor`).
     gain: u16,
 }
+
+// ---- Capture path (PIO1): I2S slave receivers on the input pins, clocked by
+// reading our own BCK/LRCK. See docs/mixer-roadmap.md "Sprint-2 capture".
+/// Input A / B data pins (MusicPi free pins; PCM1802 DOUTs land here).
+const IN_A: u32 = 27;
+const IN_B: u32 = 28;
+/// funcsel routing a GPIO to PIO1.
+const FUNCSEL_PIO1: u8 = 7;
+/// DMA channels: capture writes (ring on WRITE), simadc feeders (ring on READ).
+const DMA_RX_A: usize = 2;
+const DMA_RX_B: usize = 3;
+#[cfg(feature = "simadc")]
+const DMA_SIM_A: usize = 4;
+#[cfg(feature = "simadc")]
+const DMA_SIM_B: usize = 5;
+/// RP2350 DREQ indexes: PIO1 TX0..3 = 8..11, RX0..3 = 12..15.
+const TREQ_PIO1_RX0: u8 = 12;
+const TREQ_PIO1_RX1: u8 = 13;
+#[cfg(feature = "simadc")]
+const TREQ_PIO1_TX2: u8 = 10;
+#[cfg(feature = "simadc")]
+const TREQ_PIO1_TX3: u8 = 11;
+
+/// Capture rings: 1024 frames = 4 KiB each ((L << 16) | R words), ring-aligned.
+const CAP_FRAMES: usize = 1024;
+const CAP_RING_BITS: u8 = 12;
+#[repr(align(4096))]
+struct CapRing([u32; CAP_FRAMES]);
+static mut CAP_A: CapRing = CapRing([0; CAP_FRAMES]);
+static mut CAP_B: CapRing = CapRing([0; CAP_FRAMES]);
+
+/// simadc feeder rings: 256 frames = 1 KiB, filled once with cycle-snapped
+/// sines (distinct pitches so channel identity is audible), looped by DMA.
+#[cfg(feature = "simadc")]
+const SIM_FRAMES: usize = 128;
+#[cfg(feature = "simadc")]
+const SIM_RING_BITS: u8 = 9;
+#[cfg(feature = "simadc")]
+#[repr(align(512))]
+struct SimRing([u32; SIM_FRAMES]);
+#[cfg(feature = "simadc")]
+static mut SIM_A: SimRing = SimRing([0; SIM_FRAMES]);
+#[cfg(feature = "simadc")]
+static mut SIM_B: SimRing = SimRing([0; SIM_FRAMES]);
+
+/// PIO1 program: shared I2S slave receiver (offset 0, SM0/SM1; the SMs differ
+/// only in in_base). Sync ONCE to a LRCK fall + skip one BCK (the I2S 1-bit
+/// delay), then free-run 32 bits/frame -- a per-frame resync would skip
+/// alternate frames because the delay pushes each frame's last bit across the
+/// boundary. autopush 32, ISR shifts left -> exact (L<<16)|R words.
+///   0 wait 1 gpio 11 ; 1 wait 0 gpio 11 ; 2 wait 1 gpio 10 ; 3 wait 0 gpio 10
+///   4 wait 1 gpio 10 ; 5 in pins,1     ; 6 wait 0 gpio 10 ; 7 jmp 4
+const PIO1_RX_PROG: [u16; 8] =
+    [0x208b, 0x200b, 0x208a, 0x200a, 0x208a, 0x4001, 0x200a, 0x0004];
+/// simadc fake-ADC transmitter (offset 8, SM2/SM3): sync to a LRCK fall, then
+/// out one bit per BCK falling edge (data changes on the fall, the receivers
+/// sample on the rise). autopull 32, OSR shifts left.
+///   8 wait 1 gpio 11 ; 9 wait 0 gpio 11
+///  10 wait 1 gpio 10 ; 11 wait 0 gpio 10 ; 12 out pins,1 ; 13 jmp 10
+#[cfg(feature = "simadc")]
+const PIO1_SIM_PROG: [u16; 6] =
+    [0x208b, 0x200b, 0x208a, 0x200a, 0x6001, 0x000a];
 
 /// Which decoder (if any) the SD source is running. The decoders themselves
 /// live in the statics below (not on an op's stack) so they survive across
@@ -460,6 +686,13 @@ struct ServerImpl {
     rate: u32,
     /// Next ring chunk the tick will refill.
     next_fill: usize,
+    /// Persistent capture-ring read cursor (frames). Advances exactly one
+    /// chunk per mix_chunk; the capture DMA shares our audio clock, so the
+    /// lag set at init never drifts. Recomputing from the live write pointer
+    /// per chunk re-read overlapping data when a tick filled several chunks
+    /// back-to-back (audible as a buzz of phase jumps).
+    #[cfg(feature = "simadc")]
+    cap_rd: usize,
     /// VU peaks (abs, Q15) since the last status read.
     vu_bus: u16,
     vu_sd: u16,
@@ -467,6 +700,7 @@ struct ServerImpl {
 }
 
 impl ServerImpl {
+    #[cfg_attr(feature = "simadc", allow(dead_code))]
     fn dds_step(hz: u32, rate: u32) -> u32 {
         // 32-bit phase accumulator: step = hz * 2^32 / rate.
         ((hz as u64) << 32).div_euclid(rate as u64) as u32
@@ -480,7 +714,7 @@ impl ServerImpl {
     }
 
     /// Mix one ring chunk from the enabled sources; updates duck + VU state.
-    fn mix_chunk(&mut self, chunk: usize) {
+    fn mix_chunk(&mut self, p: &rp235x_pac::Peripherals, chunk: usize) {
         let ring = ring_ptr();
         let base = chunk * PLAY_CHUNK_FRAMES;
 
@@ -518,9 +752,31 @@ impl ServerImpl {
             }
         }
 
+        // DDS steps drive the tones only on non-capture builds.
+        #[cfg(not(feature = "simadc"))]
         let step_a = Self::dds_step(self.tone_a.hz, self.rate);
+        #[cfg(not(feature = "simadc"))]
         let step_b = Self::dds_step(self.tone_b.hz, self.rate);
         let (mut pk_bus, mut pk_sd, mut pk_out) = (0u16, 0u16, 0u16);
+
+        // Capture mode: sources A/B pull from the PIO1 capture rings (the fake
+        // or real ADCs), read a fixed lag behind each ring's DMA write pointer.
+        // Both rings share our clock, so the lag never drifts.
+        #[cfg(feature = "simadc")]
+        let (cap_a, cap_b, rd_a, rd_b) = {
+            let _ = p;
+            // SAFETY: DMA writes these; the cursor stays a fixed lag behind.
+            let rd = self.cap_rd;
+            self.cap_rd = (self.cap_rd + PLAY_CHUNK_FRAMES) % CAP_FRAMES;
+            unsafe {
+                (
+                    &(*core::ptr::addr_of!(CAP_A)).0,
+                    &(*core::ptr::addr_of!(CAP_B)).0,
+                    rd,
+                    rd,
+                )
+            }
+        };
 
         // With BOTH tones on, A pans hard left and B hard right (doubles as
         // the stereo-identity test); a single tone plays in both ears.
@@ -528,24 +784,51 @@ impl ServerImpl {
         for i in 0..PLAY_CHUNK_FRAMES {
             let (mut bus_l, mut bus_r) = (0i32, 0i32);
             if self.tone_a.enable {
-                let s = isin((self.tone_a.phase >> 23) as u32 * 360 / 512)
-                    as i32;
-                let v = s * self.tone_a.gain as i32 >> 15;
-                bus_l += v;
+                // Capture builds take source A from ring A; DDS otherwise.
+                #[cfg(feature = "simadc")]
+                let (sa_l, sa_r) = {
+                    let w = cap_a[(rd_a + i) % CAP_FRAMES];
+                    ((w >> 16) as i16 as i32, w as i16 as i32)
+                };
+                #[cfg(not(feature = "simadc"))]
+                let (sa_l, sa_r) = {
+                    let s = isin(
+                        (self.tone_a.phase >> 23) as u32 * 360 / 512,
+                    ) as i32;
+                    self.tone_a.phase =
+                        self.tone_a.phase.wrapping_add(step_a);
+                    (s, s)
+                };
+                let g = self.tone_a.gain as i32;
+                let (vl, vr) = (sa_l * g >> 15, sa_r * g >> 15);
+                bus_l += vl;
                 if !both {
-                    bus_r += v;
+                    bus_r += vr;
+                } else {
+                    // hard-pan A left in two-source mode
                 }
-                self.tone_a.phase = self.tone_a.phase.wrapping_add(step_a);
             }
             if self.tone_b.enable {
-                let s = isin((self.tone_b.phase >> 23) as u32 * 360 / 512)
-                    as i32;
-                let v = s * self.tone_b.gain as i32 >> 15;
-                bus_r += v;
+                #[cfg(feature = "simadc")]
+                let (sb_l, sb_r) = {
+                    let w = cap_b[(rd_b + i) % CAP_FRAMES];
+                    ((w >> 16) as i16 as i32, w as i16 as i32)
+                };
+                #[cfg(not(feature = "simadc"))]
+                let (sb_l, sb_r) = {
+                    let s = isin(
+                        (self.tone_b.phase >> 23) as u32 * 360 / 512,
+                    ) as i32;
+                    self.tone_b.phase =
+                        self.tone_b.phase.wrapping_add(step_b);
+                    (s, s)
+                };
+                let g = self.tone_b.gain as i32;
+                let (vl, vr) = (sb_l * g >> 15, sb_r * g >> 15);
+                bus_r += vr;
                 if !both {
-                    bus_l += v;
+                    bus_l += vl;
                 }
-                self.tone_b.phase = self.tone_b.phase.wrapping_add(step_b);
             }
             let bus_pk = bus_l.abs().max(bus_r.abs());
             pk_bus = pk_bus.max(bus_pk.unsigned_abs().min(32767) as u16);
@@ -591,7 +874,7 @@ impl ServerImpl {
         let cur = dma_chunk(p);
         while self.next_fill != cur {
             let c = self.next_fill;
-            self.mix_chunk(c);
+            self.mix_chunk(p, c);
             self.next_fill = (self.next_fill + 1) % PLAY_CHUNKS;
         }
     }
@@ -654,7 +937,9 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
         let gain = gain.min(32767);
         match src {
             0 | 1 => {
-                if enable != 0 && !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&hz) {
+                // hz == 0 means "keep the current frequency" (and is
+                // meaningless on capture builds anyway).
+                if hz != 0 && !(TONE_MIN_HZ..=TONE_MAX_HZ).contains(&hz) {
                     return Err(I2sError::BadArg.into());
                 }
                 let t = if src == 0 {
@@ -943,6 +1228,7 @@ fn main() -> ! {
     // (Amp gain is set by the on-board DIP switches; see the note above.)
     sio_output(&p, XSMT, true);
     pio_init(&p);
+    pio1_init(&p);
     set_rate(&p, DEFAULT_RATE_HZ);
 
     let mut server = ServerImpl {
@@ -967,13 +1253,27 @@ fn main() -> ! {
         },
         rate: DEFAULT_RATE_HZ,
         next_fill: 0,
+        #[cfg(feature = "simadc")]
+        cap_rd: 0,
         vu_bus: 0,
         vu_sd: 0,
         vu_out: 0,
     };
+    // Start the capture read cursor a full chunk + margin behind the write
+    // pointer so a whole chunk read never crosses it.
+    #[cfg(feature = "simadc")]
+    {
+        let a = p.DMA.ch(DMA_RX_A).ch_write_addr().read().bits();
+        let wr = ((a.wrapping_sub(core::ptr::addr_of!(CAP_A) as u32)
+            as usize)
+            / 4)
+            % CAP_FRAMES;
+        server.cap_rd =
+            (wr + CAP_FRAMES - PLAY_CHUNK_FRAMES - 128) % CAP_FRAMES;
+    }
     // Prime the whole ring, then arm the DMA and the mixer tick.
     for c in 0..PLAY_CHUNKS {
-        server.mix_chunk(c);
+        server.mix_chunk(&p, c);
     }
     arm_dma(&p);
     sys_set_timer(

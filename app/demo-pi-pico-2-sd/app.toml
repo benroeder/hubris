@@ -7,7 +7,7 @@ stacksize = 944
 
 [kernel]
 name = "demo-pi-pico-2-sd"
-requires = {flash = 32768, ram = 12288}
+requires = {flash = 32768, ram = 12800}
 stacksize = 8192
 
 [tasks.jefe]
@@ -90,11 +90,15 @@ priority = 4
 # blocking play op (same budget the pwm player used). sdcard (prio 2) must be
 # strictly higher priority than this client (4).
 max-sizes = {flash = 98304, ram = 196608}
-stacksize = 65536
-uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
+stacksize = 61440
+# Pin muxing goes through the gpio task (IPC): memories + uses + caboose must
+# fit the MPU's 7 usable regions, and pio0+pio1+dma+sio is already four.
+uses = ["pio0", "pio1", "dma", "sio"]
 start = true
-features = ["sdcard"]
-task-slots = ["sdcard"]
+# simadc: PIO1 fake I2S ADCs drive the capture pins so the whole receive path
+# runs with zero wires until the real PCM1802 boards arrive.
+features = ["sdcard", "simadc"]
+task-slots = ["sdcard", {gpio = "gpio_driver"}]
 notifications = ["timer"]
 
 # MusicPi WS2812 RGB pixel on GP26, sharing PIO0 with the i2s task (SM1,
