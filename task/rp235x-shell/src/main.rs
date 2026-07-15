@@ -3061,21 +3061,40 @@ impl Shell {
             self.out.put(b"play: name too long (8.3 max)\r\n");
             return;
         }
-        if !self.route_audio_jack() {
-            self.out.put(b"play: jack routing failed\r\n");
-            return;
-        }
-        match self.pwm.play_file(name.as_bytes()) {
+        // On I2S builds the player lives in the i2s task (DAC output); no
+        // jack pin routing -- the I2S pins are muxed once at i2s task start.
+        #[cfg(feature = "i2s")]
+        match self.i2s.play_file(name.as_bytes()) {
             Ok(packed) => self.report_play_reply(b"played", packed),
-            Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
+            Err(drv_rp235x_i2s_api::I2sError::OpenFailed) => {
                 self.out.put(b"play: open failed (no card/file?)\r\n");
             }
-            Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
-                self.out.put(
-                    b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
-                );
+            Err(drv_rp235x_i2s_api::I2sError::BadFile) => {
+                self.out.put(b"play: not a playable WAV/FLAC/MP3\r\n");
+            }
+            Err(drv_rp235x_i2s_api::I2sError::BadRate) => {
+                self.out.put(b"play: rate outside 32-48 kHz (DAC PLL)\r\n");
             }
             Err(_) => self.out.put(b"play: error\r\n"),
+        }
+        #[cfg(not(feature = "i2s"))]
+        {
+            if !self.route_audio_jack() {
+                self.out.put(b"play: jack routing failed\r\n");
+                return;
+            }
+            match self.pwm.play_file(name.as_bytes()) {
+                Ok(packed) => self.report_play_reply(b"played", packed),
+                Err(drv_rp235x_pwm_api::PwmError::OpenFailed) => {
+                    self.out.put(b"play: open failed (no card/file?)\r\n");
+                }
+                Err(drv_rp235x_pwm_api::PwmError::BadWav) => {
+                    self.out.put(
+                        b"play: not a supported WAV (PCM 16-bit mono/stereo)\r\n",
+                    );
+                }
+                Err(_) => self.out.put(b"play: error\r\n"),
+            }
         }
     }
 

@@ -28,7 +28,23 @@
 use core::ptr::addr_of_mut;
 use drv_rp235x_i2s_api::I2sError;
 use idol_runtime::RequestError;
+use userlib::sys_get_timer;
 use userlib::RecvMessage;
+#[cfg(feature = "sdcard")]
+use idol_runtime::{Leased, LenLimit, R};
+#[cfg(feature = "sdcard")]
+use userlib::task_slot;
+
+#[cfg(feature = "sdcard")]
+use drv_rp235x_sdcard_api::Rp235xSdcard;
+#[cfg(feature = "sdcard")]
+use rp235x_audio_decode as decoder;
+
+#[cfg(feature = "sdcard")]
+mod sd;
+
+#[cfg(feature = "sdcard")]
+task_slot!(SDCARD, sdcard);
 
 // ---- Pins (Pico 2 GPIO numbers) -- SB Components MusicPi HAT ----------------
 // PCM5100A DAC (same PCM510xA family/datasheet) + PAM8908 headphone amp.
@@ -80,18 +96,29 @@ const DMA_CH: usize = 0;
 const TREQ_PIO0_TX0: u8 = 0;
 /// DMA transfer size: 32-bit word.
 const DATA_SIZE_WORD: u8 = 2;
-/// Ring wrap: 2^13 = 8192 bytes = 2048 u32 = the whole ring (kept small so the
-/// task fits alongside pwm in the coexist image).
-const RING_SIZE_BITS: u8 = 13;
+/// Ring wrap: 2^14 = 16384 bytes = 4096 u32 = the whole ring -- the same size
+/// as the pwm player's, banking ~93 ms of slack at 44.1 kHz against the FLAC
+/// decoder's bursty whole-block prefetch.
+const RING_SIZE_BITS: u8 = 14;
 /// Large finite reload -- loops for hours until aborted (ENDLESS/COUNT=0 does
 /// not arm on this HW; see the pwm driver note).
 const TRANS_COUNT: u32 = 0x0fff_ffff;
 
 /// Frames in the ring. Each frame is ONE 32-bit word, `(right << 16) | left`
-/// (the same stereo packing as the pwm driver's ring), so the ring is 2048
-/// words = 8 KiB (matches RING_SIZE_BITS).
-const RING_FRAMES: usize = 2048;
+/// (the same stereo packing as the pwm driver's ring), so the ring is 4096
+/// words = 16 KiB (matches RING_SIZE_BITS).
+const RING_FRAMES: usize = 4096;
 const RING_WORDS: usize = RING_FRAMES;
+
+// ---- SD player (port of the pwm driver's play engine, minus PlayQuant:
+// samples go to the DAC as-is) ------------------------------------------------
+/// Ring chunks the producer refills behind the DMA read pointer.
+const PLAY_CHUNKS: usize = 8;
+const PLAY_CHUNK_FRAMES: usize = RING_FRAMES / PLAY_CHUNKS;
+const PLAY_CHUNK_BYTES: u32 = (RING_BYTES / PLAY_CHUNKS) as u32;
+/// Refill-stall escape: if the DMA read pointer stops moving this long, bail.
+const PLAY_STALL_MS: u64 = 500;
+const PLAY_STALL_POLL_MASK: u32 = 0x3ffff;
 const RING_BYTES: usize = RING_WORDS * 4;
 
 /// Backing store, 2x the ring so a 16 KiB window can be found 4096-byte aligned
@@ -247,13 +274,29 @@ fn set_rate(p: &rp235x_pac::Peripherals, rate: u32) {
     pio.sm(0)
         .sm_clkdiv()
         .write(|w| unsafe { w.int().bits(int).frac().bits(frac) });
+    // Flush any stale words out of the TX FIFO: joining + unjoining clears
+    // both FIFOs. (SM_RESTART does NOT flush FIFOs.)
+    pio.sm(0)
+        .sm_shiftctrl()
+        .modify(|_, w| w.fjoin_tx().set_bit());
+    pio.sm(0)
+        .sm_shiftctrl()
+        .modify(|_, w| w.fjoin_tx().clear_bit());
     // Clear the (write-1-to-clear) stall/overrun flags so post-enable FDEBUG
-    // reads are fresh evidence, then restart SM0 + divider and enable.
+    // reads are fresh evidence, then restart SM0's shift state and divider.
     pio.fdebug().write(|w| unsafe { w.bits(0xffff_ffff) });
     pio.ctrl().modify(|_, w| unsafe {
         w.sm_restart().bits(1);
         w.clkdiv_restart().bits(1)
     });
+    // CRITICAL: force the PC back to the entry instruction. SM_RESTART clears
+    // OSR/shift counters but NOT the program counter -- a previously-stopped
+    // SM sits stalled at an arbitrary mid-frame `out`, and resuming there
+    // slips the I2S frame alignment by a partial word: every sample then
+    // straddles two frames (sine -> buzz, music -> noise). Diagnosed on
+    // hardware: the freshly-entered boot tone was pure while every re-armed
+    // `play` buzzed.
+    pio.sm(0).sm_instr().write(|w| unsafe { w.sm0_instr().bits(0x0007) });
     pio.ctrl().modify(|r, w| unsafe {
         w.sm_enable().bits(r.sm_enable().bits() | 1)
     });
@@ -267,27 +310,39 @@ fn cycle_count(freq: u32, rate: u32) -> u32 {
     c.max(1)
 }
 
-/// Fill the ring with a stereo square wave: `cyc_l` / `cyc_r` whole cycles for
-/// the left / right channels. One word per frame, `(right << 16) | left` (the
-/// PIO shifts the top half out first, during the LRCK-high right phase).
+/// Integer sine via the Bhaskara I approximation (~0.2% error, no tables/FP):
+/// `deg` in 0..360, returns -TONE_AMPL..=TONE_AMPL. A SMOOTH full-range test
+/// signal -- a square tone still sounds "like a tone" through many bit-level
+/// manglings (sign flips, shifts) that turn real audio into noise, so the
+/// boot/test tone must be a sine to actually validate sample integrity.
+fn isin(deg: u32) -> i16 {
+    let (half, neg) = if deg < 180 { (deg, false) } else { (deg - 180, true) };
+    // 4*x*(180-x) / (40500 - x*(180-x)), scaled by TONE_AMPL.
+    let q = half * (180 - half);
+    let s = (4 * q as u64 * TONE_AMPL as u64 / (40500 - q) as u64) as i16;
+    if neg {
+        -s
+    } else {
+        s
+    }
+}
+
+/// Fill the ring with a stereo sine: `cyc_l` / `cyc_r` whole cycles for the
+/// left / right channels. One word per frame, canonical pico-extras packing
+/// `(left << 16) | right` (top half plays while ws=0 = LEFT).
 fn fill_ring_tone(cyc_l: u32, cyc_r: u32) {
     let ring = ring_ptr();
-    let square = |frame: usize, cyc: u32| -> u16 {
-        // Position within the current cycle, 0..RING_FRAMES; first half high.
+    let sine = |frame: usize, cyc: u32| -> u16 {
         let pos = (frame as u32).wrapping_mul(cyc) % RING_FRAMES as u32;
-        let s: i16 = if pos < (RING_FRAMES as u32 / 2) {
-            TONE_AMPL
-        } else {
-            -TONE_AMPL
-        };
-        s as u16
+        let deg = pos * 360 / RING_FRAMES as u32;
+        isin(deg) as u16
     };
     for f in 0..RING_FRAMES {
-        let l = square(f, cyc_l) as u32;
-        let r = square(f, cyc_r) as u32;
+        let l = sine(f, cyc_l) as u32;
+        let r = sine(f, cyc_r) as u32;
         // SAFETY: ring is the aligned window in RING_STORE; f < RING_WORDS.
         unsafe {
-            ring.add(f).write_volatile((r << 16) | l);
+            ring.add(f).write_volatile((l << 16) | r);
         }
     }
 }
@@ -341,6 +396,127 @@ fn play(
     Ok(())
 }
 
+/// Fill one ring chunk from the decoder: 16-bit interleaved stereo straight
+/// into `(right << 16) | left` frames -- no quantizer, the DAC gets the
+/// samples as-is. Frames past decoder EOF are zero (the DAC's zero-data
+/// detect then analog-mutes the tail). Returns the sample count decoded.
+#[cfg(feature = "sdcard")]
+fn fill_chunk<D: decoder::Decoder>(dec: &mut D, chunk: usize) -> usize {
+    let ring = ring_ptr();
+    let base = chunk * PLAY_CHUNK_FRAMES;
+    let mut pcm = [0i16; PLAY_CHUNK_FRAMES * 2];
+    let got = dec.next_pcm(&mut pcm);
+    for slot in pcm.iter_mut().skip(got) {
+        *slot = 0;
+    }
+    for i in 0..PLAY_CHUNK_FRAMES {
+        let l = pcm[2 * i] as u16 as u32;
+        let r = pcm[2 * i + 1] as u16 as u32;
+        // Canonical pico-extras FIFO format: bits 31:16 play while ws=0 (the
+        // LEFT channel in I2S), bits 15:0 while ws=1 (right).
+        // SAFETY: ring is the aligned window in RING_STORE; base + i <
+        // RING_FRAMES. Single-threaded server, no references taken.
+        unsafe {
+            ring.add(base + i).write_volatile((l << 16) | r);
+        }
+    }
+    got
+}
+
+/// Which ring chunk the DMA is currently reading, from its live read address.
+#[cfg(feature = "sdcard")]
+fn dma_chunk(p: &rp235x_pac::Peripherals) -> usize {
+    let base = ring_ptr() as u32;
+    let addr = p.DMA.ch(DMA_CH).ch_read_addr().read().bits();
+    let off = addr.wrapping_sub(base) & (RING_BYTES as u32 - 1);
+    (off / PLAY_CHUNK_BYTES) as usize
+}
+
+/// Spin until the DMA read pointer crosses `laps` chunk boundaries (EOF tail
+/// drain), bailing if it stalls for PLAY_STALL_MS.
+#[cfg(feature = "sdcard")]
+fn drain_crossings(p: &rp235x_pac::Peripherals, laps: u32) {
+    let mut crossings = 0u32;
+    let mut prev = dma_chunk(p);
+    let mut last_progress = sys_get_timer().now;
+    let mut polls = 0u32;
+    while crossings < laps {
+        let now = dma_chunk(p);
+        if now != prev {
+            crossings += 1;
+            prev = now;
+            last_progress = sys_get_timer().now;
+        }
+        polls = polls.wrapping_add(1);
+        if polls & PLAY_STALL_POLL_MASK == 0
+            && sys_get_timer().now.wrapping_sub(last_progress) > PLAY_STALL_MS
+        {
+            break;
+        }
+    }
+}
+
+/// Blocking play loop (port of the pwm player's): prime the whole ring, arm
+/// the DMA, keep the producer one lap behind the read pointer, `prefetch` in
+/// the idle slack, and after EOF let the silence tail drain one lap. Returns
+/// (underruns, refills).
+#[cfg(feature = "sdcard")]
+fn play_loop<D: decoder::Decoder>(
+    p: &rp235x_pac::Peripherals,
+    dec: &mut D,
+) -> (u32, u32) {
+    let mut eof = false;
+    for chunk in 0..PLAY_CHUNKS {
+        eof = fill_chunk(dec, chunk) == 0;
+    }
+    arm_dma(p);
+
+    let mut refills = 0u32;
+    let mut underruns = 0u32;
+    let mut next_fill = 0usize;
+    let mut last_progress = sys_get_timer().now;
+    let mut polls = 0u32;
+    while !eof {
+        if next_fill != dma_chunk(p) {
+            eof = fill_chunk(dec, next_fill) == 0;
+            refills += 1;
+            if dma_chunk(p) == next_fill {
+                underruns += 1; // producer fell a whole ring behind
+            }
+            next_fill = (next_fill + 1) % PLAY_CHUNKS;
+            last_progress = sys_get_timer().now;
+            continue;
+        }
+        // Caught up: burn the slack pre-decoding the next (FLAC) block so
+        // refills stay pure copy.
+        dec.prefetch();
+        polls = polls.wrapping_add(1);
+        if polls & PLAY_STALL_POLL_MASK == 0
+            && sys_get_timer().now.wrapping_sub(last_progress) > PLAY_STALL_MS
+        {
+            break;
+        }
+    }
+    drain_crossings(p, PLAY_CHUNKS as u32);
+    abort_dma(p);
+    (underruns, refills)
+}
+
+/// Pack the player reply like the pwm driver: rate in bits 0..15, underruns
+/// 16..22 (saturating), truncated flag bit 23, refills 24..31 (saturating).
+#[cfg(feature = "sdcard")]
+fn pack_play_reply(
+    rate: u32,
+    underruns: u32,
+    refills: u32,
+    truncated: u32,
+) -> u32 {
+    (rate & 0xffff)
+        | (underruns.min(0x7f) << 16)
+        | ((truncated & 1) << 23)
+        | (refills.min(0xff) << 24)
+}
+
 struct ServerImpl;
 
 impl idl::InOrderRp235xI2sImpl for ServerImpl {
@@ -376,6 +552,74 @@ impl idl::InOrderRp235xI2sImpl for ServerImpl {
     ) -> Result<(), RequestError<I2sError>> {
         let p = unsafe { rp235x_pac::Peripherals::steal() };
         play(&p, hz_left, hz_right, rate_hz)
+    }
+
+    #[cfg(not(feature = "sdcard"))]
+    fn play_file(
+        &mut self,
+        _: &RecvMessage,
+        _name: LenLimit<Leased<R, [u8]>, 12>,
+    ) -> Result<u32, RequestError<I2sError>> {
+        Err(I2sError::OpenFailed.into())
+    }
+
+    // `inline(never)`: the decoders hold tens of KiB on the stack for the
+    // whole play loop; keep that frame out of the dispatch path.
+    #[cfg(feature = "sdcard")]
+    #[inline(never)]
+    fn play_file(
+        &mut self,
+        _: &RecvMessage,
+        name: LenLimit<Leased<R, [u8]>, 12>,
+    ) -> Result<u32, RequestError<I2sError>> {
+        let n = name.len().min(12);
+        let mut name_buf = [0u8; 12];
+        name.read_range(0..n, &mut name_buf[..n])
+            .map_err(|()| RequestError::went_away())?;
+
+        let source = sd::SdFileSource::open(
+            Rp235xSdcard::from(SDCARD.get_task_id()),
+            &name_buf[..n],
+        )
+        .ok_or(I2sError::OpenFailed)?;
+        // Route by 8.3 extension, exactly like the pwm player.
+        let mut dec = if decoder::is_flac_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Flac(
+                decoder::FlacDecoder::new(source)
+                    .map_err(|_| I2sError::BadFile)?,
+            )
+        } else if decoder::is_mp3_name(&name_buf[..n]) {
+            decoder::AnyDecoder::Mp3(
+                decoder::Nanomp3Decoder::new(source)
+                    .map_err(|_| I2sError::BadFile)?,
+            )
+        } else {
+            decoder::AnyDecoder::Wav(
+                decoder::WavDecoder::new(source)
+                    .map_err(|_| I2sError::BadFile)?,
+            )
+        };
+
+        // The DAC's PLL only locks for fs >= 32 kHz at BCK = 32*fs: reject
+        // rather than clamp (a clamped rate would pitch-shift the audio).
+        let rate = decoder::Decoder::sample_rate(&dec);
+        if !(RATE_MIN_HZ..=RATE_MAX_HZ).contains(&rate) {
+            return Err(I2sError::BadRate.into());
+        }
+
+        let p = unsafe { rp235x_pac::Peripherals::steal() };
+        abort_dma(&p);
+        set_rate(&p, rate);
+        let (underruns, refills) = play_loop(&p, &mut dec);
+        // Leave the ring zeroed so the DAC's zero-data detect mutes.
+        let ring = ring_ptr();
+        for i in 0..RING_WORDS {
+            // SAFETY: i < RING_WORDS, within the aligned window.
+            unsafe { ring.add(i).write_volatile(0) };
+        }
+        arm_dma(&p);
+        let truncated = decoder::Decoder::had_error(&dec) as u32;
+        Ok(pack_play_reply(rate, underruns, refills, truncated))
     }
 
     fn dbg(
@@ -490,9 +734,6 @@ fn main() -> ! {
     // (Amp gain is set by the on-board DIP switches; see the note above.)
     sio_output(&p, XSMT, true);
     pio_init(&p);
-    cortex_m::asm::delay(450_000_000); // stage 1 hold: post-init park
-    set_rate(&p, DEFAULT_RATE_HZ);
-    cortex_m::asm::delay(450_000_000); // stage 2 hold: SM enabled, starved
     // Boot tone: a 440 Hz square at 48 kHz, so the DAC makes sound immediately
     // (proves PIO I2S + PLL) without needing a shell command.
     let _ = play(&p, DEFAULT_TONE_HZ, DEFAULT_TONE_HZ, DEFAULT_RATE_HZ);

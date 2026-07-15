@@ -16,6 +16,17 @@ pub enum I2sError {
     /// The PIO state machine did not drain its TX FIFO (not clocking); the
     /// write was dropped rather than blocking the server forever.
     Stalled = 2,
+    /// `play_file`: no card / no such file (or built without `sdcard`).
+    OpenFailed = 3,
+    /// `play_file`: the file is not a playable WAV/FLAC/MP3.
+    BadFile = 4,
+    /// `play_file`: the file's sample rate is outside the DAC PLL's
+    /// 32-48 kHz window (BCK = 32*fs; datasheet Table 11).
+    BadRate = 5,
+    /// The i2s server died / was restarted mid-call. Returned to the client
+    /// by the IPC layer; `play_file` takes a lease, so idol requires this.
+    #[idol(server_death)]
+    ServerDied = 6,
 }
 
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));
