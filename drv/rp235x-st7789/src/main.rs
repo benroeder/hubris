@@ -104,10 +104,14 @@ impl ServerImpl {
     /// Wait for the PL022 to finish clocking everything out.
     fn spi_drain(&self) {
         while self.spi.sspsr().read().bsy().bit_is_set() {}
-        // Drop anything the (unused) RX side latched so the FIFO never fills.
+        // Drop anything the (unused) RX side latched so the FIFO never fills,
+        // and clear the sticky receive-overrun status it accumulates during
+        // long pixel streams -- a latched ROR would look like a live fault to
+        // anyone reading the status registers later.
         while self.spi.sspsr().read().rne().bit_is_set() {
             let _ = self.spi.sspdr().read();
         }
+        self.spi.sspicr().write(|w| w.roric().clear_bit_by_one());
     }
 
     /// Send a command byte, leaving CS asserted for its data bytes.
@@ -131,8 +135,14 @@ impl ServerImpl {
         }
     }
 
-    /// Open a RAMWR window for the (clipped, non-empty) rectangle.
+    /// Open a RAMWR window for the rectangle. CONTRACT: the caller has already
+    /// clipped to the panel (as `fill_rect` does) -- the release build has no
+    /// overflow checks, so unclipped args would wrap silently.
     fn window(&self, x: u16, y: u16, w: u16, h: u16) {
+        debug_assert!(
+            w > 0 && h > 0 && x + w <= WIDTH && y + h <= HEIGHT,
+            "window args must be pre-clipped"
+        );
         let x0 = x + XOFF;
         let x1 = x + w - 1 + XOFF;
         let y0 = y + YOFF;
@@ -174,14 +184,14 @@ impl ServerImpl {
         self.done();
     }
 
-    /// Render one 8x8 glyph scaled 2x at a 16x16 cell position.
+    /// Render one 8x8 glyph scaled 2x at a 16x16 cell position. Codes outside
+    /// the font (>= 128) render as a blank cell rather than skipping -- a skip
+    /// would leave the cell's previous pixels behind while still advancing the
+    /// cursor.
     fn glyph(&self, col: u8, row: u8, ch: u8, color: u16) {
-        let g: [u8; 8] = match font8x8::legacy::BASIC_LEGACY
+        let g: [u8; 8] = *font8x8::legacy::BASIC_LEGACY
             .get(ch as usize)
-        {
-            Some(g) => *g,
-            None => return,
-        };
+            .unwrap_or(&[0u8; 8]);
         let x = col as u16 * CELL;
         let y = row as u16 * CELL;
         self.window(x, y, CELL, CELL);

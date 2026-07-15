@@ -11,7 +11,7 @@ zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 rp235x-pac = { workspace = true }
 # 8x8 public-domain bitmap font, pure const data, no_std.
-font8x8 = { version = "0.3", default-features = false }
+font8x8 = { workspace = true }
 
 drv-rp235x-st7789-api = { path = "../rp235x-st7789-api" }
 drv-rp235x-sys-api = { path = "../rp235x-sys-api" }

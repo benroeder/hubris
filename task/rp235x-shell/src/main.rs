@@ -1315,21 +1315,28 @@ impl Shell {
                 self.out.put(b"ok\r\n");
             }
             Some("fill") => {
-                let c = arg
-                    .and_then(|a| u16::from_str_radix(a, 16).ok())
-                    .unwrap_or(0);
+                // Bare RGB565 hex (no 0x prefix), like the other hex args.
+                let Some(c) =
+                    arg.and_then(|a| u16::from_str_radix(a, 16).ok())
+                else {
+                    self.out.put(b"usage: tft fill <rgb565-hex>\r\n");
+                    return;
+                };
                 let _ = self.tft.fill(c);
                 self.out.put(b"ok\r\n");
             }
             Some("bl") => {
-                let on = arg.and_then(|a| a.parse::<u8>().ok()).unwrap_or(1);
+                let Some(on) = arg.and_then(|a| a.parse::<u8>().ok()) else {
+                    self.out.put(b"usage: tft bl 0|1\r\n");
+                    return;
+                };
                 let _ = self.tft.backlight(on);
                 self.out.put(b"ok\r\n");
             }
             Some("text") => {
-                // Everything after "tft text " renders from the top-left.
-                let msg =
-                    line.splitn(3, ' ').nth(2).unwrap_or("").as_bytes();
+                // Everything after the "text" verb, whitespace-tolerant
+                // (same idiom as `sd write` / `mailbox role`).
+                let msg = subcommand_rest(line, "text").as_bytes();
                 if msg.is_empty() {
                     self.out.put(b"usage: tft text <msg>\r\n");
                     return;
