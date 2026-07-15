@@ -117,7 +117,10 @@ const MIC_CHANNEL: u8 = 2;
 const MIC_PIN: u8 = 28;
 /// Seengreat push buttons, silk-screened by GPIO. Each wires to GND, so with a
 /// pull-up the pin idles 1 (released) and reads 0 while pressed (active-low).
-const BUTTON_PINS: [u8; 2] = [20, 21];
+// MusicPi BT1/BT2/BT3 (active-low, 10K pull-ups on the HAT). NOTE: the old
+// Seengreat pins GP20/21 are the MusicPi's amp-gain DIP-switch nets, driven
+// to VBUS (5V) -- never configure or read them on this board.
+const BUTTON_PINS: [u8; 3] = [2, 3, 4];
 /// Default sine frequency for the `audiosel` source picker (GP21 = sine).
 const AUDIO_DEFAULT_HZ: u32 = 440;
 
@@ -1695,8 +1698,8 @@ impl Shell {
             // Watch ~10 s in a tight on-board loop, printing each button only when
             // its state CHANGES (edge). Sampling on-device at ~kHz can't miss a
             // normal press the way host polling does. 0 = pressed.
-            self.out.put(b"watching GP20/GP21 for 10s...\r\n");
-            let mut last = [1u8; 2];
+            self.out.put(b"watching BT1/BT2/BT3 (GP2/3/4) for 10s...\r\n");
+            let mut last = [1u8; BUTTON_PINS.len()];
             let t0 = sys_get_timer().now;
             while sys_get_timer().now - t0 < 10_000 {
                 for (i, &pin) in BUTTON_PINS.iter().enumerate() {
@@ -1746,8 +1749,8 @@ impl Shell {
         let _ = self.prep_audio_source();
         // Start on the sine so there is immediate sound.
         let _ = self.pwm.audio_start(AUDIO_DEFAULT_HZ);
-        self.out.put(b"source: sine  (GP20=mic  GP21=sine)\r\n");
-        let mut last = [1u8; 2];
+        self.out.put(b"source: sine  (BT1=mic  other=sine)\r\n");
+        let mut last = [1u8; BUTTON_PINS.len()];
         let t0 = sys_get_timer().now;
         while sys_get_timer().now - t0 < secs * 1000 {
             for (i, &pin) in BUTTON_PINS.iter().enumerate() {
