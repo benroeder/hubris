@@ -173,7 +173,6 @@ const HELP: &[u8] = b"commands:\r\n\
 
 // Per-driver help lines, printed only when that driver's feature is enabled so
 // `help` never advertises a command the build doesn't have.
-#[cfg(feature = "mailbox")]
 #[cfg(feature = "spibus")]
 const HELP_SPIBUS: &[u8] = b"  spi xfer <hex..>      full-duplex exchange, e.g. spi xfer a5 5a 3c\r\n\
   spi role controller|peripheral   set bus role for board-to-board (GP16-19)\r\n\
@@ -547,6 +546,12 @@ impl Shell {
     /// routing failed. Shared by `play_tone` and `cmd_sine` so the pin/funcsel
     /// live in one place.
     fn route_buzzer(&mut self) -> bool {
+        // See route_audio_jack: GP18 is the SD card's SCK on I2S builds.
+        if cfg!(feature = "i2s") {
+            self.out
+                .put(b"no buzzer pin on this build (GP18 = SD card SCK)\r\n");
+            return false;
+        }
         self.gpio.set_function(BUZZER_PIN, 4).is_ok()
     }
 
@@ -597,6 +602,14 @@ impl Shell {
     /// selected. Returns false if either GPIO routing failed. Shared by
     /// `cmd_audio` and `cmd_audio2`.
     fn route_audio_jack(&mut self) -> bool {
+        // On I2S (MusicPi) builds GP18/GP19 are the SD card's SPI0 SCK/MOSI,
+        // not an audio jack: remuxing them to PWM would silently kill the SD
+        // card until reboot. Audio out is the I2S DAC (`play`, `i2s tone`).
+        if cfg!(feature = "i2s") {
+            self.out
+                .put(b"no PWM audio jack on this build (use i2s/play)\r\n");
+            return false;
+        }
         self.gpio.set_function(AUDIO_LEFT_PIN, 4).is_ok()
             && self.gpio.set_function(AUDIO_RIGHT_PIN, 4).is_ok()
     }

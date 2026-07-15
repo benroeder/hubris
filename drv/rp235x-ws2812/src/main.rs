@@ -118,7 +118,11 @@ fn setup(p: &rp235x_pac::Peripherals) {
 
     let pio = &p.PIO0;
     // Disable OUR state machine before touching config -- bitwise, so the I2S
-    // task's SM (sharing this PIO block) is never clobbered.
+    // task's SM (sharing this PIO block) is never clobbered. NOTE: the RMWs on
+    // the shared CTRL register are only race-free because this setup does no
+    // blocking IPC before its CTRL writes (it runs to completion before the
+    // lower-priority i2s task starts). Adding an IPC here would open a
+    // lost-update window against the i2s task's CTRL RMWs.
     pio.ctrl().modify(|r, w| unsafe {
         w.sm_enable().bits(r.sm_enable().bits() & !(1 << SM) as u8)
     });

@@ -51,7 +51,10 @@ DAC line-out, always on -- the headphone amp (and DAC mute) gate on GP22.
   `audio` commands on this HAT (they re-mux GP18/19 to PWM).
 - ds1302 RTC task drives GP6-8 = TFT D/C + backlight -- cosmetic flicker only;
   disable ds1302 when the TFT driver lands.
-- i2c_driver GP4/5: GP4 doubles as BT3 (unused -- fine).
+- i2c_driver GP4/5: GP4 doubles as BT3, and the shell `buttons`/`audiosel`
+  commands remux GP4 to SIO -- I2C0 is then dead until reboot. Nothing sits on
+  I2C0 on this HAT, so this is accepted for now; drop i2c_driver from the app
+  when the TFT stage reshuffles it.
 
 ## Follow-ups for full MusicPi support
 
