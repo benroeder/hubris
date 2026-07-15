@@ -127,13 +127,16 @@ uses = ["watchdog", "psm", "qmi"]
 start = true
 extern-regions = ["rom", "xip"]
 
+# MusicPi TF slot: SPI0 on GP16-19 (the "musicpi" feature selects block+pins).
+# This frees SPI1 + GP10-13 for the I2S clocks (GP10/11) and the TFT (GP12/13).
 [tasks.sdcard]
 name = "drv-rp235x-sdcard"
 priority = 2
 max-sizes = {flash = 8192, ram = 2048}
 stacksize = 1024
-uses = ["spi1", "io_bank0", "pads_bank0", "sio"]
+uses = ["spi0", "io_bank0", "pads_bank0", "sio"]
 start = true
+features = ["musicpi"]
 task-slots = ["sys"]
 
 [tasks.ds1302]

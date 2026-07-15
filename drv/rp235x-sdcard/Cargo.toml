@@ -16,6 +16,11 @@ drv-rp235x-sys-api = { path = "../rp235x-sys-api" }
 counters = { path = "../../lib/counters" }
 userlib = { path = "../../sys/userlib" }
 
+[features]
+# SB Components MusicPi HAT: TF slot on SPI0, SCK=GP18 MOSI=GP19 MISO=GP16
+# CS=GP17 (manual SIO). Default: SPI1 on GP10-13 (the SPI1 breakout wiring).
+musicpi = []
+
 [build-dependencies]
 idol = { workspace = true }
 

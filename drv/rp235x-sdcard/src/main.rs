@@ -36,14 +36,32 @@ use userlib::{RecvMessage, task_slot};
 task_slot!(SYS, sys);
 
 // --- Pin map (named consts so hardware bring-up can retarget the mux) --------
-/// SPI1 SCK.
+/// SPI SCK.
+#[cfg(not(feature = "musicpi"))]
 const SCK: u32 = 10;
-/// SPI1 MOSI / TX (controller out).
+#[cfg(feature = "musicpi")]
+const SCK: u32 = 18;
+/// SPI MOSI / TX (controller out).
+#[cfg(not(feature = "musicpi"))]
 const MOSI: u32 = 11;
-/// SPI1 MISO / RX (controller in).
+#[cfg(feature = "musicpi")]
+const MOSI: u32 = 19;
+/// SPI MISO / RX (controller in).
+#[cfg(not(feature = "musicpi"))]
 const MISO: u32 = 12;
+#[cfg(feature = "musicpi")]
+const MISO: u32 = 16;
 /// Chip-select, driven manually as a SIO GPIO (active LOW).
+#[cfg(not(feature = "musicpi"))]
 const CS: u32 = 13;
+#[cfg(feature = "musicpi")]
+const CS: u32 = 17;
+
+/// The PL022 SPI block backing the card: SPI1 by default, SPI0 on the MusicPi.
+#[cfg(not(feature = "musicpi"))]
+type SpiBlock = rp235x_pac::SPI1;
+#[cfg(feature = "musicpi")]
+type SpiBlock = rp235x_pac::SPI0;
 /// funcsel that routes a GPIO to the SPI function on the RP2350.
 const FUNCSEL_SPI: u8 = 1;
 /// funcsel that routes a GPIO to SIO on the RP2350.
@@ -101,7 +119,7 @@ const TOKEN_START: u8 = 0xFE;
 const FILLER: u8 = 0xFF;
 
 struct ServerImpl {
-    spi: rp235x_pac::SPI1,
+    spi: SpiBlock,
     sio: rp235x_pac::SIO,
     /// CCS: card uses block (SDHC/SDXC) rather than byte (SDSC) addressing.
     ccs: bool,
@@ -555,7 +573,10 @@ fn setup(p: &rp235x_pac::Peripherals) {
 
     // SPI1: configure with SSE off, then enable. 8-bit Motorola SPI mode 0
     // (SPO=SPH=0) at INIT speed (~295 kHz).
+    #[cfg(not(feature = "musicpi"))]
     let spi = &p.SPI1;
+    #[cfg(feature = "musicpi")]
+    let spi = &p.SPI0;
     spi.sspcr1().write(|w| w.sse().clear_bit());
     spi.sspcpsr()
         .write(|w| unsafe { w.cpsdvsr().bits(INIT_CPSDVSR) });
@@ -577,13 +598,19 @@ fn setup(p: &rp235x_pac::Peripherals) {
 fn main() -> ! {
     // Bring SPI1 out of reset via the sys server before touching its registers.
     let sys = Rp235xSys::from(SYS.get_task_id());
+    #[cfg(not(feature = "musicpi"))]
     sys.leave_reset(sys_api::SPI1);
+    #[cfg(feature = "musicpi")]
+    sys.leave_reset(sys_api::SPI0);
 
     let p = unsafe { rp235x_pac::Peripherals::steal() };
     setup(&p);
 
     let mut server = ServerImpl {
+        #[cfg(not(feature = "musicpi"))]
         spi: p.SPI1,
+        #[cfg(feature = "musicpi")]
+        spi: p.SPI0,
         sio: p.SIO,
         ccs: false,
         v2: false,
