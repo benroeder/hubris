@@ -682,11 +682,20 @@ pub fn package(
                 .map(|c| c.tasks.contains(&t.to_string()))
                 .unwrap_or(false) as usize;
 
+        // The PMSAv8 MPU gives each task 8 regions; one is reserved, so a
+        // task's memories + `uses` + caboose must fit in 7.
+        let Some(spare) = 7usize.checked_sub(n) else {
+            bail!(
+                "task {t} needs {n} MPU regions (memories + uses + \
+                 extern-regions + caboose) but only 7 are available; reduce \
+                 its `uses` (e.g. delegate pin muxing to a gpio task)"
+            );
+        };
         task_reqs.insert(
             t,
             TaskRequest {
                 memory: sz,
-                spare_regions: 7 - n,
+                spare_regions: spare,
             },
         );
     }

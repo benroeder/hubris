@@ -12,9 +12,14 @@ zerocopy-derive = { workspace = true }
 rp235x-pac = { workspace = true }
 
 drv-rp235x-i2s-api = { path = "../rp235x-i2s-api" }
+drv-rp235x-gpio-api = { path = "../rp235x-gpio-api" }
 drv-rp235x-sdcard-api = { path = "../rp235x-sdcard-api", optional = true }
 embedded-sdmmc = { workspace = true, optional = true }
-rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["mp3", "flac"], optional = true }
+# NOTE: no "mp3": the mixer parks the decoder in a static, and nanomp3's
+# constructor needs ~72K of nested stack on top of the ~80K by-value move --
+# it blows the task stack. FLAC/WAV cover the quality path; MP3 can return
+# once the decode lib grows an in-place constructor.
+rp235x-audio-decode = { path = "../../lib/rp235x-audio-decode", features = ["flac"], optional = true }
 counters = { path = "../../lib/counters" }
 ringbuf = { path = "../../lib/ringbuf" }
 userlib = { path = "../../sys/userlib" }
@@ -24,9 +29,12 @@ userlib = { path = "../../sys/userlib" }
 # block device via embedded-sdmmc -- the same decode stack as the pwm player.
 # Without it, `play_file` compiles but returns OpenFailed.
 sdcard = ["dep:drv-rp235x-sdcard-api", "dep:embedded-sdmmc", "dep:rp235x-audio-decode"]
+# Fake I2S ADCs on PIO1 SM2/SM3 driving the capture pins (no hardware needed).
+simadc = []
 
 [build-dependencies]
 idol = { workspace = true }
+build-util = { path = "../../build/util" }
 
 [[bin]]
 name = "drv-rp235x-i2s"

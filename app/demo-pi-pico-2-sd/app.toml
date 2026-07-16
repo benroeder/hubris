@@ -7,7 +7,7 @@ stacksize = 944
 
 [kernel]
 name = "demo-pi-pico-2-sd"
-requires = {flash = 32768, ram = 12288}
+requires = {flash = 32768, ram = 12800}
 stacksize = 8192
 
 [tasks.jefe]
@@ -79,36 +79,27 @@ uses = ["adc"]
 start = true
 task-slots = ["sys"]
 
-# Non-SD pwm (tone/sine/mic only): the SD player moved to the i2s task, whose
-# DAC replaces the PWM jack on the MusicPi. Shrunk to the plain-app footprint,
-# freeing ~188 KiB of the data pool for the i2s decoder.
-[tasks.pwm_driver]
-name = "drv-rp235x-pwm"
-priority = 3
-max-sizes = {flash = 16384, ram = 34816}
-stacksize = 768
-uses = ["pwm", "dma", "adc"]
-start = true
-task-slots = ["sys"]
+# pwm_driver removed: on the MusicPi its jack/buzzer pins are the SD card's
+# SPI bus, and the I2S DAC replaced it. Freed 34K of the data pool for the
+# mixer capture rings.
 
-# I2S audio out via PIO0 + DMA (SB Components MusicPi HAT: PCM5100A DAC +
-# PAM8908 amp). BCK=GP10, LRCK=GP11, DIN=GP9, XSMT=GP22 (SIO, high = unmute),
-# amp gain GP20/21. Auto-plays a boot tone. NOTE: GP10/11 collide with the
-# sdcard task's SPI1 pins -- i2s starts later and re-muxes them to PIO, so SD
-# commands are broken on the MusicPi until SD moves to its SPI0 (GP16-19).
-# See docs/pcm5102a-research (PCM510xA family datasheet).
 [tasks.i2s]
 name = "drv-rp235x-i2s"
 priority = 4
 # Player-sized: the FLAC/MP3 decoders live on this task's stack for the whole
 # blocking play op (same budget the pwm player used). sdcard (prio 2) must be
 # strictly higher priority than this client (4).
-max-sizes = {flash = 65536, ram = 196608}
-stacksize = 159744
-uses = ["pio0", "dma", "io_bank0", "pads_bank0", "sio"]
+max-sizes = {flash = 98304, ram = 196608}
+stacksize = 53248
+# Pin muxing goes through the gpio task (IPC): memories + uses + caboose must
+# fit the MPU's 7 usable regions, and pio0+pio1+dma+sio is already four.
+uses = ["pio0", "pio1", "dma", "sio"]
 start = true
-features = ["sdcard"]
-task-slots = ["sdcard"]
+# simadc: PIO1 fake I2S ADCs drive the capture pins so the whole receive path
+# runs with zero wires until the real PCM1802 boards arrive.
+features = ["sdcard", "simadc"]
+task-slots = ["sdcard", {gpio = "gpio_driver"}]
+notifications = ["timer"]
 
 # MusicPi WS2812 RGB pixel on GP26, sharing PIO0 with the i2s task (SM1,
 # instruction slots 8..11 -- the "musicpi" feature selects pin/SM/base).
@@ -163,7 +154,7 @@ max-sizes = {flash = 65536, ram = 16384}
 stacksize = 8192
 start = true
 features = ["sdcard", "fat", "i2s", "ws2812", "tft"]
-task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "pwm_driver", "sdcard", "i2s", "ws2812", "tft"]
+task-slots = ["usb", "gpio_driver", "uart_driver", "i2c_driver", "flash_driver", "adc_driver", "sdcard", "i2s", "ws2812", "tft"]
 
 [tasks.idle]
 name = "task-idle"

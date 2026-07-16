@@ -60,6 +60,10 @@ size = 0x1000
 address = 0x5020_0000  # PIO block 0 (WS2812/NeoPixel on GP22, funcsel 6)
 size = 0x1000
 
+[pio1]
+address = 0x5030_0000  # PIO block 1 (I2S capture + simadc fake ADCs, funcsel 7)
+size = 0x1000
+
 [pio2]
 address = 0x5040_0000  # PIO block 2 (gSPI PHY for the CYW43439 Wi-Fi, funcsel 8)
 size = 0x1000

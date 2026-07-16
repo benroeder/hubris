@@ -2554,8 +2554,10 @@ dependencies = [
 name = "drv-rp235x-i2s"
 version = "0.1.0"
 dependencies = [
+ "build-util",
  "cortex-m",
  "counters",
+ "drv-rp235x-gpio-api",
  "drv-rp235x-i2s-api",
  "drv-rp235x-sdcard-api",
  "embedded-sdmmc",
