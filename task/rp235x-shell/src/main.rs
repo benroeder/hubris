@@ -428,12 +428,17 @@ impl Shell {
             }
             #[cfg(feature = "tft")]
             "tft" => self.cmd_tft(line, words.next(), words.next()),
+            // The always-true guard exists to suppress the unreachable-
+            // pattern lint against the legacy pwm `mix` arm below: on a
+            // hypothetical fat+pwm+i2s build the i2s mixer INTENTIONALLY
+            // wins and the pwm crossfader is unreachable.
             #[cfg(feature = "i2s")]
             "mix" if cfg!(feature = "i2s") => {
                 self.cmd_mixer(words.next(), words.next(), words.next())
             }
             #[cfg(feature = "i2s")]
             "duck" => self.cmd_duck(
+                words.next(),
                 words.next(),
                 words.next(),
                 words.next(),
@@ -1459,13 +1464,14 @@ impl Shell {
         thr: Option<&str>,
         atk: Option<&str>,
         rel: Option<&str>,
+        floor: Option<&str>,
     ) {
         let on = match sub {
             Some("on") => true,
             Some("off") => false,
             _ => {
                 self.out.put(
-                    b"usage: duck on [thr%] [atk-ms] [rel-ms] | duck off\r\n",
+                    b"usage: duck on [thr%] [atk-ms] [rel-ms] [floor%] | duck off\r\n",
                 );
                 return;
             }
@@ -1473,8 +1479,11 @@ impl Shell {
         let thr = thr.and_then(|a| a.parse::<u32>().ok()).unwrap_or(10);
         let atk = atk.and_then(|a| a.parse::<u16>().ok()).unwrap_or(30);
         let rel = rel.and_then(|a| a.parse::<u16>().ok()).unwrap_or(400);
+        // Floor: the level the SD source ducks down to (default ~12.5%).
+        let floor = floor.and_then(|a| a.parse::<u32>().ok()).unwrap_or(12);
         let threshold = (thr.min(100) * 32767 / 100) as u16;
-        match self.i2s.duck_set(on as u8, threshold, atk, rel, 4096) {
+        let floor_q = (floor.min(100) * 32767 / 100) as u16;
+        match self.i2s.duck_set(on as u8, threshold, atk, rel, floor_q) {
             Ok(()) => self.out.put(b"ok\r\n"),
             Err(_) => self.out.put(b"duck: failed\r\n"),
         }
@@ -3293,6 +3302,7 @@ impl Shell {
     /// whole track; a set truncated flag means an SD read faulted mid-track, so
     /// the playback was cut short (not a clean end).
     #[cfg(feature = "fat")]
+    #[cfg(all(feature = "fat", any(feature = "pwm", feature = "i2s")))]
     fn report_play_reply(&mut self, verb: &[u8], packed: u32) {
         let rate = packed & 0xffff;
         let underruns = (packed >> 16) & 0x7f;

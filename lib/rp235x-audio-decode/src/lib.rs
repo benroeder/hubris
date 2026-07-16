@@ -683,6 +683,26 @@ impl<S: ByteSource> FlacDecoder<S> {
             core::ptr::addr_of_mut!((*slot).had_error).write(false);
             core::ptr::addr_of_mut!((*slot).done).write(false);
         }
+        // Exhaustiveness guard: if a field is ever added to FlacDecoder,
+        // this destructure stops compiling -- forcing the writer above to be
+        // updated. Without it a new field would be silently left
+        // uninitialised (UB). Zero runtime cost.
+        #[allow(unused)]
+        fn _new_at_initialises_every_field<S: ByteSource>(
+            d: &FlacDecoder<S>,
+        ) {
+            let FlacDecoder {
+                reader: _,
+                buffer: _,
+                block_size: _,
+                pos: _,
+                sample_rate: _,
+                channels: _,
+                shift: _,
+                had_error: _,
+                done: _,
+            } = d;
+        }
         Ok(())
     }
 

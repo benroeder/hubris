@@ -118,9 +118,6 @@ pub struct SdFileSource {
 }
 
 impl SdFileSource {
-    /// Mount FAT volume 0, open the root directory, and open `name` read-only.
-    /// On any failure the partially-opened handles are released and `None` is
-    /// returned. `name` is a raw byte slice (an 8.3 short name) from the lease.
     /// List the playable files (.FLA / .WAV) in the FAT root as text lines
     /// "NAME.EXT <size>\n" written into `out`, returning (bytes_written,
     /// file_count). Entries that would overflow `out` are dropped (count
@@ -193,6 +190,9 @@ impl SdFileSource {
         Some((pos, count))
     }
 
+    /// Mount FAT volume 0, open the root directory, and open `name` read-only.
+    /// On any failure the partially-opened handles are released and `None` is
+    /// returned. `name` is a raw byte slice (an 8.3 short name) from the lease.
     pub fn open(sdcard: Rp235xSdcard, name: &[u8]) -> Option<Self> {
         // The FAT short name must be valid UTF-8 (ASCII in practice) for
         // embedded-sdmmc's ToShortFileName.

@@ -90,7 +90,7 @@ priority = 4
 # blocking play op (same budget the pwm player used). sdcard (prio 2) must be
 # strictly higher priority than this client (4).
 max-sizes = {flash = 98304, ram = 196608}
-stacksize = 61440
+stacksize = 53248
 # Pin muxing goes through the gpio task (IPC): memories + uses + caboose must
 # fit the MPU's 7 usable regions, and pio0+pio1+dma+sio is already four.
 uses = ["pio0", "pio1", "dma", "sio"]
